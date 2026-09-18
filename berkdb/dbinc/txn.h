@@ -168,6 +168,20 @@ void __txn_note_sc_file_write_int __P((DB_TXN *, DB *));
 void __sc_direct_copy_stats __P((u_int64_t *, u_int64_t *));
 
 /*
+ * Publication fences of rebuilt physical files.  See txn_sc_skip.c; the
+ * consumer is __mempv_fget() in berkdb/mp/mp_versioned.c.
+ */
+int __sc_publication_fence_registry_init __P((DB_ENV *));
+int __sc_publication_fence_registry_destroy __P((DB_ENV *));
+int __sc_publication_fence_pend __P((DB_ENV *, const u_int8_t *, u_int64_t));
+int __sc_publication_fence_publish __P((DB_ENV *, u_int64_t, DB_LSN));
+int __sc_publication_fence_discard_build __P((DB_ENV *, u_int64_t));
+int __sc_publication_fence_get __P((DB_ENV *, const u_int8_t *, DB_LSN *));
+void __sc_publication_fence_note __P((DB_ENV *, int));
+void __sc_publication_fence_stats __P((DB_ENV *, u_int64_t *, u_int64_t *,
+	   u_int64_t *, u_int64_t *, u_int64_t *));
+
+/*
  * Durable-flag observation (see txn_sc_skip.c).  Selects which counter
  * __sc_commit_flags_note() bumps.
  */

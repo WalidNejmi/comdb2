@@ -290,6 +290,22 @@ retry:
 int bdb_llog_scdone_tran(bdb_state_type *bdb_state, scdone_t type, tran_type *tran, const char *tbl, int tbllen,
                          int *bdberr)
 {
+    return bdb_llog_scdone_tran_lsn(bdb_state, type, tran, tbl, tbllen, NULL,
+                                    NULL, bdberr);
+}
+
+/*
+ * As bdb_llog_scdone_tran(), but also reports the LSN of the scdone record.
+ *
+ * A schema change uses that LSN as the publication fence of the generation it
+ * is publishing: the record is written after the replacement files' versions
+ * have been switched and inside the publication transaction, so it is ordered
+ * after every modification in the initial published image and before the
+ * generation becomes visible.
+ */
+int bdb_llog_scdone_tran_lsn(bdb_state_type *bdb_state, scdone_t type, tran_type *tran, const char *tbl, int tbllen,
+                             unsigned int *lsn_file, unsigned int *lsn_offset, int *bdberr)
+{
     int rc = 0;
 
     if (bdb_state->parent)
@@ -321,6 +337,10 @@ int bdb_llog_scdone_tran(bdb_state_type *bdb_state, scdone_t type, tran_type *tr
         *bdberr = BDBERR_MISC;
         return -1;
     }
+    if (lsn_file != NULL)
+        *lsn_file = lsn.file;
+    if (lsn_offset != NULL)
+        *lsn_offset = lsn.offset;
     return rc;
 }
 

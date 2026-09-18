@@ -25,6 +25,61 @@ extern char *optostr(int op);
 
 extern int __txn_commit_map_get(DB_ENV *, u_int64_t, DB_LSN *);
 
+extern int __sc_publication_fence_get(DB_ENV *, const u_int8_t *, DB_LSN *);
+extern void __sc_publication_fence_note(DB_ENV *, int);
+
+/*
+ * __mempv_sc_fence_guarantees_target --
+ *	Is this page version already the initial published image of a rebuilt
+ *	schema-change file?
+ *
+ *	A schema change rebuilds a file privately, then publishes it.  Every
+ *	modification forming the published image -- the converter's copies and
+ *	any live-schema-change writes mirrored into it -- is ordered at or
+ *	before the generation's fence, and no snapshot may read the generation
+ *	before it is published.  So when
+ *
+ *		page_lsn <= fence <= target_lsn
+ *
+ *	the page in hand is at or before an image that was already complete and
+ *	visible by the time the snapshot started, and unwinding it further
+ *	would remove rows the snapshot must see.
+ *
+ *	This is why the converter transactions' commit-map entries can be
+ *	omitted: reconstruction stops here instead of looking them up.  The
+ *	test is on the page's LSN and the fence, never on a commit-map miss --
+ *	a miss still means "not known to have committed" everywhere else.
+ */
+static int
+__mempv_sc_fence_guarantees_target(dbenv, fileid, target_lsn, page_lsn)
+	DB_ENV *dbenv;
+	const u_int8_t *fileid;
+	DB_LSN target_lsn;
+	DB_LSN page_lsn;
+{
+	DB_LSN fence;
+
+	if (__sc_publication_fence_get(dbenv, fileid, &fence) != 0)
+		return (0);
+
+	if (log_compare(&page_lsn, &fence) > 0)
+		return (0);
+
+	/*
+	 * The generation had not published yet at the snapshot's target, so
+	 * this fence proves nothing about it.  Counted, because a legal
+	 * snapshot of a rebuilt file should not be able to reach here: the
+	 * table-version check fails such a transaction first.
+	 */
+	if (log_compare(&fence, &target_lsn) > 0) {
+		__sc_publication_fence_note(dbenv, 0);
+		return (0);
+	}
+
+	__sc_publication_fence_note(dbenv, 1);
+	return (1);
+}
+
 extern int __mempv_cache_init(DB_ENV *, MEMPV_CACHE *cache);
 extern int __mempv_cache_get(DB *dbp, MEMPV_CACHE *cache, u_int8_t file_id[DB_FILE_ID_LEN], db_pgno_t pgno, DB_LSN target_lsn, BH *bhp);
 extern int __mempv_cache_put(DB *dbp, MEMPV_CACHE *cache, u_int8_t file_id[DB_FILE_ID_LEN], db_pgno_t pgno, BH *bhp, DB_LSN target_lsn);
@@ -224,7 +279,8 @@ int __mempv_fget(mpf, dbp, pgno, target_lsn, highest_checkpoint_lsn, ret_page, f
 		highest_checkpoint_lsn.offset);
 	}
 
-	if (PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn, smallest_logfile, target_lsn, initial_lsn)) {
+	if (PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn, smallest_logfile, target_lsn, initial_lsn) ||
+	    __mempv_sc_fence_guarantees_target(dbenv, mpf->fileid, target_lsn, initial_lsn)) {
 		if (mempv_debug) {
 			__mempv_logmsg(LOGMSG_USER, caller_id,
 				"Page's LSN (%"PRIu32":%"PRIu32") indicates that it is at the right version\n",
@@ -275,7 +331,8 @@ int __mempv_fget(mpf, dbp, pgno, target_lsn, highest_checkpoint_lsn, ret_page, f
 	DB_LSN current_lsn = initial_lsn;
 	while (!found) 
 	{
-		if (PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn, smallest_logfile, target_lsn, current_lsn)) {
+		if (PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn, smallest_logfile, target_lsn, current_lsn) ||
+		    __mempv_sc_fence_guarantees_target(dbenv, mpf->fileid, target_lsn, current_lsn)) {
 			if (mempv_debug) {
 				__mempv_logmsg(LOGMSG_USER, caller_id,
 					"Page's LSN (%"PRIu32":%"PRIu32") indicates that it is at the right version\n",

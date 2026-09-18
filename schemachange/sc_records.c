@@ -1425,7 +1425,7 @@ int gbl_sc_is_at_end = 0;
  * with the replacement files registered for that active conversion.  It is
  * not durable identity and is not used for anything after the conversion ends.
  */
-static uint64_t sc_private_build_id(struct schema_change_type *s)
+uint64_t sc_private_build_id(struct schema_change_type *s)
 {
     uint64_t id;
 

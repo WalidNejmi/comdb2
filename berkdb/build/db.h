@@ -173,6 +173,11 @@ struct __modsnap_txn; typedef struct __modsnap_txn MODSNAP_TXN;
 struct __sc_private_file; typedef struct __sc_private_file SC_PRIVATE_FILE;
 struct __sc_private_file_registry;
 	typedef struct __sc_private_file_registry SC_PRIVATE_FILE_REGISTRY;
+struct __sc_publication_fence;
+	typedef struct __sc_publication_fence SC_PUBLICATION_FENCE;
+struct __sc_publication_fence_registry;
+	typedef struct __sc_publication_fence_registry
+	    SC_PUBLICATION_FENCE_REGISTRY;
 
 struct __mempv; typedef struct __mempv DB_MEMPV;
 struct __mempv_cache; typedef struct __mempv_cache MEMPV_CACHE;
@@ -2912,6 +2917,13 @@ struct __db_env {
 	 */
 	SC_PRIVATE_FILE_REGISTRY *sc_private_files;
 
+	/*
+	 * Publication fences of rebuilt physical files, keyed by Berkeley file
+	 * id.  Consulted by versioned-page reconstruction; see
+	 * __sc_publication_fence_get().
+	 */
+	SC_PUBLICATION_FENCE_REGISTRY *sc_publication_fences;
+
 	DB_MEMPV *mempv;
 
 	pthread_mutex_t outstanding_modsnap_lock;
@@ -2996,6 +3008,37 @@ struct __sc_private_file_registry {
 	 * changes simply run without the optimization.
 	 */
 	u_int64_t failed_registrations;
+};
+
+/*
+ * The publication fence of one rebuilt physical file.
+ *
+ * Every modification that forms the file's initial published image is ordered
+ * at or before fence_lsn, and no snapshot may use the generation before it is
+ * published -- so a page version at or before the fence is already old enough
+ * for any snapshot that can legally read this file.  That is what lets
+ * versioned-page reconstruction stop without a commit-map entry for the
+ * converter transactions, whose entries are deliberately omitted.
+ *
+ * A zero fence_lsn means "registered but not yet published": the entry is
+ * created when the rebuilt file set is still authoritative, and stamped when
+ * the schema change writes its scdone record.  A zero fence never satisfies
+ * the stopping rule, so an unpublished -- or abandoned -- build is inert.
+ */
+struct __sc_publication_fence {
+	u_int8_t fileid[DB_FILE_ID_LEN];
+	DB_LSN fence_lsn;
+	u_int64_t build_id;
+};
+
+struct __sc_publication_fence_registry {
+	pthread_mutex_t lk;
+	hash_t *files;
+
+	u_int64_t stops;
+	u_int64_t lookup_hits;
+	u_int64_t lookup_misses;
+	u_int64_t target_before_publication;
 };
 
 struct __mempv_cache_page_key

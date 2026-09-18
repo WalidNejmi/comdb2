@@ -107,4 +107,12 @@ int init_sc_genids(struct dbtable *db, unsigned long long **p_sc_genids, struct 
 void live_sc_enter_exclusive_all(bdb_state_type *, tran_type *);
 
 void *live_sc_logical_redo_thd(struct convert_record_data *data);
+
+/*
+ * Identity of a conversion, correlating its converter transactions with the
+ * replacement files registered for it.  Returns 0 when the commit-map skip is
+ * not active for this schema change.  Finalization uses it to publish those
+ * files' fences.
+ */
+uint64_t sc_private_build_id(struct schema_change_type *s);
 #endif

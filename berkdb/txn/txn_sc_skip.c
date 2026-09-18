@@ -458,6 +458,331 @@ __sc_private_registry_stats(dbenv, available, nfiles, failures)
 }
 
 /*
+ * __sc_publication_fence_registry_init --
+ *	Create the publication-fence registry.  Called once from env open.
+ *
+ * PUBLIC: int __sc_publication_fence_registry_init __P((DB_ENV *));
+ */
+int
+__sc_publication_fence_registry_init(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg;
+	int ret;
+
+	if ((ret = __os_calloc(dbenv, 1,
+	    sizeof(SC_PUBLICATION_FENCE_REGISTRY), &reg)) != 0)
+		goto err;
+
+	reg->files = hash_init_o(offsetof(SC_PUBLICATION_FENCE, fileid),
+	    DB_FILE_ID_LEN);
+	if (reg->files == NULL) {
+		__os_free(dbenv, reg);
+		ret = ENOMEM;
+		goto err;
+	}
+
+	Pthread_mutex_init(&reg->lk, NULL);
+	dbenv->sc_publication_fences = reg;
+
+	return (0);
+err:
+	logmsg(LOGMSG_ERROR,
+	    "Failed to initialize schema-change publication-fence registry\n");
+	return (ret);
+}
+
+static int
+free_sc_publication_fence(void *obj, void *arg)
+{
+	__os_free((DB_ENV *)arg, obj);
+	return (0);
+}
+
+/*
+ * __sc_publication_fence_registry_destroy --
+ *
+ * PUBLIC: int __sc_publication_fence_registry_destroy __P((DB_ENV *));
+ */
+int
+__sc_publication_fence_registry_destroy(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+
+	if (reg == NULL)
+		return (0);
+
+	hash_for(reg->files, &free_sc_publication_fence, (void *)dbenv);
+	hash_clear(reg->files);
+	hash_free(reg->files);
+
+	Pthread_mutex_destroy(&reg->lk);
+	__os_free(dbenv, reg);
+	dbenv->sc_publication_fences = NULL;
+
+	return (0);
+}
+
+/*
+ * __sc_publication_fence_pend --
+ *	Record a rebuilt physical file whose generation is not published yet.
+ *
+ *	Called with the exact set of files the schema-change plan rebuilt, at
+ *	the point where that set is authoritative.  A reused file must never be
+ *	passed here: a fence on a public file would let reconstruction stop
+ *	early and surface writes that did not exist at the snapshot's target.
+ *
+ *	The entry starts with a zero fence, which never satisfies the stopping
+ *	rule, so nothing changes until the build publishes.
+ *
+ * PUBLIC: int __sc_publication_fence_pend __P((DB_ENV *, const u_int8_t *,
+ * PUBLIC:	   u_int64_t));
+ */
+int
+__sc_publication_fence_pend(dbenv, fileid, build_id)
+	DB_ENV *dbenv;
+	const u_int8_t *fileid;
+	u_int64_t build_id;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	SC_PUBLICATION_FENCE *f;
+	int ret = 0;
+
+	if (reg == NULL || fileid == NULL || build_id == 0)
+		return (EINVAL);
+
+	Pthread_mutex_lock(&reg->lk);
+
+	f = hash_find(reg->files, fileid);
+	if (f != NULL) {
+		/*
+		 * A file id left behind by an earlier build of the same
+		 * physical file.  The new build owns it now; reset it to
+		 * unpublished so a stale fence cannot outlive its generation.
+		 */
+		ZERO_LSN(f->fence_lsn);
+		f->build_id = build_id;
+		goto done;
+	}
+
+	if ((ret = __os_calloc(dbenv, 1, sizeof(*f), &f)) != 0)
+		goto done;
+
+	memcpy(f->fileid, fileid, DB_FILE_ID_LEN);
+	ZERO_LSN(f->fence_lsn);
+	f->build_id = build_id;
+
+	if (hash_add(reg->files, f) != 0) {
+		__os_free(dbenv, f);
+		ret = ENOMEM;
+	}
+
+done:
+	Pthread_mutex_unlock(&reg->lk);
+	return (ret);
+}
+
+struct sc_fence_build_arg {
+	u_int64_t build_id;
+	DB_LSN fence_lsn;
+	SC_PUBLICATION_FENCE *found;
+	u_int64_t nstamped;
+};
+
+static int
+stamp_one_build_fence(void *obj, void *arg)
+{
+	SC_PUBLICATION_FENCE *f = obj;
+	struct sc_fence_build_arg *a = arg;
+
+	if (f->build_id != a->build_id)
+		return (0);
+
+	f->fence_lsn = a->fence_lsn;
+	a->nstamped++;
+	return (0);
+}
+
+/*
+ * __sc_publication_fence_publish --
+ *	Stamp every pending file of a build with the generation's fence.
+ *
+ *	fence_lsn must be ordered after every modification that forms the
+ *	initial published image and before the publication commits.  The
+ *	schema change's own scdone record satisfies both: it is written after
+ *	the file versions are switched and inside the publication transaction.
+ *
+ * PUBLIC: int __sc_publication_fence_publish __P((DB_ENV *, u_int64_t,
+ * PUBLIC:	   DB_LSN));
+ */
+int
+__sc_publication_fence_publish(dbenv, build_id, fence_lsn)
+	DB_ENV *dbenv;
+	u_int64_t build_id;
+	DB_LSN fence_lsn;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	struct sc_fence_build_arg arg;
+
+	if (reg == NULL || build_id == 0 || IS_ZERO_LSN(fence_lsn))
+		return (EINVAL);
+
+	arg.build_id = build_id;
+	arg.fence_lsn = fence_lsn;
+	arg.nstamped = 0;
+
+	Pthread_mutex_lock(&reg->lk);
+	hash_for(reg->files, &stamp_one_build_fence, &arg);
+	Pthread_mutex_unlock(&reg->lk);
+
+	return (0);
+}
+
+static int
+find_one_build_fence(void *obj, void *arg)
+{
+	SC_PUBLICATION_FENCE *f = obj;
+	struct sc_fence_build_arg *a = arg;
+
+	if (f->build_id != a->build_id)
+		return (0);
+
+	a->found = f;
+	return (1); /* stop the walk */
+}
+
+/*
+ * __sc_publication_fence_discard_build --
+ *	Drop every pending file of a build that will not publish.  Idempotent,
+ *	so terminal schema-change paths can call it unconditionally.
+ *
+ * PUBLIC: int __sc_publication_fence_discard_build __P((DB_ENV *, u_int64_t));
+ */
+int
+__sc_publication_fence_discard_build(dbenv, build_id)
+	DB_ENV *dbenv;
+	u_int64_t build_id;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	struct sc_fence_build_arg arg;
+
+	if (reg == NULL || build_id == 0)
+		return (0);
+
+	Pthread_mutex_lock(&reg->lk);
+
+	/* Allocation-free, for the reason given in the sibling registry. */
+	arg.build_id = build_id;
+	for (;;) {
+		arg.found = NULL;
+		hash_for(reg->files, &find_one_build_fence, &arg);
+
+		if (arg.found == NULL)
+			break;
+
+		hash_del(reg->files, arg.found);
+		__os_free(dbenv, arg.found);
+	}
+
+	Pthread_mutex_unlock(&reg->lk);
+	return (0);
+}
+
+/*
+ * __sc_publication_fence_get --
+ *	Fetch a published file's fence.  Returns DB_NOTFOUND when the file is
+ *	not a rebuilt schema-change file, or is one that has not published.
+ *
+ * PUBLIC: int __sc_publication_fence_get __P((DB_ENV *, const u_int8_t *,
+ * PUBLIC:	   DB_LSN *));
+ */
+int
+__sc_publication_fence_get(dbenv, fileid, fence_lsn)
+	DB_ENV *dbenv;
+	const u_int8_t *fileid;
+	DB_LSN *fence_lsn;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	SC_PUBLICATION_FENCE *f;
+	int ret = DB_NOTFOUND;
+
+	if (reg == NULL || fileid == NULL)
+		return (DB_NOTFOUND);
+
+	Pthread_mutex_lock(&reg->lk);
+
+	f = hash_find(reg->files, fileid);
+	if (f != NULL && !IS_ZERO_LSN(f->fence_lsn)) {
+		*fence_lsn = f->fence_lsn;
+		reg->lookup_hits++;
+		ret = 0;
+	} else {
+		reg->lookup_misses++;
+	}
+
+	Pthread_mutex_unlock(&reg->lk);
+	return (ret);
+}
+
+/*
+ * __sc_publication_fence_note --
+ *	Count an outcome of the fence rule.  'stopped' says reconstruction
+ *	stopped at the fence; otherwise the snapshot's target predates the
+ *	generation's publication, which the rule must not treat as covered.
+ *
+ * PUBLIC: void __sc_publication_fence_note __P((DB_ENV *, int));
+ */
+void
+__sc_publication_fence_note(dbenv, stopped)
+	DB_ENV *dbenv;
+	int stopped;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+
+	if (reg == NULL)
+		return;
+
+	Pthread_mutex_lock(&reg->lk);
+	if (stopped)
+		reg->stops++;
+	else
+		reg->target_before_publication++;
+	Pthread_mutex_unlock(&reg->lk);
+}
+
+/*
+ * __sc_publication_fence_stats --
+ *
+ * PUBLIC: void __sc_publication_fence_stats __P((DB_ENV *, u_int64_t *,
+ * PUBLIC:	   u_int64_t *, u_int64_t *, u_int64_t *, u_int64_t *));
+ */
+void
+__sc_publication_fence_stats(dbenv, entries, stops, hits, misses, early)
+	DB_ENV *dbenv;
+	u_int64_t *entries;
+	u_int64_t *stops;
+	u_int64_t *hits;
+	u_int64_t *misses;
+	u_int64_t *early;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+
+	if (reg == NULL) {
+		*entries = *stops = *hits = *misses = *early = 0;
+		return;
+	}
+
+	Pthread_mutex_lock(&reg->lk);
+	*entries = (u_int64_t)hash_get_num_entries(reg->files);
+	*stops = reg->stops;
+	*hits = reg->lookup_hits;
+	*misses = reg->lookup_misses;
+	*early = reg->target_before_publication;
+	Pthread_mutex_unlock(&reg->lk);
+}
+
+/*
  * __txn_set_sc_build --
  *	Mark a transaction as belonging to an active schema-change build.
  *

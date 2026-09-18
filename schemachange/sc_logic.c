@@ -24,6 +24,7 @@
 #include "schemachange.h"
 #include "sc_global.h"
 #include "sc_logic.h"
+#include "sc_records.h"
 #include "sc_util.h"
 #include "sc_struct.h"
 #include "sc_queues.h"
@@ -298,7 +299,8 @@ int replication_only_error_code(int rc)
 
 int llog_scdone_rename_wrapper(bdb_state_type *bdb_state,
                                struct schema_change_type *s, tran_type *tran,
-                               int *bdberr)
+                               unsigned int *fence_file,
+                               unsigned int *fence_offset, int *bdberr)
 {
     int rc;
     char *mashup = NULL;
@@ -333,10 +335,56 @@ int llog_scdone_rename_wrapper(bdb_state_type *bdb_state,
         rc = bdb_llog_scdone(bdb_state, s->done_type, mashup, oldlen + newlen,
                              1, bdberr);
     else
-        rc = bdb_llog_scdone_tran(bdb_state, s->done_type, tran, mashup,
-                                  oldlen + newlen, bdberr);
+        rc = bdb_llog_scdone_tran_lsn(bdb_state, s->done_type, tran, mashup,
+                                      oldlen + newlen, fence_file, fence_offset,
+                                      bdberr);
 
     return rc;
+}
+
+/*
+ * Publish the fences of the files this schema change rebuilt.
+ *
+ * The scdone record is the fence: finalization switched the replacement files'
+ * versions before it was written (see do_finalize below), and it is written
+ * inside the publication transaction, so it is ordered after every
+ * modification in the generation's initial published image and before any
+ * snapshot can legally read that generation.
+ *
+ * Until this runs the build's entries carry a zero fence and are inert, so a
+ * schema change that never reaches here changes nothing.
+ */
+static void sc_publish_fences(struct schema_change_type *s,
+                              unsigned int fence_file,
+                              unsigned int fence_offset)
+{
+    uint64_t build_id;
+
+    if (s == NULL || s->db == NULL || s->db->handle == NULL || fence_file == 0)
+        return;
+
+    if ((build_id = sc_private_build_id(s)) == 0)
+        return;
+
+    bdb_sc_publication_fence_publish(s->db->handle, build_id, fence_file,
+                                     fence_offset);
+}
+
+/*
+ * Drop the fences of a build that did not publish, so a later build of the
+ * same physical file cannot inherit them.
+ */
+static void sc_discard_fences(struct schema_change_type *s)
+{
+    uint64_t build_id;
+
+    if (s == NULL || s->db == NULL || s->db->handle == NULL)
+        return;
+
+    if ((build_id = sc_private_build_id(s)) == 0)
+        return;
+
+    bdb_sc_publication_fence_discard(s->db->handle, build_id);
 }
 
 /*
@@ -351,6 +399,7 @@ static int do_finalize(ddl_t func, struct ireq *iq,
     int rc, bdberr = 0;
     tran_type *tran = input_tran;
     tran_type *ltran, *ptran;
+    unsigned int fence_file = 0, fence_offset = 0;
 
     if (input_tran == NULL) {
         rc = get_schema_change_txns(iq, &ltran, &ptran, &tran);
@@ -393,12 +442,22 @@ static int do_finalize(ddl_t func, struct ireq *iq,
                    bdb_get_scdone_str(s->done_type), s->tablename, tran);
         }
 
-        rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &bdberr);
+        rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &fence_file,
+                                        &fence_offset, &bdberr);
         if (rc || bdberr != BDBERR_NOERROR) {
             sc_errf(s, "Failed to send scdone rc=%d bdberr=%d\n", rc, bdberr);
             rc = -1;
             goto abort;
         }
+
+        /*
+         * Publish before the commit rather than after it: the generation is
+         * not visible until the commit lands, so an early fence cannot be
+         * observed, while a late one leaves a window in which the new files
+         * are readable but reconstruction has no stopping proof for them.
+         * The failure paths below discard it again.
+         */
+        sc_publish_fences(s, fence_file, fence_offset);
 
         if (s->keep_locked) {
             rc = trans_commit(iq, tran, gbl_myhostname);
@@ -409,6 +468,7 @@ static int do_finalize(ddl_t func, struct ireq *iq,
             rc = -1;
         if (rc && !replication_only_error_code(rc)) {
             sc_errf(s, "Failed to commit finalize transaction\n");
+            sc_discard_fences(s);
             trans_abort_logical(iq, ltran, NULL, 0, NULL, 0);
             return rc;
         }
@@ -424,14 +484,19 @@ static int do_finalize(ddl_t func, struct ireq *iq,
         sc_del_unused_files(s->db);
     } else {
         int bdberr = 0;
-        rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &bdberr);
+        rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &fence_file,
+                                        &fence_offset, &bdberr);
         if (rc || bdberr != BDBERR_NOERROR) {
             sc_errf(s, "Failed to send scdone rc=%d bdberr=%d\n", rc, bdberr);
             return -1;
         }
+
+        /* Caller owns the commit; see the note at the sibling call above. */
+        sc_publish_fences(s, fence_file, fence_offset);
     }
     return rc;
 abort:
+    sc_discard_fences(s);
     trans_abort(iq, tran);
     trans_abort_logical(iq, ltran, NULL, 0, NULL, 0);
     mark_schemachange_over(s->tablename);

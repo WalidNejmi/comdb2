@@ -538,9 +538,15 @@ char *get_ddl_csc2(struct schema_change_type *s);
 
 int comdb2_is_user_op(char *user, char *password);
 
+/*
+ * fence_file / fence_offset, when non-NULL, receive the LSN of the scdone
+ * record.  A schema change publishing a rebuilt generation uses it as that
+ * generation's publication fence.
+ */
 int llog_scdone_rename_wrapper(bdb_state_type *bdb_state,
                                struct schema_change_type *s, tran_type *tran,
-                               int *bdberr);
+                               unsigned int *fence_file,
+                               unsigned int *fence_offset, int *bdberr);
 
 int get_schema_change_txns(struct ireq *iq, tran_type **logi,
                            tran_type **ptran, tran_type **tran);

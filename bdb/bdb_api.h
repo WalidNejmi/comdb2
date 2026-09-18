@@ -2553,4 +2553,16 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state, uint64_t build_id,
 /* Drop every registration for a build.  Idempotent. */
 int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
                                     uint64_t build_id);
+
+/*
+ * Publication fences for the rebuilt files of a schema-change build.  The
+ * fence lets versioned-page reconstruction stop at the generation's initial
+ * published image, which is what makes omitting the converter transactions'
+ * commit-map entries safe.  Pended by bdb_sc_private_register_files().
+ */
+int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
+                                     uint64_t build_id, unsigned int fence_file,
+                                     unsigned int fence_offset);
+int bdb_sc_publication_fence_discard(bdb_state_type *bdb_state,
+                                     uint64_t build_id);
 #endif

@@ -50,6 +50,8 @@ int __txn_commit_map_init(DB_ENV *);
 int __txn_commit_map_destroy(DB_ENV *);
 int __sc_private_file_registry_init(DB_ENV *);
 int __sc_private_file_registry_destroy(DB_ENV *);
+int __sc_publication_fence_registry_init(DB_ENV *);
+int __sc_publication_fence_registry_destroy(DB_ENV *);
 
 extern int gbl_file_permissions;
 extern int gbl_import_mode;
@@ -437,6 +439,17 @@ __dbenv_open(dbenv, db_home, flags, mode)
 		 * before.  It must never stop the database opening.
 		 */
 		(void)__sc_private_file_registry_init(dbenv);
+
+		/*
+		 * The publication-fence registry is not an optimization aid:
+		 * without it, reconstruction of a rebuilt file whose converter
+		 * entries were omitted has no stopping proof.  It is still not
+		 * allowed to stop the database opening -- a null registry makes
+		 * every lookup miss, which is exactly the behaviour of a
+		 * database that never skipped anything.  The writer tunable is
+		 * what must stay off in that case.
+		 */
+		(void)__sc_publication_fence_registry_init(dbenv);
 
 		/*
 		 * If the application is running with transactions, initialize
@@ -1021,6 +1034,7 @@ __dbenv_close(dbenv, rep_check)
 	__txn_commit_map_destroy(dbenv);
 
 	__sc_private_file_registry_destroy(dbenv);
+	__sc_publication_fence_registry_destroy(dbenv);
 
 	/* Release versioned memory pool */
 	if (dbenv->mempv != NULL) {

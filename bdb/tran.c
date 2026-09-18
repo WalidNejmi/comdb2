@@ -100,6 +100,9 @@ void __txn_set_sc_build(DB_TXN *, uint64_t);
 int __sc_private_file_register(DB_ENV *, const uint8_t *, uint64_t);
 int __sc_private_file_unregister_build(DB_ENV *, uint64_t);
 void __sc_private_registry_note_failure(DB_ENV *);
+int __sc_publication_fence_pend(DB_ENV *, const uint8_t *, uint64_t);
+int __sc_publication_fence_publish(DB_ENV *, uint64_t, DB_LSN);
+int __sc_publication_fence_discard_build(DB_ENV *, uint64_t);
 
 /*
  * Mark a base schema-change converter transaction with its build id.
@@ -178,6 +181,16 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state, uint64_t build_id,
         if (__sc_private_file_register(bdb_state->dbenv, dbp->fileid,
                                        build_id) != 0)
             goto fail;
+
+        /*
+         * Same file, same moment, same rebuilt-only rule: this is where the
+         * exact set of rebuilt files is authoritative, so the publication
+         * fence is pended here rather than recomputed at finalization.  It
+         * stays inert until the build publishes.
+         */
+        if (__sc_publication_fence_pend(bdb_state->dbenv, dbp->fileid,
+                                        build_id) != 0)
+            goto fail;
     }
 
     return 0;
@@ -204,6 +217,47 @@ int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
         return 0;
 
     return __sc_private_file_unregister_build(bdb_state->dbenv, build_id);
+}
+
+/*
+ * Publish this build's rebuilt files at fence_file:fence_offset.
+ *
+ * The caller must pass an LSN that is ordered after every modification making
+ * up the initial published image and before the publication commits -- the
+ * schema change's own scdone record, which is written after the file versions
+ * are switched and inside the publication transaction.
+ */
+int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
+                                     uint64_t build_id, unsigned int fence_file,
+                                     unsigned int fence_offset)
+{
+    DB_LSN fence;
+
+    if (bdb_state == NULL || build_id == 0 || fence_file == 0)
+        return -1;
+
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    fence.file = fence_file;
+    fence.offset = fence_offset;
+
+    return __sc_publication_fence_publish(bdb_state->dbenv, build_id, fence);
+}
+
+/*
+ * Drop the pending fences of a build that will not publish.  Idempotent.
+ */
+int bdb_sc_publication_fence_discard(bdb_state_type *bdb_state,
+                                     uint64_t build_id)
+{
+    if (bdb_state == NULL || build_id == 0)
+        return 0;
+
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    return __sc_publication_fence_discard_build(bdb_state->dbenv, build_id);
 }
 
 tran_type *bdb_tran_begin_logical_norowlocks_int(bdb_state_type *bdb_state,

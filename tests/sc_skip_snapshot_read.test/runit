@@ -3,25 +3,32 @@ bash -n "$0" || exit 1
 
 # Snapshot correctness after a rebuild whose converter commits were skipped.
 #
-# THIS TEST CURRENTLY FAILS. That failure is the point of the test, and is the
-# result being reported rather than worked around.
-#
 # Omitting converter transactions from the commit-LSN map is only safe if
-# nothing still needs their commit LSNs. Versioned-page reconstruction does:
+# nothing still needs their commit LSNs. Versioned-page reconstruction did:
 # __mempv_fget() (berkdb/mp/mp_versioned.c) looks up the utxnid that wrote a
 # page and, when the lookup MISSES, rolls that operation back out of the
 # reconstructed page. A miss is not neutral -- it is treated as "not yet
 # committed".
 #
-# After a rebuild, pages in the new files carry converter LSNs. A snapshot that
-# has to reconstruct one of those pages looks up a converter utxnid that is no
-# longer in the map, and undoes the row writes. Measured: the snapshot sees an
-# empty table.
+# After a rebuild, pages in the new files carry converter LSNs, so a snapshot
+# reconstructing one of them undid the row writes and saw an empty table:
 #
-#   skip disabled   snapshot count(*) = 5000   sum(j) = 12502500
-#   skip enabled    snapshot count(*) = 0      sum(j) = NULL
+#   skip enabled, no fence   snapshot count(*) = 0      sum(j) = NULL
 #
-# Same test, same data, only the skip differs.
+# The fix is the publication fence. Each physical file the schema change
+# rebuilt records the LSN of the scdone record that published its generation.
+# Every write forming the initial published image is ordered before that LSN,
+# and no snapshot may read the generation before it is published, so
+#
+#   page_lsn <= fence <= target_lsn
+#
+# proves the page in hand is already old enough -- without consulting the
+# commit map at all. Reconstruction stops there instead of unwinding into
+# converter history.
+#
+# This test asserts both halves at once: the converter entries are STILL
+# omitted, and the snapshot is still correct. A fix that merely put the
+# entries back would fail the skipped-count assertion.
 
 source ${TESTSROOTDIR}/tools/runit_common.sh
 
@@ -102,5 +109,21 @@ rowcount=$(run 'select count(*) from t')
 
 do_verify t
 
-echo "SC_SKIP_SNAPSHOT: rows=$N skipped=$skipped snapshot_count=$first_count snapshot_sum=$first_sum"
+# The fence is what made the reads above correct, not an unrelated change:
+# reconstruction must actually have stopped at one. Without this, a fix that
+# quietly stopped skipping -- or one where reconstruction never ran -- would
+# still pass everything above.
+clminfo=$(cdb2sql ${CDB2_OPTIONS} --host $master $dbnm \
+	"exec procedure sys.cmd.send('bdb clminfo')")
+fence_stops=$(echo "$clminfo" | grep -oP '(?<=SC fence stops: )[0-9]+')
+fences=$(echo "$clminfo" | grep -oP '(?<=SC publication fences: )[0-9]+')
+
+(( fences > 0 )) || \
+	fail "no publication fences registered; the rebuilt files were never fenced"
+(( fence_stops > 0 )) || \
+	fail "reconstruction never stopped at a publication fence (stops=$fence_stops);" \
+		"the snapshot above was correct for some other reason"
+
+echo "SC_SKIP_SNAPSHOT: rows=$N skipped=$skipped snapshot_count=$first_count snapshot_sum=$first_sum" \
+	"fences=$fences fence_stops=$fence_stops"
 echo "Passed test"

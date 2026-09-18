@@ -822,6 +822,25 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 						fs.unsupported_unknown_family);
 	}
 
+	/*
+	 * Publication fences of rebuilt schema-change files.  'stops' is the
+	 * number of times reconstruction ended at a fence instead of walking
+	 * into converter history that has no commit-map entry -- the count that
+	 * shows the skip is actually being made safe.
+	 */
+	{
+		u_int64_t fentries, fstops, fhits, fmisses, fearly;
+
+		__sc_publication_fence_stats(dbenv, &fentries, &fstops, &fhits,
+				&fmisses, &fearly);
+		logmsg(lvl, "SC publication fences: %"PRIu64"\n", fentries);
+		logmsg(lvl, "SC fence stops: %"PRIu64"\n", fstops);
+		logmsg(lvl, "SC fence lookup hits: %"PRIu64"\n", fhits);
+		logmsg(lvl, "SC fence lookup misses: %"PRIu64"\n", fmisses);
+		logmsg(lvl, "SC fence target before publication: %"PRIu64"\n",
+				fearly);
+	}
+
 	/* Enough to tell whether the mechanism was available at all. */
 	logmsg(lvl, "SC private registry available: %d\n",
 					st.sc_registry_available);

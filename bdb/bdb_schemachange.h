@@ -66,6 +66,10 @@ void bdb_bump_dbopen_gen(scdone_t type, const char *message,
 
 int bdb_llog_scdone_tran(bdb_state_type *bdb_state, scdone_t type,
                          tran_type *tran, const char *tbl, int tbllen, int *bdberr);
+int bdb_llog_scdone_tran_lsn(bdb_state_type *bdb_state, scdone_t type,
+                             tran_type *tran, const char *tbl, int tbllen,
+                             unsigned int *lsn_file, unsigned int *lsn_offset,
+                             int *bdberr);
 int bdb_llog_scdone(bdb_state_type *, scdone_t, const char *tablename,
                     int tablenamelen, int wait, int *bdberr);
 int bdb_llog_luareload(bdb_state_type *, int wait, int *bdberr);
