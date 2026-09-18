@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Application DML running *during* a live schema change, and the fence.
+#
+# The publication fence says: every write forming this file's initial published
+# image is ordered at or before the fence LSN.  The rule then stops
+# reconstruction at the fence without consulting the commit map.
+#
+# That is only sound if every such write also COMMITTED before the fence.  If
+# an application transaction could write into a replacement file during the
+# conversion and commit AFTER publication, the fence would cover a write that
+# was not committed at a snapshot's target, and reconstruction would hand that
+# snapshot data it must not see -- the same class of bug the fence exists to
+# fix, reintroduced through a different door.
+#
+# Why that cannot happen (this test guards the reasoning, it does not replace
+# it):
+#
+#   * the DML path takes a tablename READ lock on its own transaction --
+#     bdb_lock_tablename_read(..., trans) at db/osqlcomm.c:7341, which routes to
+#     bdb_lock_table_int(..., resolve_locker_id(tran), BDB_LOCK_READ).  A lock
+#     held on the transaction is held until it commits or aborts.
+#
+#   * finalize takes the WRITE lock on the same object --
+#     bdb_lock_table_write(db->handle, transac) at
+#     schemachange/sc_alter_table.c:957, routing to bdb_lock_table_int(...,
+#     BDB_LOCK_WRITE) with the same form_tablelock_keyname() key.
+#
+#   * READ and WRITE conflict, so finalize cannot be granted the lock while any
+#     DML transaction that touched the table is still open; and the scdone
+#     record that supplies the fence is written after that lock is held.
+#
+#   * the logical live-schema-change redo thread is drained separately, at
+#     sc_alter_table.c:976.
+#
+# So the drain is enforced by the lock manager, not by timing.  This test
+# exercises it adversarially: hammer the table with DML while the rebuild runs,
+# then check the results a snapshot sees.
+#
+# Per the plan's warning, it must not silently tolerate a writer that did
+# nothing: it asserts a nonzero number of writes actually landed, and fails if
+# the DML load did not overlap the conversion.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+
+set -o pipefail
+
+dbnm=$1
+[[ -z "$dbnm" ]] && dbnm=$DBNAME
+
+N=${SC_FENCE_ROWS:-20000}
+
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+
+clm() {
+	cdb2sql ${CDB2_OPTIONS} --host $master $dbnm \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null
+}
+skipped()  { clm | grep -oP '(?<=SC commit-map entries skipped: )[0-9]+'; }
+fences()   { clm | grep -oP '(?<=SC publication fences: )[0-9]+'; }
+
+# --- seed -------------------------------------------------------------------
+
+run "create table t(i int, j int)" > /dev/null
+run "create index ix_j on t(j)" > /dev/null
+run "insert into t select value, value from generate_series(1, $N)" > /dev/null
+
+(( $(run 'select count(*) from t') == N )) || fail "seed failed"
+
+# Rows with i > N are inserted only by the concurrent writer, so counting them
+# afterwards proves the writer really ran alongside the conversion.
+writer_log=/tmp/sc_fence_livedml_writer.$$
+writes_ok=0
+
+# --- rebuild with concurrent DML --------------------------------------------
+
+run "rebuild t" > /dev/null &
+rebuild_pid=$!
+
+# Hammer the table for as long as the rebuild is running.  Every statement's
+# success is recorded; a writer that silently failed throughout would leave
+# writes_ok at 0 and fail the test below.
+# Batched: one cdb2sql process per statement would be far slower than the
+# conversion and would barely overlap it.  Each iteration writes BATCH rows and
+# updates a BATCH-sized band, so the writer keeps real pressure on the table
+# for the whole rebuild.
+BATCH=${SC_FENCE_BATCH:-500}
+k=0
+while kill -0 $rebuild_pid 2>/dev/null; do
+	lo=$(( N + k * BATCH + 1 ))
+	hi=$(( N + (k + 1) * BATCH ))
+
+	if run "insert into t select value, value from generate_series($lo, $hi)" \
+			>> $writer_log 2>&1; then
+		writes_ok=$(( writes_ok + BATCH ))
+	fi
+
+	ulo=$(( (k * BATCH) % N + 1 ))
+	if run "update t set j = j + 1 where i >= $ulo and i < $(( ulo + BATCH ))" \
+			>> $writer_log 2>&1; then
+		writes_ok=$(( writes_ok + BATCH ))
+	fi
+
+	k=$(( k + 1 ))
+done
+
+wait $rebuild_pid || fail "rebuild failed"
+rm -f $writer_log
+
+echo "SC_FENCE_LIVEDML: writer statements committed=$writes_ok"
+
+(( writes_ok > 0 )) || \
+	fail "no application write committed during the rebuild; this test did" \
+		"not exercise concurrent DML at all"
+
+inserted=$(run "select count(*) from t where i > $N")
+(( inserted > 0 )) || \
+	fail "the writer committed $writes_ok statements but none of its rows are" \
+		"in the table; the DML did not overlap the conversion"
+
+sc_skipped=$(skipped)
+sc_fences=$(fences)
+
+(( sc_skipped > 0 )) || \
+	fail "the rebuild skipped no converter entries; the skip was not active"
+(( sc_fences > 0 )) || fail "the rebuild published no fences"
+
+total=$(run 'select count(*) from t')
+echo "SC_FENCE_LIVEDML: rows=$total inserted_during_sc=$inserted" \
+	"skipped=$sc_skipped fences=$sc_fences"
+
+# Every row the writer committed must have survived the conversion: those
+# writes were mirrored into the replacement files and are part of the published
+# image, which is exactly what the fence asserts.
+(( total == N + inserted )) || \
+	fail "table has $total rows, expected $(( N + inserted )) -- DML committed" \
+		"during the conversion was lost"
+
+# --- the property: a snapshot over the published generation -----------------
+#
+# The fence now covers these files.  A snapshot taken after publication must
+# see the table as of its own start point: every write committed before it, and
+# none committed after it.
+
+expected_sum=$(run 'select sum(j) from t')
+expected_count=$total
+
+fifo=/tmp/sc_fence_livedml_fifo.$$
+out=/tmp/sc_fence_livedml_out.$$
+mkfifo $fifo
+cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm - < $fifo > $out 2>&1 &
+pid=$!
+exec 9>$fifo
+
+printf '%s\n' "set transaction snapshot isolation" "begin" \
+	"select count(*) from t" "select sum(j) from t" >&9
+sleep 2
+
+# Writes the snapshot must NOT see.  These force reconstruction of pages whose
+# history runs back through the converter writes.
+for r in 1 2 3; do
+	run "update t set j = j + 1000 where i <= $(( N / 2 ))" > /dev/null
+done
+
+printf '%s\n' "select count(*) from t" "select sum(j) from t" "commit" >&9
+sleep 2
+
+exec 9>&-
+wait $pid 2>/dev/null
+rm -f $fifo
+
+mapfile -t vals < <(grep -vE '^\[' $out)
+rm -f $out
+
+echo "SC_FENCE_LIVEDML_SNAPSHOT: first=(${vals[0]}, ${vals[1]})" \
+	"second=(${vals[2]}, ${vals[3]})"
+
+(( ${vals[0]} == expected_count )) || \
+	fail "snapshot saw ${vals[0]} rows at start, expected $expected_count"
+[[ "${vals[1]}" == "$expected_sum" ]] || \
+	fail "snapshot summed ${vals[1]} at start, expected $expected_sum"
+
+# The real assertion: after three concurrent updates the snapshot must be
+# unchanged.  If the fence covered a write that was not committed at this
+# snapshot's target, this is where the wrong value shows up.
+(( ${vals[2]} == expected_count )) || \
+	fail "snapshot saw ${vals[2]} rows after concurrent updates, expected" \
+		"$expected_count"
+[[ "${vals[3]}" == "$expected_sum" ]] || \
+	fail "snapshot sum changed under it: '${vals[3]}' vs '$expected_sum' --" \
+		"reconstruction retained a write that postdates the snapshot target"
+
+do_verify t
+
+echo "Passed test"

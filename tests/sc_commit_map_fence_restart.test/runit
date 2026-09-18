@@ -114,6 +114,13 @@ echo "SC_FENCE_RESTART_BEFORE: skipped=$skipped_before fences=$fences_before" \
 
 echo "Restarting the node..."
 stop_all_nodes
+
+# stop_all_nodes uses kill -9, which leaves the portmux registration behind for
+# a moment.  Restarting straight away can lose the race and the new process
+# dies with "pmux register replication failed / service already active", which
+# looks like a fence failure but is not one.  Give pmux time to reap it.
+sleep 10
+
 start_all_nodes
 wait_up
 
