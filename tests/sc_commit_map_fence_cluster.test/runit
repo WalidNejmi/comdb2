@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# A replica must learn the publication fence, and keep it across promotion.
+#
+# This is the case the fence's durability exists for.  A replica applied the
+# converter transactions and, honouring the same durable marker the master
+# wrote, left their commit-map entries out.  So reconstruction of a page in a
+# rebuilt file has nothing to look up on the replica either, and needs a fence.
+#
+# The replica never pended one: pending happens on the node that ran the
+# schema change.  It has to pick the fence up from the durable record, which
+# scdone_callback() reloads once the publication transaction has committed.
+#
+# Unlike a restarted node, a replica has no startup checkpoint sitting above
+# the converter writes, so the checkpoint clause does not cover them and the
+# fence really is on the critical path here.  That is why this test needs a
+# cluster and cannot be folded into sc_commit_map_fence_restart.
+#
+# Phases:
+#   A. rebuild t on the master; converter entries are skipped, fences published
+#   B. every replica reports the same fences, without having pended any
+#   C. a snapshot read served by a replica is correct
+#   D. after a master swing, the promoted node still holds them
+#
+# Skips cleanly when the harness gives no cluster.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+source "$(dirname "$0")/cluster_commit_map_lib.sh"
+
+set -o pipefail
+
+dbname=$1
+[[ -z "$dbname" ]] && dbname=$DBNAME
+
+require_cluster
+
+N=${SC_FENCE_ROWS:-5000}
+
+node_fences() {
+	node_clminfo "$1" | grep -oP '(?<=SC publication fences: )[0-9]+'
+}
+node_fence_stops() {
+	node_clminfo "$1" | grep -oP '(?<=SC fence stops: )[0-9]+'
+}
+
+master=$(cluster_master)
+[[ -n "$master" ]] || fail "could not find master"
+
+cluster_log_delete_off
+
+# --- A: rebuild on the master ----------------------------------------------
+
+seed_table "$master" "$N"
+sleep 2
+
+master=$(cluster_master)
+sql_node "$master" "rebuild t" > /dev/null || fail "rebuild failed"
+sleep 5
+
+master_fences=$(node_fences "$master")
+master_skipped=$(node_skipped "$master")
+
+(( master_skipped >= N )) || \
+	fail "master skipped $master_skipped converter entries; the skip is not" \
+		"active, so this test would not exercise the fence"
+(( master_fences > 0 )) || fail "master published no fences"
+
+echo "SC_FENCE_CLUSTER_MASTER: skipped=$master_skipped fences=$master_fences"
+
+# --- B: every replica has them too ------------------------------------------
+
+for node in $(cluster_replicas); do
+	rf=$(node_fences "$node")
+	[[ -n "$rf" ]] || fail "replica $node reported no fence count at all"
+
+	# The replica never pended a fence -- it did not run the schema change.
+	# Anything it has came from the durable record via scdone_callback().
+	(( rf >= master_fences )) || \
+		fail "replica $node holds $rf fences, master holds $master_fences;" \
+			"the replica did not pick up the published fences and cannot" \
+			"reconstruct a page in a rebuilt file"
+
+	echo "SC_FENCE_CLUSTER_REPLICA: node=$node fences=$rf"
+done
+
+# --- C: a replica serves a correct snapshot ---------------------------------
+
+replica=$(cluster_replicas | head -1)
+[[ -n "$replica" ]] || fail "no replica to read from"
+
+expected_sum=$(sql_node "$master" 'select sum(j) from t')
+stops_before=$(node_fence_stops "$replica")
+
+fifo=/tmp/sc_fence_cluster_fifo.$$
+out=/tmp/sc_fence_cluster_out.$$
+mkfifo $fifo
+cdb2sql --tabs ${CDB2_OPTIONS} --host "$replica" "$dbname" - < $fifo > $out 2>&1 &
+pid=$!
+exec 9>$fifo
+printf '%s\n' "set transaction snapshot isolation" "begin" \
+	"select count(*) from t" >&9
+sleep 3
+
+# Writes the replica's snapshot must not see; they force reconstruction.
+sql_node "$master" "update t set j = j + 1000 where i <= $(( N / 2 ))" > /dev/null
+sleep 3
+
+printf '%s\n' "select count(*) from t" "select sum(j) from t" "commit" >&9
+sleep 3
+exec 9>&-
+wait $pid 2>/dev/null
+rm -f $fifo
+
+mapfile -t vals < <(grep -vE '^\[' $out)
+rm -f $out
+
+stops_after=$(node_fence_stops "$replica")
+stops_delta=$(( stops_after - stops_before ))
+
+echo "SC_FENCE_CLUSTER_SNAPSHOT: node=$replica count=${vals[1]} sum=${vals[2]}" \
+	"fence_stops_delta=$stops_delta"
+
+(( ${vals[1]} == N )) || \
+	fail "replica snapshot saw ${vals[1]} rows, expected $N -- without the" \
+		"fence, reconstruction walks into converter history the replica" \
+		"also left out of its commit map"
+[[ "${vals[2]}" == "$expected_sum" ]] || \
+	fail "replica snapshot summed ${vals[2]}, expected $expected_sum"
+
+# --- D: the fence survives a promotion --------------------------------------
+
+echo "Downgrading $master to force a promotion..."
+send_node "$master" "downgrade"
+sleep 10
+
+new_master=$(cluster_master)
+[[ -n "$new_master" ]] || fail "no master after downgrade"
+[[ "$new_master" != "$master" ]] || \
+	echo "WARN: master did not change; promotion arm is weaker"
+
+promoted_fences=$(node_fences "$new_master")
+(( promoted_fences >= master_fences )) || \
+	fail "promoted master $new_master holds $promoted_fences fences," \
+		"original master held $master_fences"
+
+echo "SC_FENCE_CLUSTER_PROMOTED: node=$new_master fences=$promoted_fences"
+
+cluster_log_delete_on
+
+echo "Passed test"

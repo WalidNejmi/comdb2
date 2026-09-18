@@ -1347,5 +1347,38 @@ int (*SCDONE_CALLBACKS[])(const char *, void *, scdone_t) = {
 int scdone_callback(bdb_state_type *bdb_state, const char table[], void *arg,
                     scdone_t type)
 {
-    return SCDONE_CALLBACKS[type](table, arg, type);
+    int rc = SCDONE_CALLBACKS[type](table, arg, type);
+    int nfences = 0, bdberr = 0;
+
+    /*
+     * Refresh this node's publication-fence registry from llmeta.
+     *
+     * A replica needs the fence for exactly the same reason the master does:
+     * it applied the converter transactions and, honouring the durable marker,
+     * left their commit-map entries out -- so reconstruction of a page in a
+     * rebuilt file has nothing to look up and needs a fence to stop at.  The
+     * registry is process-local and is only otherwise built at startup, so
+     * without this a replica that was already running when the schema change
+     * arrived would never learn the fence.  The same applies to a node
+     * promoted to master later: it must have been maintaining its own.
+     *
+     * This is the right place because the fence record is written in the
+     * publication transaction, after the scdone record, and these callbacks
+     * run once that transaction has committed -- scdone_alter() reads the new
+     * schema out of llmeta here, so llmeta is readable.  Hooking the scdone
+     * log record itself would be too early: the record would not be there yet.
+     *
+     * Reloading the whole set rather than one build's worth keeps this
+     * independent of which schema change just landed; installing an entry that
+     * is already present just overwrites it with the same values.
+     */
+    if (bdb_load_sc_publication_fences(NULL, &nfences, &bdberr) != 0) {
+        logmsg(LOGMSG_ERROR,
+               "%s: failed to refresh schema-change publication fences "
+               "(bdberr %d); snapshot reconstruction of rebuilt files on this "
+               "node may be unable to stop\n",
+               __func__, bdberr);
+    }
+
+    return rc;
 }

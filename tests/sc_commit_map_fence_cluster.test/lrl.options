@@ -1,0 +1,12 @@
+utxnid_log on
+enable_snapshot_isolation
+
+# The converter entries are only omitted -- and the fences only published --
+# when the master writes the durable marker, which is gated on this writer.
+sc_commit_flags_writer 1
+
+# Keep the fence on the critical path.  A checkpoint after the converter
+# writes would let the checkpoint clause of PAGE_VERSION_IS_GUARANTEED_TARGET
+# short-circuit before the fence is consulted, which is exactly what masks the
+# property on a restarted node (see sc_commit_map_fence_restart).
+setattr CHECKPOINTTIME 9999999
