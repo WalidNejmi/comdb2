@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Characterization test: pin down WHICH commit-record family the
+# schema-change converter actually writes, at runtime, in both configurations.
+#
+# This matters because the durable-flag work adds a flag-carrying twin for every
+# family the converter can use.  Getting the set wrong means the flag silently
+# does not exist for real traffic.  Two facts established by inspection and
+# confirmed here:
+#
+#   * with emit_gen_commits ON (the default) the converter writes the regop_gen
+#     family (berkdb/txn/txn.c:1363-1397);
+#   * with it OFF it writes plain regop (txn.c:1420-1436, via
+#     __txn_regop_log_commit, which takes no rectype argument);
+#
+#     NOTE the knob is gbl_emit_gen_commits, NOT the identically-named berkattr
+#     elect_highest_committed_gen.  The local variable in __txn_commit_int()
+#     that picks the family is *named* elect_highest_committed_gen but is
+#     assigned from (!gbl_fullrecovery && gbl_emit_gen_commits) at txn.c:1135;
+#     the berkattr only biases elections (rep_method.c:1325).  Setting the
+#     berkattr was measured to leave the converter on regop_gen_endianize.
+#   * and because gbl_endianize_locklist defaults ON (txn.c:1025), the gen case
+#     is really regop_gen_ENDIANIZE (151), not regop_gen (16) -- which is why
+#     three new rectypes were allocated, not two.
+#
+# The variant with emit_gen_commits off is generated from
+# nogen.testopts (appended to lrl.options by tools/create_generated_tests.sh),
+# so both modes share this script.
+#
+# Records are identified through the comdb2_transaction_logs systable, which
+# exposes the raw rectype per log record -- this is the "exact ledger" the plan
+# asks for in §10.1, rather than inferring the family from aggregate counters.
+#
+# Runs on a single node or a cluster: the family is chosen by the master when it
+# writes the commit record, so no replica is required.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+
+set -o pipefail
+
+dbnm=$1
+
+N=${SC_COMMIT_MAP_ROWS:-2000}
+
+# Rectypes, in both their plain and utxnid-logged (+2000) forms.  gbl_utxnid_log
+# is on for this test (lrl.options), so the +2000 forms are what actually
+# appear; both are accepted so the test does not silently pass by matching
+# nothing if utxnid logging is ever turned off here.
+R_REGOP=10;                 R_REGOP_U=2010
+R_REGOP_GEN=16;             R_REGOP_GEN_U=2016
+R_REGOP_GEN_END=151;        R_REGOP_GEN_END_U=2151
+R_ROWLOCKS=15;              R_ROWLOCKS_U=2015
+R_ROWLOCKS_END=150;         R_ROWLOCKS_END_U=2150
+R_DIST_COMMIT=19;           R_DIST_COMMIT_U=2019
+R_CHILD=12;                 R_CHILD_U=2012
+
+# Which family do we expect?  The generated variant carries "_nogen_" in its
+# name (sc_commit_map_families_nogen_generated).
+if [[ "$TESTCASE" == *_nogen_* ]]; then
+	MODE=nogen
+else
+	MODE=gen
+fi
+
+master=$(getmaster)
+[[ -z "$master" ]] && failexit "could not find master"
+
+run_master() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+
+fail() { echo "FAIL: $*"; exit 1; }
+
+# Count commit records of a given rectype set that were written strictly after
+# the (file, offset) watermark captured before the rebuild.
+count_after() {
+	local f=$1 o=$2 types=$3
+	run_master "select count(*) from comdb2_transaction_logs
+		where rectype in ($types)
+		  and (lsnfile > $f or (lsnfile = $f and lsnoffset > $o))"
+}
+
+emit_gen=$(run_master "select value from comdb2_tunables where name='emit_gen_commits'")
+case "$MODE" in
+gen)
+	[[ "$emit_gen" == "ON" || "$emit_gen" == "1" ]] || fail \
+		"expected emit_gen_commits ON for the gen variant, got '$emit_gen'"
+	;;
+nogen)
+	[[ "$emit_gen" == "OFF" || "$emit_gen" == "0" ]] || fail \
+		"expected emit_gen_commits OFF for the nogen variant, got '$emit_gen';" \
+		"the variant knob did not take effect and this run would just be a" \
+		"second copy of the gen case"
+	;;
+esac
+
+echo "mode=$MODE rows=$N master=$master emit_gen_commits=$emit_gen"
+
+run_master "create table t(i int)" > /dev/null
+run_master "insert into t select value from generate_series(1, $N)" > /dev/null
+rowcount=$(run_master "select count(*) from t")
+(( rowcount == N )) || fail "expected $N rows, got $rowcount"
+
+# Watermark: the last LSN before the rebuild starts.  Everything the converter
+# writes lands strictly after it.
+wm_file=$(run_master "select max(lsnfile) from comdb2_transaction_logs")
+wm_off=$(run_master "select max(lsnoffset) from comdb2_transaction_logs where lsnfile=$wm_file")
+[[ -z "$wm_file" || -z "$wm_off" ]] && fail "could not read LSN watermark"
+echo "watermark=[$wm_file][$wm_off]"
+
+run_master "rebuild t" > /dev/null || fail "rebuild failed"
+
+n_regop=$(count_after "$wm_file" "$wm_off" "$R_REGOP,$R_REGOP_U")
+n_gen=$(count_after "$wm_file" "$wm_off" "$R_REGOP_GEN,$R_REGOP_GEN_U")
+n_gen_end=$(count_after "$wm_file" "$wm_off" "$R_REGOP_GEN_END,$R_REGOP_GEN_END_U")
+n_rowlocks=$(count_after "$wm_file" "$wm_off" \
+	"$R_ROWLOCKS,$R_ROWLOCKS_U,$R_ROWLOCKS_END,$R_ROWLOCKS_END_U")
+n_dist=$(count_after "$wm_file" "$wm_off" "$R_DIST_COMMIT,$R_DIST_COMMIT_U")
+n_child=$(count_after "$wm_file" "$wm_off" "$R_CHILD,$R_CHILD_U")
+
+echo "SC_COMMIT_MAP_FAMILIES: mode=$MODE rows=$N regop=$n_regop" \
+	"regop_gen=$n_gen regop_gen_endianize=$n_gen_end" \
+	"rowlocks=$n_rowlocks dist_commit=$n_dist child=$n_child"
+
+# The converter commits one transaction per copied row, so the family it uses
+# must appear at least N times.  Anything appearing only a handful of times is
+# schema-change bookkeeping, not the converter.
+case "$MODE" in
+gen)
+	# Default configuration: endianize is on, so the converter's records are
+	# regop_gen_endianize.  Accept either gen form for robustness, but report
+	# which one actually carried the load.
+	total_gen=$(( n_gen + n_gen_end ))
+	if (( total_gen < N )); then
+		fail "expected >= $N regop_gen-family converter commits, got" \
+			"$total_gen (gen=$n_gen endianize=$n_gen_end);" \
+			"the converter is not using the family this test assumes"
+	fi
+	if (( n_gen_end < N && n_gen >= N )); then
+		echo "NOTE: converter used plain regop_gen (16), not the endianize" \
+			"twin -- gbl_endianize_locklist may be off in this build"
+	fi
+	# ...and plain regop must NOT be carrying the converter.
+	if (( n_regop >= N )); then
+		fail "plain regop appeared $n_regop times with" \
+			"emit_gen_commits ON; expected the regop_gen family"
+	fi
+	;;
+nogen)
+	# emit_gen_commits off: the legacy __txn_regop_log_commit() path.
+	if (( n_regop < N )); then
+		fail "expected >= $N plain regop converter commits with" \
+			"emit_gen_commits off, got $n_regop;" \
+			"the regop family may be unreachable -- if so, document why" \
+			"rather than dropping regop_flags support"
+	fi
+	if (( n_gen + n_gen_end >= N )); then
+		fail "regop_gen family appeared $(( n_gen + n_gen_end )) times with" \
+			"emit_gen_commits off; expected plain regop"
+	fi
+	;;
+esac
+
+# Plan §11 acceptance: the skippable set is root, childless, non-rowlock and
+# non-distributed.  None of these families may carry converter traffic.
+if (( n_rowlocks >= N )); then
+	fail "rowlocks family appeared $n_rowlocks times; the converter is not" \
+		"supposed to be a rowlock transaction (skip design assumes page-lock)"
+fi
+if (( n_dist >= N )); then
+	fail "dist_commit appeared $n_dist times; the converter is not supposed" \
+		"to be a distributed transaction"
+fi
+# Child records must not scale with the row count -- the converter root is
+# childless, so a per-row child would break the root-only skip scope.
+if (( n_child >= N )); then
+	fail "child records appeared $n_child times (>= rows=$N); converter roots" \
+		"are supposed to be childless, so the root-only skip scope is unsafe"
+fi
+
+echo "Passed test"

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+set -e
+
+# Serialization round-trip for the flag-carrying commit records.  No database
+# is needed: the executable compiles berkdb's txn_auto.c directly and drives
+# the real production encoders and decoders, so this is a unit test.
+echo "running rectype round-trip executable: ${TESTSBUILDDIR}/txn_commit_flags_roundtrip"
+${TESTSBUILDDIR}/txn_commit_flags_roundtrip

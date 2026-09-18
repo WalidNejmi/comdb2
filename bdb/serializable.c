@@ -484,6 +484,50 @@ static int osql_serial_check(bdb_state_type *bdb_state, void *ranges,
                 if (rectype == DB_llog_ltran_commit) {
                     break;
                 }
+            } else if (rectype == DB___txn_regop_flags) {
+                /*
+                 * Non-gen flag-carrying twin of regop: same prev_lsn walk as
+                 * the regop branch above (commit_flags is appended after the
+                 * fixed fields and does not affect the chain).
+                 */
+                __txn_regop_flags_args *argrfp = NULL;
+                rc = __txn_regop_flags_read(bdb_state->dbenv, logdta.data, &argrfp);
+                prevlsn = argrfp->prev_lsn;
+                free(logdta.data);
+                logdta.data = NULL;
+                rc = prevcur->get(prevcur, &prevlsn, &logdta, DB_SET);
+                if (!rc) {
+                    LOGCOPY_32(&rectype, logdta.data);
+                    normalize_rectype(&rectype);
+                } else {
+                    logmsg(LOGMSG_ERROR, "Unable to get last_logical_lsn, rc %d\n", rc);
+                    free(argrfp);
+                    break;
+                }
+                free(argrfp);
+                if (rectype == DB_llog_ltran_commit) {
+                    break;
+                }
+            } else if (rectype == DB___txn_regop_gen_flags ||
+                       rectype == DB___txn_regop_gen_flags_endianize) {
+                __txn_regop_gen_flags_args *argflagsp = NULL;
+                rc = __txn_regop_gen_flags_read(bdb_state->dbenv, logdta.data, &argflagsp);
+                prevlsn = argflagsp->prev_lsn;
+                free(logdta.data);
+                logdta.data = NULL;
+                rc = prevcur->get(prevcur, &prevlsn, &logdta, DB_SET);
+                if (!rc) {
+                    LOGCOPY_32(&rectype, logdta.data);
+                    normalize_rectype(&rectype);
+                } else {
+                    logmsg(LOGMSG_ERROR, "Unable to get last_logical_lsn, rc %d\n", rc);
+                    free(argflagsp);
+                    break;
+                }
+                free(argflagsp);
+                if (rectype == DB_llog_ltran_commit) {
+                    break;
+                }
             } else if (rectype == DB___txn_regop_gen || rectype == DB___txn_regop_gen_endianize) {
                 rc = __txn_regop_gen_read(bdb_state->dbenv, logdta.data, &arggenp);
                 prevlsn = arggenp->prev_lsn;

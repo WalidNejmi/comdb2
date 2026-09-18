@@ -257,6 +257,12 @@ optostr(int op)
 		return "DB___txn_regop_gen";
 	case DB___txn_regop_gen_endianize:
 		return "DB___txn_regop_gen_endianize";
+	case DB___txn_regop_flags:
+		return "DB___txn_regop_flags";
+	case DB___txn_regop_gen_flags:
+		return "DB___txn_regop_gen_flags";
+	case DB___txn_regop_gen_flags_endianize:
+		return "DB___txn_regop_gen_flags_endianize";
 	case DB___txn_regop_rowlocks:
 		return "DB___txn_regop_rowlocks";
 	case DB___txn_regop_rowlocks_endianize:
@@ -393,6 +399,9 @@ ufid_for_recovery_record(DB_ENV *env, DB_LSN *lsn, int rectype,
 	case DB___txn_regop:
 	case DB___txn_regop_gen:
 	case DB___txn_regop_gen_endianize:
+	case DB___txn_regop_flags:
+	case DB___txn_regop_gen_flags:
+	case DB___txn_regop_gen_flags_endianize:
 	case DB___txn_dist_prepare:
 	case DB___txn_dist_prepare_endianize:
 	case DB___txn_dist_commit:
@@ -514,6 +523,9 @@ __db_dispatch(dbenv, dtab, dtabsize, db, lsnp, redo, info)
 		case DB___txn_regop:
 		case DB___txn_regop_gen:
 		case DB___txn_regop_gen_endianize:
+		case DB___txn_regop_flags:
+		case DB___txn_regop_gen_flags:
+		case DB___txn_regop_gen_flags_endianize:
 		case DB___txn_dist_commit:
 		case DB___txn_dist_abort:
 		case DB___txn_regop_rowlocks:
@@ -598,6 +610,9 @@ __db_dispatch(dbenv, dtab, dtabsize, db, lsnp, redo, info)
 		case DB___txn_regop:
 		case DB___txn_regop_gen:
 		case DB___txn_regop_gen_endianize:
+		case DB___txn_regop_flags:
+		case DB___txn_regop_gen_flags:
+		case DB___txn_regop_gen_flags_endianize:
 		case DB___txn_dist_commit:
 		case DB___txn_dist_abort:
 		case DB___txn_regop_rowlocks:

@@ -41,6 +41,21 @@ int __txn_regop_gen_print __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
 int __txn_regop_gen_read __P((DB_ENV *, void *, __txn_regop_gen_args **));
 unsigned long long __txn_regop_read_context __P((__txn_regop_args *));
 
+/* Flag-carrying commit records (see txn_auto.h). */
+int __txn_regop_flags_log __P((DB_ENV *, DB_TXN *, DB_LSN *, u_int64_t *, u_int32_t, u_int32_t, int32_t, u_int32_t, const DBT *, void *));
+int __txn_regop_flags_getpgnos __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
+int __txn_regop_flags_getallpgnos __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
+int __txn_regop_flags_read_int __P((DB_ENV *, void *, int, __txn_regop_flags_args **));
+int __txn_regop_flags_print __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
+int __txn_regop_flags_read __P((DB_ENV *, void *, __txn_regop_flags_args **));
+unsigned long long __txn_regop_flags_read_context __P((__txn_regop_flags_args *));
+int __txn_regop_gen_flags_log __P((DB_ENV *, u_int32_t, DB_TXN *, DB_LSN *, u_int64_t *, u_int32_t, u_int32_t, u_int32_t, u_int64_t, u_int32_t, const DBT *, void *));
+int __txn_regop_gen_flags_getpgnos __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
+int __txn_regop_gen_flags_getallpgnos __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
+int __txn_regop_gen_flags_read_int __P((DB_ENV *, void *, int, __txn_regop_gen_flags_args **));
+int __txn_regop_gen_flags_print __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
+int __txn_regop_gen_flags_read __P((DB_ENV *, void *, __txn_regop_gen_flags_args **));
+
 /* For 2pc */
 int __txn_dist_prepare_log __P((DB_ENV *, u_int32_t, DB_TXN *, DB_LSN *, u_int32_t, u_int32_t, DB_LSN *, const DBT *, u_int64_t, u_int32_t, u_int32_t, const DBT *, const DBT *, const DBT *, const DBT *));
 int __txn_dist_prepare_getpgnos __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
@@ -94,6 +109,8 @@ void __txn_dbenv_create __P((DB_ENV *));
 int __txn_set_tx_max __P((DB_ENV *, u_int32_t));
 int __txn_regop_recover __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
 int __txn_regop_gen_recover __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
+int __txn_regop_flags_recover __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
+int __txn_regop_gen_flags_recover __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
 int __txn_regop_rowlocks_recover __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
 int __txn_dist_commit_recover __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
 int __txn_dist_prepare_recover __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));

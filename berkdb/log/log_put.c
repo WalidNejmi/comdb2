@@ -144,12 +144,15 @@ int gbl_commit_delay_trace = 0;
 static inline int is_commit_record(int rectype) {
 	switch(rectype) {
 		/* regop regop_gen regop_rowlocks */
-		case (DB___txn_regop): 
+		case (DB___txn_regop):
 		case (DB___txn_regop_gen):
 		case (DB___txn_regop_gen_endianize):
 		case (DB___txn_dist_commit):
 		case (DB___txn_regop_rowlocks):
 		case (DB___txn_regop_rowlocks_endianize):
+		case (DB___txn_regop_flags):
+		case (DB___txn_regop_gen_flags):
+		case (DB___txn_regop_gen_flags_endianize):
 			return 1;
 			break;
 		default:
@@ -738,12 +741,15 @@ __log_put_next(dbenv, lsn, context, dbt, udbt, hdr, old_lsnp, off_context, key, 
 		unsigned long long ltid = 0, *ltranid = &ltid;
 		int pushlog = 1;
 
-		assert( rectype == DB___txn_regop || 
+		assert( rectype == DB___txn_regop ||
 				rectype == DB___txn_regop_gen ||
 				rectype == DB___txn_regop_rowlocks ||
 				rectype == DB___txn_dist_commit ||
 				rectype == DB___txn_regop_gen_endianize ||
-				rectype == DB___txn_regop_rowlocks_endianize);
+				rectype == DB___txn_regop_rowlocks_endianize ||
+				rectype == DB___txn_regop_flags ||
+				rectype == DB___txn_regop_gen_flags ||
+				rectype == DB___txn_regop_gen_flags_endianize);
 
 		if (rectype == DB___txn_regop_rowlocks ||
 			rectype == DB___txn_regop_rowlocks_endianize)
@@ -754,8 +760,15 @@ __log_put_next(dbenv, lsn, context, dbt, udbt, hdr, old_lsnp, off_context, key, 
 			pushlog = (flags & DB_LOG_LOGICAL_COMMIT);
 		}
 
+		/*
+		 * The flag-carrying variants append commit_flags AFTER the fields read
+		 * here, so generation sits at exactly the same offset as in the parent
+		 * record and the same expression serves both.
+		 */
 		if (rectype == DB___txn_regop_gen ||
-			rectype == DB___txn_regop_gen_endianize)
+			rectype == DB___txn_regop_gen_endianize ||
+			rectype == DB___txn_regop_gen_flags ||
+			rectype == DB___txn_regop_gen_flags_endianize)
 		{
 			/* rectype(4)+txn_num(4)+db_lsn(8)+txn_unum(8)+opcode(4)+GENERATION(4) */
 			LOGCOPY_32( &generation, &pp[ 4 + 4 + 8 + (utxnid_logged ? 8 : 0) + 4] );

@@ -4196,6 +4196,9 @@ int is_commit(u_int32_t rectype)
     case DB___txn_dist_commit:
     case DB___txn_regop_rowlocks:
     case DB___txn_regop_rowlocks_endianize:
+    case DB___txn_regop_flags:
+    case DB___txn_regop_gen_flags:
+    case DB___txn_regop_gen_flags_endianize:
         return 1;
     default:
         return 0;
@@ -4301,6 +4304,45 @@ static inline int retrieve_start_lsn(DBT *data, u_int32_t rectype, DB_LSN *lsn)
         *lsn = txn_gen_args->prev_lsn;
         free(txn_gen_args);
         break;
+
+    case DB___txn_regop_flags: {
+        __txn_regop_flags_args *txn_flags_args = NULL;
+        if ((rc = __txn_regop_flags_read(dbenv, data->data, &txn_flags_args)) !=
+            0) {
+            logmsg(LOGMSG_ERROR,
+                   "%s line %d regop_flags read returns %d for "
+                   "%d:%d\n",
+                   __func__, __LINE__, rc, lsn->file, lsn->offset);
+            return 1;
+        }
+        if (txn_flags_args->opcode != TXN_COMMIT) {
+            free(txn_flags_args);
+            return 1;
+        }
+        *lsn = txn_flags_args->prev_lsn;
+        free(txn_flags_args);
+        break;
+    }
+
+    case DB___txn_regop_gen_flags:
+    case DB___txn_regop_gen_flags_endianize: {
+        __txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
+        if ((rc = __txn_regop_gen_flags_read(dbenv, data->data,
+                                             &txn_gen_flags_args)) != 0) {
+            logmsg(LOGMSG_ERROR,
+                   "%s line %d regop_gen_flags read returns %d for "
+                   "%d:%d\n",
+                   __func__, __LINE__, rc, lsn->file, lsn->offset);
+            return 1;
+        }
+        if (txn_gen_flags_args->opcode != TXN_COMMIT) {
+            free(txn_gen_flags_args);
+            return 1;
+        }
+        *lsn = txn_gen_flags_args->prev_lsn;
+        free(txn_gen_flags_args);
+        break;
+    }
 
     case DB___txn_regop_rowlocks:
     case DB___txn_regop_rowlocks_endianize:

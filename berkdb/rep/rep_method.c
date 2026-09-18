@@ -1159,9 +1159,12 @@ __retrieve_logged_generation_commitlsn(dbenv, lsn, gen)
 			rectype != DB___txn_regop_gen_endianize &&
 			rectype != DB___txn_regop_rowlocks_endianize &&
 			rectype != DB___txn_dist_prepare_endianize &&
+			rectype != DB___txn_regop_gen_flags &&
+			rectype != DB___txn_regop_gen_flags_endianize &&
 			(rectype != DB___txn_ckp || !vote_on_ckp)) {
 
-		if (rectype == DB___txn_regop && !vote_on_ckp) {
+		if ((rectype == DB___txn_regop || rectype == DB___txn_regop_flags) &&
+		    !vote_on_ckp) {
 			regop_cnt++;
 
 			/* Tolerate txn_regop to a point (unfortunately) - but only if we are not allowed to
@@ -1209,6 +1212,25 @@ __retrieve_logged_generation_commitlsn(dbenv, lsn, gen)
 		}
 		MUTEX_UNLOCK(dbenv, db_rep->rep_mutexp);
 		__os_free(dbenv, txn_gen_args);
+	} else if (rectype == DB___txn_regop_gen_flags ||
+			rectype == DB___txn_regop_gen_flags_endianize) {
+		/*
+		 * Same generation semantics as regop_gen; commit_flags does not
+		 * participate in election/generation decisions.
+		 */
+		__txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
+		if ((ret = __txn_regop_gen_flags_read(dbenv, rec.data,
+						&txn_gen_flags_args)) != 0)
+			goto err;
+		MUTEX_LOCK(dbenv, db_rep->rep_mutexp);
+		rep->committed_lsn = *lsn = curlsn;
+		rep->committed_gen = *gen = txn_gen_flags_args->generation;
+		if (rep->gen < rep->committed_gen) {
+			__rep_set_gen(dbenv, __func__, __LINE__, rep->committed_gen);
+			__rep_set_log_gen(dbenv, __func__, __LINE__, rep->gen);
+		}
+		MUTEX_UNLOCK(dbenv, db_rep->rep_mutexp);
+		__os_free(dbenv, txn_gen_flags_args);
 	} else if (rectype == DB___txn_dist_prepare ||
 			rectype == DB___txn_dist_prepare_endianize) {
 		__txn_dist_prepare_args *txn_dist_prepare_args = NULL;

@@ -136,6 +136,29 @@ list(APPEND test-tools crc32c_test)
 # Tests that live outside this repo. Included before the link loop below so
 # the tools it adds pick up cdb2api and the common deps like any other one.
 set(COMDB2_EXTRA_TESTS ${EXTRA_TESTS} CACHE PATH "Path to additional tests")
+# Serialization round-trip tests for the flag-carrying commit records.  Unlike
+# the rest of this directory these are not client tests: they compile berkdb's
+# txn_auto.c directly so they exercise the real production decoders, with link
+# stubs standing in for the rest of the server (see the _stubs.c file).
+add_exe(txn_commit_flags_roundtrip
+  txn_commit_flags_roundtrip.c
+  txn_commit_flags_roundtrip_stubs.c
+  ${PROJECT_SOURCE_DIR}/berkdb/txn/txn_auto.c
+)
+target_include_directories(txn_commit_flags_roundtrip PRIVATE
+  ${PROJECT_SOURCE_DIR}/berkdb/build
+  ${PROJECT_SOURCE_DIR}/berkdb
+  ${PROJECT_BINARY_DIR}/berkdb
+  ${PROJECT_SOURCE_DIR}/bdb
+  ${PROJECT_SOURCE_DIR}/dlmalloc
+)
+target_compile_definitions(txn_commit_flags_roundtrip PRIVATE
+  PER_THREAD_MALLOC
+  _GNU_SOURCE
+  _LINUX_SOURCE
+  lint
+)
+
 if (COMDB2_EXTRA_TESTS)
   include(${COMDB2_EXTRA_TESTS}/CMakeLists.txt)
 endif()

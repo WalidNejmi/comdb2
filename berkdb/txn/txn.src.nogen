@@ -193,3 +193,41 @@ ARG generation	u_int32_t	u
 ARG context		genid_t		llx
 TIME timestamp	u_int64_t	llx
 END
+
+/*
+ * NOTE: this file is not part of the build (see the .nogen warning at the top)
+ * and has already drifted from txn_auto.h -- DB___txn_ckp_recovery (20) has no
+ * BEGIN block here.  The definitions below are recorded for documentation and
+ * for anyone who ever does regenerate; txn_auto.c / txn_auto.h remain the
+ * source of truth, and their hand-maintained local edits (utxnid plumbing,
+ * commit-context offsets, endianize variants) are NOT reproduced by gen_rec.awk.
+ *
+ * Flag-carrying commit records.  Each is the corresponding legacy commit record
+ * with a u_int32_t commit_flags appended after the last fixed field and before
+ * the trailing locks DBT.  They are separate rectypes rather than a widening of
+ * 10/16 because existing consumers parse the legacy layouts at computed byte
+ * offsets, and because an older node must fail to recognize such a record
+ * rather than silently misread a wider one.
+ *
+ * Numbers are allocated above the _endianize block (150-152): the txn block
+ * 10-20 cannot be extended contiguously because 21 is DB___ham_insdel.
+ *
+ * regop_gen_flags additionally has an endianize twin (155), mirroring
+ * regop_gen/regop_gen_endianize, because gbl_endianize_locklist defaults on.
+ * regop has no endianize twin, so regop_flags needs none.
+ */
+BEGIN regop_flags		153
+ARG	opcode		u_int32_t	lu
+TIME	timestamp	int32_t		ld
+ARG	commit_flags	u_int32_t	lu
+DBT	locks		DBT		s
+END
+
+BEGIN regop_gen_flags		154
+ARG	opcode		u_int32_t	lu
+ARG generation  u_int32_t   u
+ARG context   genid_t llx
+TIME	timestamp	u_int64_t		llx
+ARG	commit_flags	u_int32_t	lu
+DBT	locks		DBT		s
+END

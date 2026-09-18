@@ -202,6 +202,16 @@ uint64_t logrecord_timestamp_matchable(char *data)
         return logrecord_timestamp_regop_gen(data);
     }
 
+    /*
+     * regop_gen_flags is regop_gen with commit_flags appended AFTER the
+     * timestamp, so the regop_gen offset parse applies unchanged.
+     */
+    if (rectype == DB___txn_regop_gen_flags || (rectype == DB___txn_regop_gen_flags + 2000) ||
+        rectype == DB___txn_regop_gen_flags_endianize ||
+        (rectype == DB___txn_regop_gen_flags_endianize + 2000)) {
+        return logrecord_timestamp_regop_gen(data);
+    }
+
     if (rectype == DB___txn_dist_commit || (rectype == DB___txn_dist_commit + 2000)) {
         return logrecord_timestamp_dist_commit(data);
     }

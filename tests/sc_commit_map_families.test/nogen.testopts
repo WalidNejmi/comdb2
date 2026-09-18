@@ -1,0 +1,12 @@
+# Force the legacy (non-generation) commit path so the converter writes plain
+# regop instead of the regop_gen family.
+#
+# The knob is "emit_gen_commits", NOT the berkattr "elect_highest_committed_gen".
+# The local variable in __txn_commit_int() that selects the family happens to be
+# named elect_highest_committed_gen, but it is assigned from
+#   (!gbl_fullrecovery && gbl_emit_gen_commits)     -- berkdb/txn/txn.c:1135
+# so the identically-named berkattr (which biases elections,
+# berkdb/rep/rep_method.c:1325) has no effect on which commit record is written.
+# Setting the berkattr here was measured to leave the converter on
+# regop_gen_endianize, i.e. it is the wrong knob.
+emit_gen_commits off

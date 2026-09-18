@@ -3156,6 +3156,16 @@ __txn_force_abort(dbenv, buffer)
 	 * __txn_xa_regop records in txn.src.  We are passed the beginning
 	 * of the commit record in the log buffer and overwrite the
 	 * commit with an abort and recalculate the checksum.
+	 *
+	 * It is NOT gated on rectype: it overwrites whatever commit record sits
+	 * at this offset.  That is safe for the flag-carrying variants
+	 * (regop_flags / regop_gen_flags) only because they keep opcode as the
+	 * first field after the header, exactly where regop and regop_gen have
+	 * it -- commit_flags is appended at the END, after the other fixed
+	 * fields.  Do not reorder those layouts.  Forcing the opcode to
+	 * TXN_ABORT is also sufficient to neutralize commit_flags downstream,
+	 * because every consumer of SC_PRIVATE_SKIP_MAP first requires
+	 * opcode == TXN_COMMIT.
 	 */
 	hdrsize = CRYPTO_ON(dbenv) ? HDR_CRYPTO_SZ : HDR_NORMAL_SZ;
 

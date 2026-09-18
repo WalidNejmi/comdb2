@@ -181,6 +181,9 @@ static inline int wait_for_running_transactions(DB_ENV *dbenv);
 	(R) != DB___dbreg_register && \
 	(R) != DB___txn_dist_prepare && \
 	(R) != DB___txn_dist_prepare_endianize && \
+	(R) != DB___txn_regop_flags && \
+	(R) != DB___txn_regop_gen_flags && \
+	(R) != DB___txn_regop_gen_flags_endianize && \
 	(R) != DB___txn_dist_abort)
 
 int gbl_rep_process_msg_print_rc;
@@ -465,6 +468,9 @@ matchable_log_type(DB_ENV *dbenv, int rectype)
 		ret = ((!dbenv->attr.elect_highest_committed_gen && rectype == DB___txn_regop) ||
 				rectype == DB___txn_regop_gen ||
 				rectype == DB___txn_regop_gen_endianize ||
+				rectype == DB___txn_regop_flags ||
+				rectype == DB___txn_regop_gen_flags ||
+				rectype == DB___txn_regop_gen_flags_endianize ||
 				rectype == DB___txn_dist_commit ||
 				rectype == DB___txn_dist_abort ||
 				rectype == DB___txn_regop_rowlocks ||
@@ -2097,16 +2103,21 @@ more:
 		LOGCOPY_32(&rectype, mylog.data);
 
 		int utxnid_logged = normalize_rectype(&rectype);
-		if (rectype == DB___txn_regop) {
+		if (rectype == DB___txn_regop || rectype == DB___txn_regop_flags) {
 			/* If it's a commit, copy the timestamp - if we're about to unroll too
 			 * far, we want to notice and not do it. */
 			uint32_t timestamp;
 			time_t t;
 			__txn_regop_args a;
 
-			/* I feel slightly bad hardcoding the timestamp offset, but I'd rather not call 
-			 * __txn_regop_read_int per record just to perform this check, and the log format 
+			/* I feel slightly bad hardcoding the timestamp offset, but I'd rather not call
+			 * __txn_regop_read_int per record just to perform this check, and the log format
 			 * is not likely to change without notice. */
+			/*
+			 * regop_flags shares this offset: it is regop with commit_flags
+			 * appended AFTER the timestamp, so opcode and timestamp stay put.
+			 * (As before, the gen families are not handled here.)
+			 */
 			LOGCOPY_32(&timestamp,
 				(uint8_t *)mylog.data + sizeof(a.type) +
 				sizeof(a.txnid->txnid) + sizeof(DB_LSN) +
@@ -3011,6 +3022,9 @@ static inline int is_commit(int rectype)
 		case DB___txn_regop_gen:
 		case DB___txn_regop_gen_endianize:
 		case DB___txn_dist_commit:
+		case DB___txn_regop_flags:
+		case DB___txn_regop_gen_flags:
+		case DB___txn_regop_gen_flags_endianize:
 			return 1;
 		default:
 			return 0;
@@ -3948,6 +3962,9 @@ gap_check:		use_range = 0;
 	case DB___txn_regop:
 	case DB___txn_regop_gen:
 	case DB___txn_regop_gen_endianize:
+	case DB___txn_regop_flags:
+	case DB___txn_regop_gen_flags:
+	case DB___txn_regop_gen_flags_endianize:
 	case DB___txn_dist_commit:
 		if (gbl_dumptxn_at_commit)
 			dumptxn(dbenv, &rp->lsn);
@@ -4992,6 +5009,8 @@ __rep_process_txn_int(dbenv, rctl, rec, ltrans, maxlsn, commit_gen, rep_gen, loc
 	uint64_t x1=0, x2=0, d;
 	__txn_regop_args *txn_args = NULL;
 	__txn_regop_gen_args *txn_gen_args = NULL;
+	__txn_regop_flags_args *txn_flags_args = NULL;
+	__txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
 	__txn_regop_rowlocks_args *txn_rl_args = NULL;
 	__txn_dist_commit_args *txn_dist_commit_args = NULL;
 	void *args = NULL;
@@ -5175,6 +5194,55 @@ __rep_process_txn_int(dbenv, rctl, rec, ltrans, maxlsn, commit_gen, rep_gen, loc
 		lock_dbt = &txn_gen_args->locks;
 		MUTEX_LOCK(dbenv, db_rep->rep_mutexp);
 		(*commit_gen) = rep->committed_gen = txn_gen_args->generation;
+		assert(*commit_gen);
+		rep->committed_lsn = rctl->lsn;
+		MUTEX_UNLOCK(dbenv, db_rep->rep_mutexp);
+	} else if (rectype == DB___txn_regop_flags) {
+		/*
+		 * Flag-carrying twin of DB___txn_regop.  Decoded and applied exactly
+		 * like its parent; commit_flags is available as
+		 * txn_flags_args->commit_flags and is honoured at the root map-add in
+		 * the serial-omission commit.
+		 */
+		if ((ret = __txn_regop_flags_read(dbenv, rec->data, &txn_flags_args)) != 0) {
+			logmsg(LOGMSG_DEBUG, "%s failed at line %d\n", __func__, __LINE__);
+			return (ret);
+		}
+		if (txn_flags_args->opcode != TXN_COMMIT) {
+			__os_free(dbenv, txn_flags_args);
+			return (0);
+		}
+		args = txn_flags_args;
+		context = __txn_regop_flags_read_context(txn_flags_args);
+		txnid = txn_flags_args->txnid->txnid;
+		utxnid = txn_flags_args->txnid->utxnid;
+		prev_lsn = txn_flags_args->prev_lsn;
+		lock_dbt = &txn_flags_args->locks;
+		(*commit_gen) = 0;
+	} else if (rectype == DB___txn_regop_gen_flags ||
+			rectype == DB___txn_regop_gen_flags_endianize) {
+		/* Flag-carrying twin of DB___txn_regop_gen; see above. */
+		if (rectype == DB___txn_regop_gen_flags_endianize) {
+			endianize = 1;
+		}
+		if ((ret =
+			__txn_regop_gen_flags_read(dbenv, rec->data,
+				&txn_gen_flags_args)) != 0) {
+			logmsg(LOGMSG_DEBUG, "%s failed at line %d\n", __func__, __LINE__);
+			return (ret);
+		}
+		if (txn_gen_flags_args->opcode != TXN_COMMIT) {
+			__os_free(dbenv, txn_gen_flags_args);
+			return (0);
+		}
+		args = txn_gen_flags_args;
+		context = txn_gen_flags_args->context;
+		txnid = txn_gen_flags_args->txnid->txnid;
+		utxnid = txn_gen_flags_args->txnid->utxnid;
+		prev_lsn = txn_gen_flags_args->prev_lsn;
+		lock_dbt = &txn_gen_flags_args->locks;
+		MUTEX_LOCK(dbenv, db_rep->rep_mutexp);
+		(*commit_gen) = rep->committed_gen = txn_gen_flags_args->generation;
 		assert(*commit_gen);
 		rep->committed_lsn = rctl->lsn;
 		MUTEX_UNLOCK(dbenv, db_rep->rep_mutexp);
@@ -5622,6 +5690,11 @@ err1:
 	else if (rectype == DB___txn_regop_gen ||
 		rectype == DB___txn_regop_gen_endianize)
 		__os_free(dbenv, txn_gen_args);
+	else if (rectype == DB___txn_regop_flags)
+		__os_free(dbenv, txn_flags_args);
+	else if (rectype == DB___txn_regop_gen_flags ||
+		rectype == DB___txn_regop_gen_flags_endianize)
+		__os_free(dbenv, txn_gen_flags_args);
 	else if (rectype == DB___txn_regop_rowlocks ||
 		rectype == DB___txn_regop_rowlocks_endianize)
 		__os_free(dbenv, txn_rl_args);
@@ -5872,6 +5945,8 @@ __rep_process_txn_concurrent_int(dbenv, rctl, rec, ltrans, ctrllsn, maxlsn,
 	LTDESC *lt = NULL;
 	__txn_regop_args *txn_args = NULL;
 	__txn_regop_gen_args *txn_gen_args = NULL;
+	__txn_regop_flags_args *txn_flags_args = NULL;
+	__txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
 	__txn_regop_rowlocks_args *txn_rl_args = NULL;
 	__txn_dist_commit_args *txn_dist_commit_args = NULL;
 	void *args = NULL;
@@ -6105,6 +6180,64 @@ bad_resize:	;
 
 		MUTEX_LOCK(dbenv, db_rep->rep_mutexp);
 		(*commit_gen) = rep->committed_gen = txn_gen_args->generation;
+		rep->committed_lsn = rctl->lsn;
+		MUTEX_UNLOCK(dbenv, db_rep->rep_mutexp);
+
+	} else if (rectype == DB___txn_regop_flags) {
+		/*
+		 * Flag-carrying twin of DB___txn_regop.  Decoded and applied exactly
+		 * like its parent; commit_flags is available as
+		 * txn_flags_args->commit_flags and is honoured at the root map-add in
+		 * the concurrent-omission commit, where it must also be carried into
+		 * the processor state (and reset on processor reuse / preserved across
+		 * deadlock retry).
+		 */
+		if ((ret = __txn_regop_flags_read(dbenv, rec->data, &txn_flags_args)) != 0)
+			return (ret);
+		if (txn_flags_args->opcode != TXN_COMMIT) {
+			__os_free(dbenv, txn_flags_args);
+			return (0);
+		}
+
+		args = txn_flags_args;
+		rp->context = __txn_regop_flags_read_context(txn_flags_args);
+		(*commit_gen) = 0;
+
+		txnid = txn_flags_args->txnid->txnid;
+		utxnid = txn_flags_args->txnid->utxnid;
+		rp->ltrans = NULL;
+
+		prev_lsn = txn_flags_args->prev_lsn;
+		lock_dbt = &txn_flags_args->locks;
+
+	} else if (rectype == DB___txn_regop_gen_flags ||
+			rectype == DB___txn_regop_gen_flags_endianize) {
+		/* Flag-carrying twin of DB___txn_regop_gen; see above. */
+		if (rectype == DB___txn_regop_gen_flags_endianize) {
+			endianize = 1;
+		}
+
+		if ((ret =
+			__txn_regop_gen_flags_read(dbenv, rec->data,
+				&txn_gen_flags_args)) != 0)
+			return (ret);
+		if (txn_gen_flags_args->opcode != TXN_COMMIT) {
+			__os_free(dbenv, txn_gen_flags_args);
+			return (0);
+		}
+
+		args = txn_gen_flags_args;
+		rp->context = txn_gen_flags_args->context;
+
+		txnid = txn_gen_flags_args->txnid->txnid;
+		utxnid = txn_gen_flags_args->txnid->utxnid;
+		rp->ltrans = NULL;
+
+		prev_lsn = txn_gen_flags_args->prev_lsn;
+		lock_dbt = &txn_gen_flags_args->locks;
+
+		MUTEX_LOCK(dbenv, db_rep->rep_mutexp);
+		(*commit_gen) = rep->committed_gen = txn_gen_flags_args->generation;
 		rep->committed_lsn = rctl->lsn;
 		MUTEX_UNLOCK(dbenv, db_rep->rep_mutexp);
 
@@ -6497,6 +6630,8 @@ bad_resize:	;
 
 	txn_args = NULL;
 	txn_gen_args = NULL;
+	txn_flags_args = NULL;
+	txn_gen_flags_args = NULL;
 	txn_rl_args = NULL;
 
 	/* If we got this far, we let the processor do cleanup */
@@ -6510,6 +6645,11 @@ err:
 	if ((rectype == DB___txn_regop_gen ||
 		 rectype == DB___txn_regop_gen_endianize) && txn_gen_args)
 		__os_free(dbenv, txn_gen_args);
+	if (rectype == DB___txn_regop_flags && txn_flags_args)
+		__os_free(dbenv, txn_flags_args);
+	if ((rectype == DB___txn_regop_gen_flags ||
+		 rectype == DB___txn_regop_gen_flags_endianize) && txn_gen_flags_args)
+		__os_free(dbenv, txn_gen_flags_args);
 	if (rectype == DB___txn_dist_commit && txn_dist_commit_args) {
 		if (got_schema_lk)
 			unlock_schema_lk();
@@ -7553,6 +7693,65 @@ restart:
 				goto err;
 		}
 
+		/*
+		 * Flag-carrying twins: identical undo/lock handling.  commit_flags
+		 * plays no part in deciding whether to undo -- an intentionally
+		 * omitted map entry is not an absent transaction.
+		 */
+		if (rectype == DB___txn_regop_gen_flags ||
+			rectype == DB___txn_regop_gen_flags_endianize) {
+			__txn_regop_gen_flags_args *txngenflagsrec = NULL;
+			if (rectype == DB___txn_regop_gen_flags_endianize) {
+				endianize = 1;
+			}
+			if ((ret =
+				__txn_regop_gen_flags_read(dbenv, mylog.data,
+					&txngenflagsrec)) != 0)
+				goto err;
+			if (txngenflagsrec->opcode != TXN_ABORT) {
+				undo = 1;
+			}
+			if (online)
+				ret = recovery_getlocks(dbenv, lockid, &txngenflagsrec->locks, lsn, endianize);
+
+			__os_free(dbenv, txngenflagsrec);
+
+			if (ret == DB_LOCK_DEADLOCK) {
+				gbl_rep_trans_deadlocked++;
+				recovery_release_locks(dbenv, lockid);
+				lockid = DB_LOCK_INVALIDID;
+				goto restart;
+			}
+
+			if (ret)
+				goto err;
+		}
+
+		if (rectype == DB___txn_regop_flags) {
+			__txn_regop_flags_args *txnflagsrec = NULL;
+			if ((ret =
+				__txn_regop_flags_read(dbenv, mylog.data,
+					&txnflagsrec)) != 0)
+				goto err;
+			if (txnflagsrec->opcode != TXN_ABORT) {
+				undo = 1;
+			}
+			if (online)
+				ret = recovery_getlocks(dbenv, lockid, &txnflagsrec->locks, lsn, endianize);
+
+			__os_free(dbenv, txnflagsrec);
+
+			if (ret == DB_LOCK_DEADLOCK) {
+				gbl_rep_trans_deadlocked++;
+				recovery_release_locks(dbenv, lockid);
+				lockid = DB_LOCK_INVALIDID;
+				goto restart;
+			}
+
+			if (ret)
+				goto err;
+		}
+
 		if (rectype == DB___txn_regop) {
 			if ((ret =
 				__txn_regop_read(dbenv, mylog.data,
@@ -7860,6 +8059,64 @@ get_committed_lsns(dbenv, inlsns, n_lsns, epoch, file, offset)
 					__os_free(dbenv, txn_gen_args);
 				} break;
 
+			case DB___txn_regop_flags:
+			case DB___txn_regop_gen_flags_endianize:
+			case DB___txn_regop_gen_flags: {
+				/*
+				 * Same epoch/commit accounting as the parent records.  Only
+				 * the timestamp, opcode and prev_lsn are needed here, and both
+				 * flag-carrying layouts keep them where the parents do, so a
+				 * single branch serves all three rectypes.
+				 */
+				u_int64_t ftimestamp;
+				u_int32_t fopcode;
+				DB_LSN fprev_lsn;
+
+				if (rectype == DB___txn_regop_flags) {
+					__txn_regop_flags_args *fa = NULL;
+					if ((ret = __txn_regop_flags_read(dbenv, mylog.data,
+													&fa)) != 0)
+						return (ret);
+					ftimestamp = (u_int64_t)fa->timestamp;
+					fopcode = fa->opcode;
+					fprev_lsn = fa->prev_lsn;
+					__os_free(dbenv, fa);
+				} else {
+					__txn_regop_gen_flags_args *fa = NULL;
+					if ((ret = __txn_regop_gen_flags_read(dbenv, mylog.data,
+													&fa)) != 0)
+						return (ret);
+					ftimestamp = fa->timestamp;
+					fopcode = fa->opcode;
+					fprev_lsn = fa->prev_lsn;
+					__os_free(dbenv, fa);
+				}
+
+				if (ftimestamp < epoch) {
+					done = 1;
+					break;
+				}
+
+				if (fopcode == TXN_COMMIT) {
+					if (*n_lsns + 1 >= curlim) {
+						curlim = (!curlim) ? 1000 : 2 * curlim;
+						if (!(newlsns = (DB_LSN *)realloc(lsns,
+								curlim * sizeof(DB_LSN)))) {
+							logmsg(LOGMSG_ERROR,
+								"%s:%d Too complex snapshot (realloc failure at trns %d)\n",
+								__FILE__, __LINE__, *n_lsns);
+							ret = ENOMEM;
+							if (lsns) free(lsns);
+							lsns = NULL;
+							goto err;
+						}
+						lsns = newlsns;
+					}
+					lsns[*n_lsns] = fprev_lsn;
+					*n_lsns += 1;
+				}
+			} break;
+
 			case DB___txn_dist_commit: {
 				if ((ret = __txn_dist_commit_read(dbenv, mylog.data,
 												&txn_dist_commit_args)) != 0) {
@@ -8161,6 +8418,52 @@ get_lsn_context_from_timestamp(dbenv, timestamp, ret_lsn, ret_context)
 			txn_gen_args = NULL;
 		}
 
+		if (rectype == DB___txn_regop_flags) {
+			__txn_regop_flags_args *txn_flags_args = NULL;
+			if ((rc = __txn_regop_flags_read(dbenv, logdta.data,
+					&txn_flags_args)) != 0)
+				goto err;
+			if (txn_flags_args->timestamp <= timestamp) {
+				*ret_lsn = lsn;
+				if (ret_context)
+					*ret_context =
+						__txn_regop_flags_read_context(txn_flags_args);
+			}
+			if (txn_flags_args->timestamp > timestamp) {
+				if (logdta.data) {
+					__os_free(dbenv, logdta.data);
+					logdta.data = NULL;
+				}
+				__os_free(dbenv, txn_flags_args);
+				__log_c_close(logc);
+				return 0;
+			}
+			__os_free(dbenv, txn_flags_args);
+		}
+
+		if (rectype == DB___txn_regop_gen_flags ||
+			rectype == DB___txn_regop_gen_flags_endianize) {
+			__txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
+			if ((rc = __txn_regop_gen_flags_read(dbenv, logdta.data,
+					&txn_gen_flags_args)) != 0)
+				goto err;
+			if (txn_gen_flags_args->timestamp <= timestamp) {
+				*ret_lsn = lsn;
+				if (ret_context)
+					*ret_context = txn_gen_flags_args->context;
+			}
+			if (txn_gen_flags_args->timestamp > timestamp) {
+				if (logdta.data) {
+					__os_free(dbenv, logdta.data);
+					logdta.data = NULL;
+				}
+				__os_free(dbenv, txn_gen_flags_args);
+				__log_c_close(logc);
+				return 0;
+			}
+			__os_free(dbenv, txn_gen_flags_args);
+		}
+
 		if (rectype == DB___txn_dist_commit) {
 			if ((rc =
 				__txn_dist_commit_read(dbenv, logdta.data,
@@ -8263,6 +8566,9 @@ get_context_from_lsn(dbenv, lsn, ret_context)
 	while ( rectype != DB___txn_regop &&
 			rectype != DB___txn_regop_gen && 
 			rectype != DB___txn_regop_gen_endianize && 
+			rectype != DB___txn_regop_flags &&
+			rectype != DB___txn_regop_gen_flags &&
+			rectype != DB___txn_regop_gen_flags_endianize &&
 			rectype != DB___txn_dist_commit &&
 			rectype != DB___txn_regop_rowlocks &&
 			rectype != DB___txn_regop_rowlocks_endianize) {
@@ -8283,6 +8589,9 @@ get_context_from_lsn(dbenv, lsn, ret_context)
 	assert(rectype == DB___txn_regop ||
 		   rectype == DB___txn_regop_gen ||
 		   rectype == DB___txn_regop_gen_endianize ||
+		   rectype == DB___txn_regop_flags ||
+		   rectype == DB___txn_regop_gen_flags ||
+		   rectype == DB___txn_regop_gen_flags_endianize ||
 		   rectype == DB___txn_dist_commit ||
 		   rectype == DB___txn_regop_rowlocks ||
 		   rectype == DB___txn_regop_rowlocks_endianize);
@@ -8309,6 +8618,33 @@ get_context_from_lsn(dbenv, lsn, ret_context)
 			logdta.data = NULL;
 		}
 		__os_free(dbenv, txn_gen_args);
+		__log_c_close(logc);
+		return 0;
+	} else if (rectype == DB___txn_regop_flags) {
+		__txn_regop_flags_args *txn_flags_args = NULL;
+		if ((rc = __txn_regop_flags_read(dbenv, logdta.data,
+				&txn_flags_args)) != 0)
+			goto err;
+		*ret_context = __txn_regop_flags_read_context(txn_flags_args);
+		if (logdta.data) {
+			__os_free(dbenv, logdta.data);
+			logdta.data = NULL;
+		}
+		__os_free(dbenv, txn_flags_args);
+		__log_c_close(logc);
+		return 0;
+	} else if (rectype == DB___txn_regop_gen_flags ||
+			   rectype == DB___txn_regop_gen_flags_endianize) {
+		__txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
+		if ((rc = __txn_regop_gen_flags_read(dbenv, logdta.data,
+				&txn_gen_flags_args)) != 0)
+			goto err;
+		*ret_context = txn_gen_flags_args->context;
+		if (logdta.data) {
+			__os_free(dbenv, logdta.data);
+			logdta.data = NULL;
+		}
+		__os_free(dbenv, txn_gen_flags_args);
 		__log_c_close(logc);
 		return 0;
 	} else if (rectype == DB___txn_dist_commit) {

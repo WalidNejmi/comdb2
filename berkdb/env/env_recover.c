@@ -860,6 +860,9 @@ full_recovery_check(DB_ENV *dbenv, DB_LSN *max_lsn)
 			first = lsn;
 		if (type == DB___txn_regop || type == DB___txn_regop_gen ||
 			type == DB___txn_regop_gen_endianize ||
+			type == DB___txn_regop_flags ||
+			type == DB___txn_regop_gen_flags ||
+			type == DB___txn_regop_gen_flags_endianize ||
 			type == DB___txn_dist_commit || type == DB___txn_regop_rowlocks ||
 			type == DB___txn_regop_rowlocks_endianize) {
 			cpy = lsn;
@@ -2193,6 +2196,43 @@ __scan_logfiles_for_asof_modsnap(dbenv)
 				GOTOERR;
 			}
 			break;
+		case DB___txn_regop_gen_flags_endianize:
+		case DB___txn_regop_gen_flags: {
+			/*
+			 * Flag-carrying twin of regop_gen.  Behaves identically here; the
+			 * SC_PRIVATE_SKIP_MAP guard on this map-add is added in the
+			 * recovery-omission commit, alongside the one in txn_rec.c.
+			 */
+			__txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
+			if ((ret =
+				__txn_regop_gen_flags_read(dbenv, data.data,
+					&txn_gen_flags_args)) != 0) {
+				GOTOERR;
+			}
+			free_ptr = txn_gen_flags_args;
+			if (__txn_commit_map_enabled() && (txn_gen_flags_args->opcode == TXN_COMMIT) &&
+					(ret = __txn_commit_map_add(dbenv, txn_gen_flags_args->txnid->utxnid, lsn))) {
+				logmsg(LOGMSG_ERROR, "%s: Failed to add to commit LSN map\n", __func__);
+				GOTOERR;
+			}
+			break;
+		}
+		case DB___txn_regop_flags: {
+			/* Flag-carrying twin of regop; see above. */
+			__txn_regop_flags_args *txn_flags_args = NULL;
+			if ((ret =
+				__txn_regop_flags_read(dbenv, data.data,
+					&txn_flags_args)) != 0) {
+				GOTOERR;
+			}
+			free_ptr = txn_flags_args;
+			if (__txn_commit_map_enabled() && (txn_flags_args->opcode == TXN_COMMIT) &&
+				(ret = __txn_commit_map_add(dbenv, txn_flags_args->txnid->utxnid, lsn))) {
+				logmsg(LOGMSG_ERROR, "%s: Failed to add to commit LSN map\n", __func__);
+				GOTOERR;
+			}
+			break;
+		}
 		case DB___txn_regop_rowlocks:
 		case DB___txn_regop_rowlocks_endianize:
 			if ((ret =
