@@ -1,0 +1,11 @@
+# The commit-LSN map only exists when utxnids are logged and snapshot
+# isolation is enabled; both are on by default, but this test measures the
+# map itself, so state the requirement explicitly rather than inheriting it.
+utxnid_log on
+enable_snapshot_isolation
+
+# The master omits a converter transaction from the map only when the durable
+# marker is in the WAL, which is gated on this writer.  With it off the master
+# ADDS every entry (converge-by-add) and skips nothing; this test measures the
+# skip optimization directly, so turn the writer on to make the skip path live.
+sc_commit_flags_writer 1

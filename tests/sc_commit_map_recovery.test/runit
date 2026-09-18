@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Characterization test (plan Part I, §8): pin down what a SINGLE-NODE crash
+# actually does to the schema-change commit-map omission, and record why this
+# harness cannot exhibit the durability gap the WAL-flag work must close.
+#
+# WHAT THE LIVE MASTER DOES (deterministic, asserted here)
+#
+# During a rebuild the converter copies rows into its own build's replacement
+# file.  convert_record() commits ONE physical transaction per row
+# (schemachange/sc_records.c:1205-1219), and each such root transaction is
+# marked (sc_build_id) and, on writing its own build's file, sets
+# sc_skip_commit_map.  __txn_commit_int() then omits that transaction's
+# commit-LSN map entry (berkdb/txn/txn.c:1558-1579) and bumps the
+# "SC commit-map entries skipped" counter.  So a live rebuild of N rows skips
+# ~N commit-map adds while the map itself grows only by fixed schema-change and
+# background overhead, not per row.  Both facts are asserted below.
+#
+# WHY THIS HARNESS CANNOT SHOW THE DURABILITY GAP (documented, not asserted)
+#
+# The omission is in-memory only: txnp->sc_skip_commit_map is never written to
+# the WAL, so the converter's commit records (regop / regop_gen) carry no
+# indication the entry was intentionally omitted.  A node that rebuilds the map
+# from those records therefore has no way to honour the omission -- that is the
+# gap.  On a single node it is not observable:
+#
+#   * Crash AFTER the schema change completes: SC finalize forces a checkpoint
+#     (bdb/file.c bdb_flush_int -> ll_checkpoint, force=1) that moves every
+#     converter commit BELOW the recovery floor, so recovery never replays them
+#     and never re-adds their entries.  Masked by checkpoint ordering.
+#
+#   * Crash DURING the schema change (this test: sc_pause_at_end + kill -9 with
+#     the converters pinned above a flushed floor): on restart the schema change
+#     resumes and then aborts ("Didn't find existing tempdb: new.<tbl>,
+#     aborting schema change"), unwinding the incomplete conversion.  The
+#     recovered log holds only the fixed handful of root commit records; the
+#     per-row converter commits are not present as replayable roots, so there is
+#     nothing for recovery to re-add.  Observed: recovered map == live map.
+#
+# In BOTH single-node cases the map does NOT regrow -- but for INCIDENTAL
+# reasons (checkpoint masking; whole-SC unwind), not because recovery honours a
+# durable omission.  Demonstrating the real gap needs a second node that applies
+# the master's WAL live, or a freshly-promoted master that recovers a COMPLETED
+# schema change whose converters are still above its floor; both require a
+# cluster and are covered by the guarded cluster tests (Task 4 / §11).
+#
+# This test therefore asserts only what is deterministic on one node:
+#   (1) the live master skips the converter entries (skip works), and
+#   (2) a mid-SC crash does NOT leave the map regrown per row.
+# The durability of the omission across the WAL (the property the flag work
+# adds) is deliberately NOT asserted here; it is OPEN and tracked in §8/§11.
+#
+# Single-node only: stop_all_nodes/start_all_nodes drive one local instance.
+#
+# On a cluster this test is not merely uninformative, it is harmful: it crashes
+# every node at once and the harness then hangs in teardown (observed: the test
+# body passes with recovered_delta=13, then stop/unsetup never completes).  The
+# cluster-side behaviour it would be reaching for is covered properly by
+# sc_commit_map_cluster_replica_restart, which bounces a single replica.  So
+# skip cleanly rather than run a whole-cluster crash here.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+
+if [[ -n "${CLUSTER}" ]]; then
+	echo "Test is single-node only (crashes the whole instance);" \
+		"see sc_commit_map_cluster_replica_restart for the clustered case. Skipping."
+	exit 0
+fi
+
+set -o pipefail
+
+dbnm=$1
+
+# Rows to rebuild.  Large enough that fixed schema-change/recovery overhead does
+# not dominate the signal, small enough to stay inside the CI timeout.
+N=${SC_COMMIT_MAP_ROWS:-5000}
+
+# Upper bound on live (pre-crash) non-converter commit-map growth.  With the
+# converter entries skipped, live growth is fixed schema-change/background
+# overhead, not per-row (same slack the growth test uses).
+MAX_LIVE_MAP_DELTA=${SC_COMMIT_MAP_MAX_DELTA:-200}
+
+# Upper bound on how much larger than the pre-rebuild baseline the map may be
+# after recovery.  Recovery re-adds the fixed handful of surviving root commits
+# (setup, insert, schema-change bookkeeping) but -- crucially -- NOT one entry
+# per converted row.  This bound is fixed overhead and independent of N; the
+# assertion is that recovered growth is bounded by it rather than proportional
+# to N.  Kept well below N so the two are never confused.
+MAX_RECOVERY_DELTA=${SC_COMMIT_MAP_MAX_RECOVERY_DELTA:-500}
+
+master=$(getmaster)
+if [[ -z "$master" ]]; then
+	echo "FAIL: could not find master"
+	exit 1
+fi
+
+run_on_master() {
+	cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm "$1"
+}
+
+send_to_master() {
+	cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm \
+		"exec procedure sys.cmd.send('$1')"
+}
+
+get_clminfo() {
+	cdb2sql ${CDB2_OPTIONS} --host $master $dbnm \
+		"exec procedure sys.cmd.send('bdb clminfo')"
+}
+
+extract_current_entries_from_clminfo() {
+	grep -oP '(?<=Current entries: )[0-9]+' <<<"$1"
+}
+
+extract_entries_added_from_clminfo() {
+	grep -oP '(?<=Entries added: )[0-9]+' <<<"$1"
+}
+
+extract_skipped_from_clminfo() {
+	grep -oP '(?<=SC commit-map entries skipped: )[0-9]+' <<<"$1"
+}
+
+fail() { echo "FAIL: $*"; exit 1; }
+
+# Compare the O(1) count reported by clminfo against an exhaustive walk of the
+# map through the test-only systable, so the number we base the measurement on
+# is real.
+verify_clminfo_matches_systable() {
+	local -r current=$1 label=$2
+	local detailed
+
+	detailed=$(run_on_master 'select COUNT(*) from comdb2_transaction_commit')
+	if [[ "$current" != "$detailed" ]]; then
+		echo "FAIL ($label): clminfo current entries ($current) !=" \
+			"comdb2_transaction_commit count ($detailed)"
+		exit 1
+	fi
+}
+
+# Read a consistent snapshot of the map size once it is quiescent: clminfo's
+# O(1) counter and the exhaustive systable walk agree only when no converter is
+# concurrently mutating the map.  After recovery a resumed schema change may be
+# briefly running before it aborts, so poll until the two agree and return that
+# value (which is both the measurement and the cross-check).
+snapshot_quiescent_current() {
+	local label=$1 c a b
+	local attempt
+	for (( attempt=0; attempt<240; attempt++ )); do
+		c=$(get_clminfo)
+		a=$(extract_current_entries_from_clminfo "$c")
+		b=$(run_on_master 'select COUNT(*) from comdb2_transaction_commit')
+		if [[ -n "$a" && "$a" == "$b" ]]; then
+			echo "$a"
+			return 0
+		fi
+		sleep 0.25
+	done
+	echo "FAIL ($label): commit map never reached a quiescent snapshot" \
+		"(clminfo=$a systable=$b)" >&2
+	echo "$a"
+	return 1
+}
+
+# Backgrounded schema-change pid; set before the rebuild is launched so the EXIT
+# trap can reference it unconditionally.
+rebuild_pid=""
+
+# Failure-safe cleanup.  A failed assertion while a schema change is stalled at
+# sc_pause_at_end would otherwise leave it paused forever; releasing an unpaused
+# or finished schema change is a no-op.  Re-enable log deletion (its timed form
+# would eventually re-enable itself, but do it promptly on every path).  The
+# EXIT trap preserves the triggering exit status.
+cleanup() {
+	send_to_master "sc_pause_at_end 0" > /dev/null 2>&1 || true
+	send_to_master "sync log-delete on" > /dev/null 2>&1 || true
+	if [[ -n "$rebuild_pid" ]]; then
+		wait "$rebuild_pid" 2>/dev/null || true
+	fi
+}
+trap cleanup EXIT
+
+# Hold log deletion so the log files holding the converter commit records are
+# not pruned before the crash -- recovery replays the physical log, so the
+# records must still be on disk for the (attempted) regrowth to be observable.
+send_to_master "sync log-delete off"
+
+# Populate in a single transaction so setup contributes one map entry, not N.
+run_on_master "create table t(i int)"
+run_on_master "insert into t select value from generate_series(1, $N)"
+
+rowcount=$(run_on_master 'select COUNT(*) from t')
+if (( rowcount != N )); then
+	fail "expected $N rows before rebuild, got $rowcount"
+fi
+
+# Baseline before the rebuild.
+clminfo=$(get_clminfo)
+before_current=$(extract_current_entries_from_clminfo "$clminfo")
+before_added=$(extract_entries_added_from_clminfo "$clminfo")
+before_skipped=$(extract_skipped_from_clminfo "$clminfo")
+if [[ -z "$before_current" || -z "$before_added" || -z "$before_skipped" ]]; then
+	echo "FAIL: could not parse commit-map stats from clminfo:"
+	echo "$clminfo"
+	exit 1
+fi
+verify_clminfo_matches_systable "$before_current" "before rebuild"
+
+# Pin the recovery floor below the converter commits.  flush_db() forces a
+# checkpoint; taken here -- after the table exists and is populated, but before
+# the rebuild -- its ckp_lsn sits below every converter commit that follows.
+# Crash recovery rolls back to the last checkpoint's ckp_lsn, so this puts the
+# converters inside the backward-roll window.  Combined with CHECKPOINTTIME
+# 9999999 (no periodic checkpoint) and a crash taken before the schema change's
+# own finalize checkpoint, the recovery floor is deterministic.
+send_to_master "flush"
+
+# Arm the pre-finalize pause, then run the rebuild in the background: the
+# converter commits are logged and skipped on the live master, and the schema
+# change stalls after the last one but before it finalises.  No checkpoint is
+# taken between the flush above and the crash, so nothing advances the recovery
+# floor past the converter commits.
+send_to_master "sc_pause_at_end 1"
+run_on_master "rebuild t" > /dev/null 2>&1 &
+rebuild_pid=$!
+
+# Wait for the deterministic window: every row copied, every converter committed,
+# schema change paused before finalize.
+at_end=0
+for (( attempt=0; attempt<1200; attempt++ )); do
+	v=$(run_on_master "select value from comdb2_tunables where name='sc_is_at_end'")
+	if [[ "$v" == "ON" || "$v" == "1" ]]; then
+		at_end=1
+		break
+	fi
+	kill -0 $rebuild_pid 2>/dev/null || break
+	sleep 0.25
+done
+(( at_end == 1 )) || fail \
+	"schema change never reported sc_is_at_end; could not establish a" \
+	"pre-finalize window with the converter commits above the recovery floor"
+
+clminfo=$(get_clminfo)
+live_current=$(extract_current_entries_from_clminfo "$clminfo")
+live_skipped=$(extract_skipped_from_clminfo "$clminfo")
+verify_clminfo_matches_systable "$live_current" "paused pre-finalize (live)"
+
+live_map_delta=$(( live_current - before_current ))
+live_skipped_delta=$(( live_skipped - before_skipped ))
+
+echo "SC_COMMIT_MAP_RECOVERY_LIVE: rows=$N live_current=$live_current" \
+	"live_map_delta=$live_map_delta live_skipped_delta=$live_skipped_delta"
+
+# (1) The live master must actually have skipped the converter entries: one per
+# converted row (convert_record commits per row).  Without this there is nothing
+# to characterize.
+if (( live_skipped_delta < N )); then
+	fail "live master skipped only $live_skipped_delta converter commit-map" \
+		"entries; expected at least one per converted row ($N)"
+fi
+# (1, cont.) ...and the live map itself must have grown only by fixed overhead,
+# not per row -- i.e. the skip is actually keeping entries out of the map.
+if (( live_map_delta > MAX_LIVE_MAP_DELTA )); then
+	fail "live rebuild grew the commit map by $live_map_delta" \
+		"(limit $MAX_LIVE_MAP_DELTA); the skip is not working on the live master"
+fi
+
+# Hard crash in the paused, pre-finalize window.
+echo "Crashing the node (kill -9) mid schema change (paused pre-finalize)..."
+stop_all_nodes
+
+# The backgrounded rebuild client dies with the server; reap it without
+# requiring success (the schema change was deliberately not allowed to finish).
+wait "$rebuild_pid" 2>/dev/null || true
+rebuild_pid=""
+
+start_all_nodes
+wait_up
+
+master=$(getmaster)
+if [[ -z "$master" ]]; then
+	fail "could not find master after recovery"
+fi
+
+# Keep the map from being pruned before measurement, and stall any resumed
+# schema change before its finalize checkpoint so nothing on the recovered node
+# masks the map state while we measure.
+send_to_master "sync log-delete off"
+send_to_master "sc_pause_at_end 1"
+
+# The source table must have survived recovery (the schema change never
+# finalised, so t is still the original generation with all N rows).
+rowcount=$(run_on_master 'select COUNT(*) from t')
+if (( rowcount != N )); then
+	fail "expected $N rows after recovery, got $rowcount"
+fi
+
+recovered_current=$(snapshot_quiescent_current "after recovery") || exit 1
+recovered_delta=$(( recovered_current - before_current ))
+
+echo "SC_COMMIT_MAP_RECOVERY_RECOVERED: rows=$N before_current=$before_current" \
+	"live_current=$live_current recovered_current=$recovered_current" \
+	"recovered_delta=$recovered_delta"
+
+# (2) The deterministic single-node outcome: a mid-SC crash unwinds the
+# incomplete conversion, so recovery does NOT re-add one commit-map entry per
+# converted row.  Recovered growth is bounded by fixed schema-change/recovery
+# overhead (MAX_RECOVERY_DELTA), NOT proportional to N.
+#
+# NOTE: This asserts the map is not regrown per row; it does NOT prove the
+# omission is durable across the WAL.  On one node the converters are simply
+# gone after the unwind, so there is nothing to re-add -- incidental safety, not
+# a durability guarantee.  The durable-omission property is OPEN and is exercised
+# by the guarded cluster tests (§11).  See the header for the full argument.
+if (( recovered_delta > MAX_RECOVERY_DELTA )); then
+	fail "after recovery the commit map grew by $recovered_delta entries" \
+		"(limit $MAX_RECOVERY_DELTA); expected fixed overhead, not one per" \
+		"converted row ($N) -- a mid-SC crash should have unwound the converters"
+fi
+# Guard the interpretation: the whole point is recovered growth is NOT per-row.
+# If it ever approaches N the bound above is meaningless, so state it directly.
+if (( recovered_delta >= N )); then
+	fail "after recovery the commit map grew by $recovered_delta (>= rows=$N);" \
+		"the converter entries were re-added -- single-node assumption broken"
+fi
+
+echo "Passed test"

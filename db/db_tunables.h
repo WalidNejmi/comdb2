@@ -1099,6 +1099,33 @@ REGISTER_TUNABLE("rep_skip_recovery", "Skip recovery if truncate won't unwind a 
                  TUNABLE_BOOLEAN, &gbl_rep_skip_recovery, 0, NULL, NULL, NULL, NULL);
 REGISTER_TUNABLE("emit_gen_commits", "Emit commit-records which include cluster generation.  (Default: on)",
                  TUNABLE_BOOLEAN, &gbl_emit_gen_commits, 0, NULL, NULL, NULL, NULL);
+/*
+ * Writer switch for the flag-carrying commit records.  Reader support is
+ * unconditional; this controls whether the master EMITS them and, when it
+ * does, omits the converter's own commit-map entry.  Every consumer now acts
+ * on the durable flag -- both replica apply paths, recovery, and the as-of
+ * scan skip the entry too -- so turning this on changes cluster behaviour, not
+ * just the WAL.  Do not enable in a mixed-version cluster: a node without
+ * reader support silently diverges rather than erroring (see berkdb/txn/txn.c).
+ */
+REGISTER_TUNABLE("sc_commit_flags_writer",
+                 "Emit flag-carrying commit records for schema-change direct-copy "
+                 "transactions and skip their commit-map entries cluster-wide.  "
+                 "All nodes must have reader support before enabling.  "
+                 "(Default: off)",
+                 TUNABLE_BOOLEAN, &gbl_sc_commit_flags_writer, 0, NULL, NULL, NULL, NULL);
+/*
+ * TEST ONLY.  Forces the commit-time check to reject every direct-copy
+ * candidate, producing the classifier-says-yes / final-decision-says-no case
+ * that sc_commit_map_nearmiss.test exists to check.  Never enable in
+ * production: it disables the schema-change commit-map optimisation entirely.
+ */
+REGISTER_TUNABLE("sc_commit_flags_force_unsupported",
+                 "TEST ONLY.  Treat every schema-change direct-copy candidate as "
+                 "unsupported at commit time, so it keeps ordinary commit-map "
+                 "history.  Used to exercise the fail-closed path.  (Default: off)",
+                 TUNABLE_BOOLEAN, &gbl_sc_commit_flags_force_unsupported,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 /* 'retrieve_gen_from_ckp' / 'recovery_ckp' disabled under legacy_defaults until db moves */
 REGISTER_TUNABLE("retrieve_gen_from_ckp", "Retrieve generation from ckp records.  (Default: on)", TUNABLE_BOOLEAN,
                  &gbl_retrieve_gen_from_ckp, 0, NULL, NULL, NULL, NULL);

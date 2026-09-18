@@ -1026,6 +1026,132 @@ int gbl_endianize_locklist = 1;
 int gbl_emit_gen_commits = 1;
 
 /*
+ * Emit the flag-carrying commit records when a transaction is a direct-copy
+ * candidate.  Reader support for those records exists on every node; this
+ * switch is what turns the WRITER on, and it is deliberately separate so the
+ * rollout can be readers-first.
+ *
+ * It gates SERIALIZATION ONLY, not the decision.  __txn_sc_commit_flags() runs
+ * either way and its answer always drives the master's own commit-map
+ * omission; this switch decides only whether that answer is also written into
+ * the WAL.  The split matters because the master's omission predates the
+ * durable flag and must keep working with the writer off -- but it must be the
+ * SAME answer, or the master and the WAL could disagree.
+ *
+ * Consequence while this is off: the master omits entries that the WAL does not
+ * mention, so replicas and recovery still re-add them.  That is the
+ * pre-existing divergence this work exists to close.  With it on, the WAL
+ * carries the master's exact decision and every consumer -- both replica apply
+ * paths and recovery -- now honours it.
+ *
+ * STILL NOT gated on a cluster capability check, and the hazard is worse than
+ * it first appears.  A node without reader support does NOT crash on one of
+ * these records:
+ *
+ *   - The commit-rectype assert in __log_put_int_int() sits behind
+ *     "off_context >= 0", which is the WRITING node's path.  A replica
+ *     receiving the record never reaches it.
+ *   - IS_SIMPLE() is a list of exclusions.  On a build that predates these
+ *     rectypes, IS_SIMPLE(regop_flags) is TRUE, so __rep_apply treats the
+ *     record as a simple one: it logs it, advances the LSN and acks it, and
+ *     never calls __rep_process_txn().  The transaction is never applied to
+ *     the pages.
+ *
+ * So the failure mode is SILENT, PERMANENT data divergence on that node, not an
+ * abort.  Two things follow.  A post-hoc detector is not a substitute for a
+ * gate that runs before the first record is emitted; and once one of these
+ * records is in the WAL, downgrading the software is not a rollback path.
+ *
+ * Do not enable this outside a cluster where every node is known to have
+ * reader support.
+ */
+int gbl_sc_commit_flags_writer = 0;
+
+/*
+ * TEST ONLY.  Make the commit-time check reject every direct-copy candidate, as
+ * though it had landed on a commit family with no flag-carrying twin.
+ *
+ * This exists to exercise the fail-closed path, which is otherwise very hard to
+ * reach on purpose: the natural near misses are rowlocks (a whole-database mode
+ * that cannot be turned on for one transaction), distributed transactions, and
+ * a converter transaction with committed children -- none of which a schema
+ * change produces on its own.  Without a way to reach it, the case where the
+ * classifier says "candidate" but the final decision says "no" would be
+ * untested, and that is exactly the case where the master and the WAL could
+ * disagree.
+ *
+ * It changes only the DECISION.  Nothing about the transaction's physical
+ * writes, locking, durability or commit family changes, so what it produces is
+ * a genuine rejected candidate rather than a simulated one.
+ */
+int gbl_sc_commit_flags_force_unsupported = 0;
+
+/*
+ * __txn_sc_commit_flags --
+ *	Decide the durable commit-map flags for a root transaction about to be
+ *	logged, and record why a near-miss was rejected.
+ *
+ *	This is the single place the decision is made, and the returned value is
+ *	the only thing allowed to drive commit-map omission.  Its two consumers
+ *	-- the WAL record selection and the master's own commit-map block -- read
+ *	the same variable from the same call, so they cannot disagree.
+ *
+ *	The three names in play are easy to confuse:
+ *
+ *	  txnp->sc_skip_commit_map   the converter's classification; an INPUT
+ *	                             here, never a decision on its own
+ *	  this function's return     the final commit-time answer
+ *	  SKIP_MAP in the WAL        that answer, made durable
+ *
+ *	Fail closed: only a root, childless direct-copy candidate gets the flag.
+ *	Rowlock and distributed/prepared shapes never reach here -- each has its
+ *	own commit branch (regop_rowlocks / dist_commit) that logs it and counts
+ *	the rejection there -- so this function neither sees nor re-checks them.
+ *
+ *	Called on the commit families that have a flag-carrying twin.  Families
+ *	without one never call it, so their sc_commit_flags stays zero and the
+ *	transaction keeps ordinary history -- which is the fail-closed answer for
+ *	a shape this version does not support.
+ */
+static u_int32_t
+__txn_sc_commit_flags(txnp)
+	DB_TXN *txnp;
+{
+	if (txnp == NULL)
+		return (0);
+
+	/* Not a direct-copy transaction at all: silent, not a near-miss. */
+	if (!txnp->sc_skip_commit_map)
+		return (0);
+
+	/* Children are never skippable; only the root carries the decision. */
+	if (txnp->parent != NULL)
+		return (0);
+
+	/*
+	 * From here on the transaction WAS a direct-copy candidate, so every
+	 * rejection is worth counting -- a zero skip count should be
+	 * explainable, not mysterious.
+	 */
+	if (!listc_empty(&txnp->committed_kids)) {
+		__sc_commit_flags_note(SC_OBS_UNSUP_CHILDREN, 0);
+		return (0);
+	}
+
+	/*
+	 * Test-only rejection, last so that it only ever turns an otherwise
+	 * SUPPORTED candidate into a rejected one -- the case that distinguishes
+	 * the final decision from the classifier bit.
+	 */
+	if (gbl_sc_commit_flags_force_unsupported) {
+		__sc_commit_flags_note(SC_OBS_UNSUP_UNKNOWN_FAMILY, 0);
+		return (0);
+	}
+
+	return (TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP);
+}
+
+/*
  * __txn_commit --
  *	Commit a transaction.
  *
@@ -1062,8 +1188,32 @@ __txn_commit_int(txnp, flags, ltranid, llid, last_commit_lsn, rlocks, inlks,
 	int32_t timestamp;
 	uint32_t gen = 0;
 	u_int64_t context = 0;
+	/*
+	 * The final commit-time schema-change decision for THIS root
+	 * transaction, computed once by __txn_sc_commit_flags() on the commit
+	 * families that support it and consumed twice: once to select the WAL
+	 * record, and once by the commit-map block at the bottom of this
+	 * function.  It must outlive the logging branches, which is why it is
+	 * declared here rather than beside either use.
+	 *
+	 * Zero means "keep ordinary history".  It stays zero on every path that
+	 * does not positively establish a skippable shape -- rowlocks,
+	 * distributed/prepared, and any family without a flag-carrying twin --
+	 * so an unsupported path can never reach the map block claiming a skip.
+	 */
+	u_int32_t sc_commit_flags = 0;
 	int ret, t_ret, elect_highest_committed_gen, commit_lsn_map;
 	int endianize_locklist = gbl_endianize_locklist;
+	/*
+	 * Latch the writer tunable once, exactly as endianize_locklist above.
+	 * The tunable is runtime-settable, and it is read both when the WAL
+	 * record is selected and again by the commit-map block at the bottom of
+	 * this function.  Re-reading the global at each site would let an operator
+	 * flipping it mid-commit encode one answer into the WAL and take the other
+	 * on the master's own map -- the master-only divergence both-or-neither
+	 * exists to prevent.  One read here keeps both sites consistent.
+	 */
+	int sc_commit_flags_writer = gbl_sc_commit_flags_writer;
 
 	dbenv = txnp->mgrp->dbenv;
 	commit_lsn_map = __txn_commit_map_enabled();
@@ -1279,6 +1429,14 @@ __txn_commit_int(txnp, flags, ltranid, llid, last_commit_lsn, rlocks, inlks,
 							abort();
 						}
 					} else {
+						/*
+						 * A direct-copy candidate that turns out to be a
+						 * rowlock transaction is out of scope for the
+						 * first version of the skip: no flag, ordinary
+						 * history, counted so the omission is explainable.
+						 */
+						if (txnp->sc_skip_commit_map && txnp->parent == NULL)
+							__sc_commit_flags_note(SC_OBS_UNSUP_ROWLOCK, 0);
 						u_int32_t rectype = endianize_locklist ? 
 							DB___txn_regop_rowlocks_endianize :
 							DB___txn_regop_rowlocks;
@@ -1369,6 +1527,12 @@ __txn_commit_int(txnp, flags, ltranid, llid, last_commit_lsn, rlocks, inlks,
 							db_rep->rep_mutexp);
 
 						if (commit_prepared) {
+							/*
+							 * Distributed/prepared transactions are out of
+							 * scope for the first version of the skip.
+							 */
+							if (txnp->sc_skip_commit_map && txnp->parent == NULL)
+								__sc_commit_flags_note(SC_OBS_UNSUP_DISTRIBUTED, 0);
 							DBT dist_txnid = {0};
 							dist_txnid.data = txnp->dist_txnid;
 							dist_txnid.size = strlen(txnp->dist_txnid);
@@ -1385,15 +1549,46 @@ __txn_commit_int(txnp, flags, ltranid, llid, last_commit_lsn, rlocks, inlks,
 								logmsg(LOGMSG_FATAL, "%s writing multiple commits for same txn?\n", __func__);
 								abort();
 							}
-							u_int32_t rectype = endianize_locklist ? 
-								DB___txn_regop_gen_endianize :
-								DB___txn_regop_gen;
-							ret =
-								__txn_regop_gen_log(dbenv, rectype,
-										txnp, &txnp->last_lsn,
-										&context, lflags,
-										TXN_COMMIT, gen, timestamp,
-										request.obj, usr_ptr);
+							/*
+							 * Decide once.  The decision is made regardless of
+							 * whether it may be serialized, because the master's
+							 * own map behaviour below is taken from this same
+							 * value -- see the commit-map block at the bottom of
+							 * this function.  Only the ENCODING of the decision
+							 * into the WAL is gated on the writer tunable.
+							 */
+							sc_commit_flags =
+								__txn_sc_commit_flags(txnp);
+							if (sc_commit_flags_writer &&
+							    sc_commit_flags != 0) {
+								/*
+								 * Flag-carrying twin: identical fields in the
+								 * same order, with commit_flags appended
+								 * before the locks DBT.
+								 */
+								u_int32_t rectype = endianize_locklist ?
+									DB___txn_regop_gen_flags_endianize :
+									DB___txn_regop_gen_flags;
+								ret =
+									__txn_regop_gen_flags_log(dbenv, rectype,
+											txnp, &txnp->last_lsn,
+											&context, lflags,
+											TXN_COMMIT, gen, timestamp,
+											sc_commit_flags,
+											request.obj, usr_ptr);
+								__sc_commit_flags_note(SC_OBS_MASTER,
+										sc_commit_flags);
+							} else {
+								u_int32_t rectype = endianize_locklist ?
+									DB___txn_regop_gen_endianize :
+									DB___txn_regop_gen;
+								ret =
+									__txn_regop_gen_log(dbenv, rectype,
+											txnp, &txnp->last_lsn,
+											&context, lflags,
+											TXN_COMMIT, gen, timestamp,
+											request.obj, usr_ptr);
+							}
 							txnp->wrote_regop_gen = 1;
 						}
 #if defined DEBUG_STACK_AT_TXN_LOG
@@ -1408,6 +1603,12 @@ __txn_commit_int(txnp, flags, ltranid, llid, last_commit_lsn, rlocks, inlks,
 							db_rep->rep_mutexp);
 					} else {
 						if (commit_prepared) {
+							/*
+							 * Distributed/prepared transactions are out of
+							 * scope for the first version of the skip.
+							 */
+							if (txnp->sc_skip_commit_map && txnp->parent == NULL)
+								__sc_commit_flags_note(SC_OBS_UNSUP_DISTRIBUTED, 0);
 							DBT dist_txnid = {0};
 							dist_txnid.data = txnp->dist_txnid;
 							dist_txnid.size = strlen(txnp->dist_txnid);
@@ -1427,13 +1628,34 @@ __txn_commit_int(txnp, flags, ltranid, llid, last_commit_lsn, rlocks, inlks,
 
 
 						} else {
-							ret =
-								__txn_regop_log_commit
-								(dbenv, txnp,
-								 &txnp->last_lsn, &context,
-								 lflags, TXN_COMMIT,
-								 timestamp, request.obj,
-								 usr_ptr);
+							/* Decide once; see the regop_gen site above. */
+							sc_commit_flags =
+								__txn_sc_commit_flags(txnp);
+							if (sc_commit_flags_writer &&
+							    sc_commit_flags != 0) {
+								/*
+								 * Flag-carrying twin of regop.  This family has
+								 * no endianize variant, so there is only one
+								 * rectype to choose.
+								 */
+								ret =
+									__txn_regop_flags_log
+									(dbenv, txnp,
+									 &txnp->last_lsn, &context,
+									 lflags, TXN_COMMIT,
+									 timestamp, sc_commit_flags,
+									 request.obj, usr_ptr);
+								__sc_commit_flags_note(SC_OBS_MASTER,
+										sc_commit_flags);
+							} else {
+								ret =
+									__txn_regop_log_commit
+									(dbenv, txnp,
+									 &txnp->last_lsn, &context,
+									 lflags, TXN_COMMIT,
+									 timestamp, request.obj,
+									 usr_ptr);
+							}
 						}
 #if defined DEBUG_STACK_AT_TXN_LOG
 						comdb2_cheapstack_sym(stderr, "TXN-COMMIT TXNID %x LSN [%d:%d]",
@@ -1556,10 +1778,50 @@ __txn_commit_int(txnp, flags, ltranid, llid, last_commit_lsn, rlocks, inlks,
 	Pthread_mutex_lock(&dbenv->txmap->txmap_mutexp);
 
 	if (commit_lsn_map && !txnp->parent) {
-		ret = __txn_commit_map_add_nolock(dbenv, txnp->utxnid, txnp->last_lsn);
-		if (ret != 0) {
-			Pthread_mutex_unlock(&dbenv->txmap->txmap_mutexp);
-			goto err;
+		/*
+		 * This transaction wrote a replacement file belonging to its own
+		 * schema-change build, so its commit LSN is not needed: omit the
+		 * map entry.  The transaction and its commit record are still
+		 * logged normally -- only this in-memory entry is skipped.
+		 *
+		 * Root transactions only, and only this transaction's own entry.
+		 * Committed children below are added as before; the bit is set on
+		 * the exact DB_TXN that performed the write and is not propagated.
+		 *
+		 * The decision comes from sc_commit_flags, NOT from
+		 * txnp->sc_skip_commit_map.  Those are not the same thing:
+		 * sc_skip_commit_map is the converter's classification, an INPUT to
+		 * __txn_sc_commit_flags(); sc_commit_flags is that function's final
+		 * fail-closed answer, and is the exact value selected for the WAL
+		 * above.  Reading the classifier bit here instead would let a
+		 * candidate rejected at commit time for having committed children,
+		 * for being a rowlock transaction, for being distributed, or for
+		 * landing on a family with no flag-carrying twin be dropped by this
+		 * master while the WAL told every other node to keep it.
+		 *
+		 * The skip is additionally gated on sc_commit_flags_writer, the
+		 * once-latched snapshot of the writer tunable taken at the top of this
+		 * function -- the same local both encode-sites test, so a mid-commit
+		 * flip of the global cannot make the WAL and this block disagree.
+		 * When the writer is off, nothing above encoded the marker into the
+		 * WAL, so every other node
+		 * -- replica, recovery, and physrep -- keeps the entry; the master
+		 * must keep it too, or it alone would diverge.  When the writer is
+		 * on, the marker is in the WAL and every node skips.  Either way the
+		 * master omits the entry exactly when the WAL carries the omission:
+		 * both-or-neither, never a master-only divergence.
+		 */
+		if (sc_commit_flags_writer &&
+		    (sc_commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP) != 0) {
+			++dbenv->txmap->sc_commit_map_entries_skipped;
+		} else {
+			ret = __txn_commit_map_add_nolock(dbenv,
+			    txnp->utxnid, txnp->last_lsn);
+			if (ret != 0) {
+				Pthread_mutex_unlock(
+				    &dbenv->txmap->txmap_mutexp);
+				goto err;
+			}
 		}
 
 		/* No grandchildren in comdb2, so this is sufficient. */

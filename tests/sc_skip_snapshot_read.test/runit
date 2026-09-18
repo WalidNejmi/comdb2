@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Snapshot correctness after a rebuild whose converter commits were skipped.
+#
+# THIS TEST CURRENTLY FAILS. That failure is the point of the test, and is the
+# result being reported rather than worked around.
+#
+# Omitting converter transactions from the commit-LSN map is only safe if
+# nothing still needs their commit LSNs. Versioned-page reconstruction does:
+# __mempv_fget() (berkdb/mp/mp_versioned.c) looks up the utxnid that wrote a
+# page and, when the lookup MISSES, rolls that operation back out of the
+# reconstructed page. A miss is not neutral -- it is treated as "not yet
+# committed".
+#
+# After a rebuild, pages in the new files carry converter LSNs. A snapshot that
+# has to reconstruct one of those pages looks up a converter utxnid that is no
+# longer in the map, and undoes the row writes. Measured: the snapshot sees an
+# empty table.
+#
+#   skip disabled   snapshot count(*) = 5000   sum(j) = 12502500
+#   skip enabled    snapshot count(*) = 0      sum(j) = NULL
+#
+# Same test, same data, only the skip differs.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+
+set -o pipefail
+
+dbnm=$1
+N=${SC_SKIP_ROWS:-5000}
+
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+readonly master N
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+
+run "create table t(i int, j int)" > /dev/null
+run "create index ix_j on t(j)" > /dev/null
+run "insert into t select value, value from generate_series(1, $N)" > /dev/null
+
+expected_sum=$(run 'select sum(j) from t')
+run "rebuild t" > /dev/null
+
+skipped=$(cdb2sql ${CDB2_OPTIONS} --host $master $dbnm \
+	"exec procedure sys.cmd.send('bdb clminfo')" |
+	grep -oP '(?<=SC commit-map entries skipped: )[0-9]+')
+(( skipped >= N )) || \
+	fail "rebuild skipped only $skipped commit-map entries; this test is only meaningful once the skip is active"
+
+# Hold a snapshot open across concurrent writes. Reading afterwards forces
+# reconstruction of pages whose LSNs belong to skipped converter transactions,
+# which is the only path that can expose the problem.
+fifo=/tmp/sc_skip_fifo.$$
+out=/tmp/sc_skip_out.$$
+mkfifo $fifo
+cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm - < $fifo > $out 2>&1 &
+pid=$!
+exec 9>$fifo
+
+printf '%s\n' "set transaction snapshot isolation" "begin" \
+	"select count(*) from t" "select sum(j) from t" >&9
+sleep 3
+
+for k in 1 2 3 4 5; do
+	run "update t set j = j + 1000 where i <= $(( N / 2 ))" > /dev/null
+done
+
+printf '%s\n' "select count(*) from t" "select sum(j) from t" "commit" >&9
+sleep 3
+
+exec 9>&-
+wait $pid 2>/dev/null
+rm -f $fifo
+
+# Four result rows, in order: count, sum, count, sum.
+mapfile -t vals < <(grep -vE '^\[' $out)
+rm -f $out
+
+first_count=${vals[0]}
+first_sum=${vals[1]}
+second_count=${vals[2]}
+second_sum=${vals[3]}
+
+# A snapshot must see the table as it was when it started: all N rows, and the
+# same sum before and after the concurrent updates.
+(( first_count == N )) || \
+	fail "snapshot saw $first_count rows immediately after the rebuild, expected $N -- skipped converter entries made reconstruction undo the rebuilt rows"
+[[ "$first_sum" == "$expected_sum" ]] || \
+	fail "snapshot sum was '$first_sum', expected $expected_sum"
+
+(( second_count == N )) || \
+	fail "snapshot saw $second_count rows after concurrent updates, expected $N"
+[[ "$second_sum" == "$expected_sum" ]] || \
+	fail "snapshot sum changed under it: '$second_sum' vs '$expected_sum'"
+
+# The table itself must still be intact regardless.
+rowcount=$(run 'select count(*) from t')
+(( rowcount == N )) || fail "table has $rowcount rows, expected $N"
+
+do_verify t
+
+echo "SC_SKIP_SNAPSHOT: rows=$N skipped=$skipped snapshot_count=$first_count snapshot_sum=$first_sum"
+echo "Passed test"

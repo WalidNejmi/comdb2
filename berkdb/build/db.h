@@ -2967,6 +2967,13 @@ struct __txn_commit_map {
 	u_int64_t lookup_misses;
 
 	u_int64_t peak_payload_lower_bound_bytes;
+
+	/*
+	 * Commit-map insertions omitted because the committing transaction
+	 * wrote a replacement file belonging to its own schema-change build.
+	 * This directly measures the behaviour being shipped.
+	 */
+	u_int64_t sc_commit_map_entries_skipped;
 };
 
 /*

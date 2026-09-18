@@ -92,6 +92,8 @@ struct commit_map_stats_snapshot {
 
 	int64_t remove_misses;
 
+	u_int64_t sc_commit_map_entries_skipped;
+
 	u_int64_t sc_direct_copy_marked;
 	u_int64_t sc_direct_copy_matched;
 
@@ -730,6 +732,7 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 		__txn_commit_map_payload_lower_bound_nolock(txmap);
 	st.peak_payload_lower_bound_bytes = txmap->peak_payload_lower_bound_bytes;
 	st.remove_misses = gbl_commit_map_remove_miss;
+	st.sc_commit_map_entries_skipped = txmap->sc_commit_map_entries_skipped;
 
 	if (should_lock) { Pthread_mutex_unlock(&txmap->txmap_mutexp); }
 
@@ -764,9 +767,18 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 					st.peak_payload_lower_bound_bytes);
 
 	/*
+	 * Commit-map insertions omitted because the committing transaction
+	 * wrote a replacement file of its own schema-change build.  This is
+	 * the number that measures the optimization.
+	 */
+	logmsg(lvl, "SC commit-map entries skipped: %"PRIu64"\n",
+					st.sc_commit_map_entries_skipped);
+
+	/*
 	 * Separates "never a copy transaction" from "was one, but wrote nothing
-	 * belonging to its build".  A test needs those apart in order to prove
-	 * an application transaction never entered the classification path.
+	 * belonging to its build".  The skip count alone cannot tell those
+	 * apart, which is what a test needs in order to prove an application
+	 * transaction never entered the classification path at all.
 	 */
 	logmsg(lvl, "SC direct-copy txns marked: %"PRIu64"\n",
 					st.sc_direct_copy_marked);
@@ -774,8 +786,9 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 					st.sc_direct_copy_matched);
 
 	/*
-	 * Durable-flag observation.  These are how we prove all four consumers
-	 * agree: for the same set of transactions, master / serial replica /
+	 * Durable-flag observation.  While the writer is enabled but nothing
+	 * acts on the flag, these are how we prove all four consumers agree:
+	 * for the same set of transactions, master / serial replica /
 	 * concurrent replica / recovery must report the SAME would-skip count.
 	 * A node only sees the counters for the roles it actually played.
 	 */

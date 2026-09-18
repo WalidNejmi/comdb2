@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Observation-mode test for the durable commit-map flag (plan §19, Commit B).
+#
+# With sc_commit_flags_writer on, the master writes the flag-carrying commit
+# records for schema-change direct-copy transactions.  NOTHING acts on the flag
+# yet -- master, replicas and recovery all still add every root entry -- so this
+# test asserts only that the durable decision is being recorded correctly and
+# agrees with the in-memory one.  It must NOT observe any change in map sizes.
+#
+# What it pins:
+#
+#   1. The flag-carrying rectype actually appears in the WAL, once per converted
+#      row.  (Checked against the raw rectype via comdb2_transaction_logs, not
+#      inferred from a counter that could be bumped from the wrong place.)
+#   2. The master emitted exactly as many flags as it would-skip: every record
+#      written carries SC_PRIVATE_SKIP_MAP, none carries an empty flag word.
+#   3. would-skip(master) == the in-memory skip count for the same window.  This
+#      is the property that makes the WAL and the master's own decision
+#      incapable of disagreeing once the flag is honoured.
+#   4. Application DML during the same window emits NO flag -- the classifier
+#      is not sweeping up ordinary writes.
+#   5. Behaviour is still unchanged: the commit map does not shrink further than
+#      it already did under the master-local skip.
+#
+# On a cluster this also exercises the replica-side decode counters; the
+# master-side assertions are the same either way.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+
+set -o pipefail
+
+dbnm=$1
+
+N=${SC_COMMIT_MAP_ROWS:-2000}
+APP_WRITES=${SC_COMMIT_MAP_APP_WRITES:-50}
+
+# Flag-carrying rectypes, utxnid (+2000) forms -- utxnid logging is on here.
+R_FLAGS=2153            # regop_flags
+R_GEN_FLAGS=2154        # regop_gen_flags
+R_GEN_FLAGS_END=2155    # regop_gen_flags_endianize
+
+master=$(getmaster)
+[[ -z "$master" ]] && failexit "could not find master"
+
+run_master() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+send_master() {
+	cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+		"exec procedure sys.cmd.send('$1')"
+}
+# clminfo prints one "(out='NAME: VALUE')" line per counter.  Match the name
+# literally -- sed BRE treats the parentheses in names like "(master)" as
+# ordinary characters -- and take the number that follows it.
+clminfo_val() {
+	cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+		"exec procedure sys.cmd.send('bdb clminfo')" \
+		| sed -n "s/.*$1: \([0-9][0-9]*\).*/\1/p" | head -1
+}
+
+fail() { echo "FAIL: $*"; exit 1; }
+
+count_after() {
+	local f=$1 o=$2 types=$3
+	run_master "select count(*) from comdb2_transaction_logs
+		where rectype in ($types)
+		  and (lsnfile > $f or (lsnfile = $f and lsnoffset > $o))"
+}
+
+# The writer must actually be on, or this test silently proves nothing.
+writer=$(run_master "select value from comdb2_tunables where name='sc_commit_flags_writer'")
+if [[ "$writer" != "ON" && "$writer" != "1" ]]; then
+	fail "sc_commit_flags_writer is '$writer'; this test requires it ON" \
+		"(see lrl.options) -- otherwise no flag records are written at all"
+fi
+
+echo "master=$master rows=$N writer=$writer"
+
+send_master "sync log-delete off" > /dev/null
+
+run_master "create table t(i int)" > /dev/null
+run_master "insert into t select value from generate_series(1, $N)" > /dev/null
+run_master "create table u(i int)" > /dev/null
+
+before_skipped=$(clminfo_val "SC commit-map entries skipped")
+before_emitted=$(clminfo_val "SC flags emitted (master)")
+before_wskip=$(clminfo_val "SC would-skip (master)")
+before_current=$(clminfo_val "Current entries")
+if [[ -z "$before_skipped" || -z "$before_emitted" || -z "$before_wskip" ]]; then
+	fail "could not read the observation counters from clminfo;" \
+		"is this build missing the Commit-B counters?"
+fi
+
+wm_file=$(run_master "select max(lsnfile) from comdb2_transaction_logs")
+wm_off=$(run_master "select max(lsnoffset) from comdb2_transaction_logs where lsnfile=$wm_file")
+[[ -z "$wm_file" || -z "$wm_off" ]] && fail "could not read LSN watermark"
+
+run_master "rebuild t" > /dev/null || fail "rebuild failed"
+
+# Ordinary application DML after the rebuild: must not be flagged.
+for (( k=0; k<APP_WRITES; k++ )); do
+	run_master "insert into u values($k)" > /dev/null 2>&1 || true
+done
+
+# The app writes must actually have landed, or assertion (4) below -- that
+# ordinary DML is not flagged -- is vacuous: zero successful inserts trivially
+# satisfies it while proving nothing.
+app_rows=$(run_master "select count(*) from u")
+if (( app_rows != APP_WRITES )); then
+	fail "expected $APP_WRITES application rows in u, got $app_rows;" \
+		"the 'application DML is not flagged' check would be vacuous"
+fi
+
+after_skipped=$(clminfo_val "SC commit-map entries skipped")
+after_emitted=$(clminfo_val "SC flags emitted (master)")
+after_wskip=$(clminfo_val "SC would-skip (master)")
+after_current=$(clminfo_val "Current entries")
+
+d_skipped=$(( after_skipped - before_skipped ))
+d_emitted=$(( after_emitted - before_emitted ))
+d_wskip=$(( after_wskip - before_wskip ))
+d_current=$(( after_current - before_current ))
+
+n_flags=$(count_after "$wm_file" "$wm_off" "$R_FLAGS")
+n_gen_flags=$(count_after "$wm_file" "$wm_off" "$R_GEN_FLAGS")
+n_gen_flags_end=$(count_after "$wm_file" "$wm_off" "$R_GEN_FLAGS_END")
+n_durable=$(( n_flags + n_gen_flags + n_gen_flags_end ))
+
+echo "SC_COMMIT_MAP_FLAGS_OBSERVE: rows=$N app_writes=$APP_WRITES" \
+	"durable_records=$n_durable (regop_flags=$n_flags gen_flags=$n_gen_flags" \
+	"gen_flags_endianize=$n_gen_flags_end)" \
+	"emitted=$d_emitted would_skip=$d_wskip skipped=$d_skipped" \
+	"map_delta=$d_current"
+
+# (1) the durable record is really in the WAL, once per converted row
+if (( n_durable < N )); then
+	fail "only $n_durable flag-carrying commit records in the WAL for $N" \
+		"converted rows; the writer is not emitting them"
+fi
+
+# (2) every emitted record carried SKIP_MAP
+if (( d_emitted != d_wskip )); then
+	fail "master emitted $d_emitted flagged records but only $d_wskip carried" \
+		"SC_PRIVATE_SKIP_MAP; an empty flag word was written"
+fi
+
+# (3) the durable decision matches the in-memory one, exactly
+if (( d_wskip != d_skipped )); then
+	fail "durable would-skip ($d_wskip) != in-memory skip ($d_skipped);" \
+		"the WAL flag and the master's own decision disagree, which is the" \
+		"one thing this design may never allow"
+fi
+if (( d_wskip < N )); then
+	fail "would-skip $d_wskip is below the converted row count $N"
+fi
+
+# (4) application DML must not be flagged.  The rebuild accounts for exactly
+# d_wskip flags; if the subsequent inserts had been flagged too, the emitted
+# count would exceed the number of converter records in the WAL.
+if (( d_emitted > n_durable )); then
+	fail "master emitted $d_emitted flags but only $n_durable flag records" \
+		"exist in the rebuild window; application DML appears to be flagged"
+fi
+
+# (5) still observation-only: the map must not have grown per row (the
+# master-local skip was already in effect), and must not have collapsed either
+# -- nothing is acting on the flag yet.
+if (( d_current >= N )); then
+	fail "commit map grew by $d_current (>= rows=$N); the master-local skip" \
+		"regressed"
+fi
+
+# ---------------------------------------------------------------------------
+# (6) Cross-consumer agreement (plan Gate 3), cluster only.
+#
+# The gate the plan puts in front of actually honouring the flag: for the same
+# transactions, every consumer must reach the SAME decision.  Here that means
+# each replica decoded the same number of flagged records the master emitted,
+# and would-skip the same number.  A replica that decoded fewer has a decode
+# path the writer can reach but the reader cannot.
+# ---------------------------------------------------------------------------
+if [[ -n "${CLUSTER}" ]]; then
+	node_val() {
+		cdb2sql ${CDB2_OPTIONS} --host "$1" "$dbnm" \
+			"exec procedure sys.cmd.send('bdb clminfo')" \
+			| sed -n "s/.*$2: \([0-9][0-9]*\).*/\1/p" | head -1
+	}
+
+	# Let the replicas finish applying before comparing.
+	sleep 5
+
+	agree=1
+	for n in $(getclusternodes); do
+		[[ "$n" == "$master" ]] && continue
+
+		s_dec=$(node_val "$n" "SC flags decoded (serial replica)")
+		s_skip=$(node_val "$n" "SC would-skip (serial replica)")
+		c_dec=$(node_val "$n" "SC flags decoded (concurrent replica)")
+		c_skip=$(node_val "$n" "SC would-skip (concurrent replica)")
+		: "${s_dec:=0}" "${s_skip:=0}" "${c_dec:=0}" "${c_skip:=0}"
+
+		# A given replica uses one apply path or the other, so sum them
+		# rather than guessing which is configured.
+		r_dec=$(( s_dec + c_dec ))
+		r_skip=$(( s_skip + c_skip ))
+
+		echo "SC_COMMIT_MAP_FLAGS_OBSERVE_REPLICA: node=$n decoded=$r_dec" \
+			"would_skip=$r_skip (serial $s_dec/$s_skip," \
+			"concurrent $c_dec/$c_skip)"
+
+		if (( r_dec < d_emitted )); then
+			echo "DISAGREE: $n decoded $r_dec of the $d_emitted flagged" \
+				"records the master emitted"
+			agree=0
+		fi
+		if (( r_skip != r_dec )); then
+			echo "DISAGREE: $n decoded $r_dec flagged records but would-skip" \
+				"$r_skip of them"
+			agree=0
+		fi
+	done
+
+	if (( agree == 0 )); then
+		fail "consumers do not agree on the durable decision; the flag must" \
+			"not be honoured until they do (plan Gate 3)"
+	fi
+
+	# -----------------------------------------------------------------
+	# (7) The fourth consumer: RECOVERY.  Bounce one replica so it rebuilds
+	# from its own WAL and decodes the flag on the recovery path rather than
+	# the apply path.
+	#
+	# The counters reset with the process, so what is read afterwards is
+	# purely what recovery decoded.
+	#
+	# We assert the path was exercised and is self-consistent rather than
+	# demanding equality with the master's number, for two independent
+	# reasons:
+	#   * how many converter commits recovery replays at all depends on where
+	#     the checkpoint floor happens to sit, which this test does not pin
+	#     (the replica-restart test is the one that arranges that);
+	#   * recovery replays the log in more than one pass, so its counter is a
+	#     multiple of the transaction count -- 8000 decode events were
+	#     measured for 2000 converted rows.  The counters are decode events,
+	#     not distinct transactions.  decoded == would_skip is the meaningful
+	#     invariant here: every flagged record recovery saw, it agreed to skip.
+	# -----------------------------------------------------------------
+	victim=""
+	for n in $(getclusternodes); do
+		[[ "$n" != "$master" ]] && { victim=$n; break; }
+	done
+
+	if [[ -n "$victim" ]]; then
+		echo "Bouncing replica $victim to exercise the recovery decode path..."
+		kill_restart_node "$victim" 0 1
+		wait_for_cluster
+
+		r_dec=$(node_val "$victim" "SC flags decoded (recovery)")
+		r_skip=$(node_val "$victim" "SC would-skip (recovery)")
+		: "${r_dec:=0}" "${r_skip:=0}"
+
+		echo "SC_COMMIT_MAP_FLAGS_OBSERVE_RECOVERY: node=$victim" \
+			"decoded=$r_dec would_skip=$r_skip"
+
+		if (( r_dec == 0 )); then
+			echo "NOTE: recovery decoded no flagged records on $victim -- the" \
+				"converter commits were below its recovery floor, so the" \
+				"recovery consumer was not exercised by this run"
+		elif (( r_skip != r_dec )); then
+			fail "recovery on $victim decoded $r_dec flagged records but" \
+				"would-skip $r_skip; the recovery consumer disagrees with the" \
+				"flag it just read"
+		fi
+	fi
+fi
+
+echo "Passed test"

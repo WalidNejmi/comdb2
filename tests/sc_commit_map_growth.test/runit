@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Characterization test for commit-LSN map growth caused by a rebuilding
+# schema change.
+#
+# A rebuild converts records one row per transaction (convert_record() starts
+# and commits a transaction for every record; gbl_num_record_converts only
+# throttles the replication wait). Every one of those commits gets an entry in
+# the in-memory commit-LSN map, and the entry is retained until the log file
+# holding its commit record is deleted. So a rebuild over N rows currently
+# grows the map by roughly N entries, which is the pattern behind the
+# schema-change memory-growth incidents.
+#
+# This test does NOT assert that the behaviour is desirable -- it pins down
+# what current code does, so that a later change which makes SC-driven map
+# growth near-constant has to update this test deliberately rather than
+# silently.
+#
+# It deliberately removes noise:
+#   - rows are created in one bulk statement, not N standalone transactions
+#     (otherwise the setup pollutes the map with the same order of growth we
+#     are trying to attribute to the schema change);
+#   - log deletion is held off for the duration, so retained entries are not
+#     pruned mid-measurement;
+#   - there are no concurrent application writers.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+
+set -o pipefail
+
+dbnm=$1
+
+# Number of rows to rebuild. Large enough that fixed schema-change metadata
+# does not dominate the signal, small enough to stay inside the CI timeout.
+N=${SC_COMMIT_MAP_ROWS:-5000}
+
+# Upper bound on non-converter commit-map growth across the rebuild (llmeta
+# updates, schema-change bookkeeping, background traffic). The lower bound is
+# structural (>= N) and needs no tuning; this slack is the only tunable.
+#
+# Derived empirically: 20 consecutive single-node runs at N=5000 on current
+# main all reported map_delta=5015, i.e. exactly 15 entries of fixed overhead
+# with no run-to-run variance. 200 leaves an order of magnitude of headroom
+# for cluster background traffic while still catching a real change in the
+# per-row relationship. Re-derive it if the harness or SC internals change --
+# each run prints an SC_COMMIT_MAP_GROWTH line for exactly that purpose.
+# Upper bound on how much the commit map may still grow across a rebuild.
+# With converter entries skipped this is fixed schema-change and background
+# overhead, not a per-row quantity: measured at 15 for N=5000.  The scaling
+# claim is checked by running at several N and seeing this stay flat.
+MAX_MAP_DELTA=${SC_COMMIT_MAP_MAX_DELTA:-200}
+
+master=$(getmaster)
+if [[ -z "$master" ]]; then
+	echo "FAIL: could not find master"
+	exit 1
+fi
+readonly master N MAX_MAP_DELTA
+
+run_on_master() {
+	cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm "$1"
+}
+
+send_to_master() {
+	cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm \
+		"exec procedure sys.cmd.send(\"$1\")"
+}
+
+get_clminfo() {
+	cdb2sql ${CDB2_OPTIONS} --host $master $dbnm \
+		"exec procedure sys.cmd.send('bdb clminfo')"
+}
+
+extract_current_entries_from_clminfo() {
+	grep -oP '(?<=Current entries: )[0-9]+' <<<"$1"
+}
+
+extract_peak_entries_from_clminfo() {
+	grep -oP '(?<=Peak entries: )[0-9]+' <<<"$1"
+}
+
+extract_entries_added_from_clminfo() {
+	grep -oP '(?<=Entries added: )[0-9]+' <<<"$1"
+}
+
+extract_entries_removed_from_clminfo() {
+	grep -oP '(?<=Entries removed: )[0-9]+' <<<"$1"
+}
+
+extract_skipped_from_clminfo() {
+	grep -oP '(?<=SC commit-map entries skipped: )[0-9]+' <<<"$1"
+}
+
+extract_payload_lower_bound_from_clminfo() {
+	# Capital 'P' keeps this from matching "Peak payload lower bound bytes".
+	grep -oP '(?<=Payload lower bound bytes: )[0-9]+' <<<"$1"
+}
+
+# Compare the O(1) count reported by clminfo against an exhaustive walk of the
+# map through the test-only systable, so we know the number we are basing the
+# growth measurement on is real.
+verify_clminfo_matches_systable() {
+	local -r current=$1 label=$2
+	local detailed
+
+	detailed=$(run_on_master 'select COUNT(*) from comdb2_transaction_commit')
+	if [[ "$current" != "$detailed" ]]; then
+		echo "FAIL ($label): clminfo current entries ($current) !=" \
+			"comdb2_transaction_commit count ($detailed)"
+		exit 1
+	fi
+}
+
+restore_log_deletion() {
+	send_to_master "sync log-delete on" > /dev/null 2>&1
+}
+
+# Hold log deletion for the duration so the map is not pruned underneath the
+# measurement. The timed form re-enables deletion on its own if we die without
+# running the trap; the trap restores it immediately on the normal and the
+# failing path alike, so a failed assertion does not leave the database with
+# log deletion disabled.
+trap restore_log_deletion EXIT
+send_to_master "sync log-delete off 10"
+
+# Populate in a single transaction.
+run_on_master "create table t(i int)"
+run_on_master "insert into t select value from generate_series(1, $N)"
+
+rowcount=$(run_on_master 'select COUNT(*) from t')
+if (( rowcount != N )); then
+	echo "FAIL: expected $N rows before rebuild, got $rowcount"
+	exit 1
+fi
+
+# Baseline.
+clminfo=$(get_clminfo)
+before_current=$(extract_current_entries_from_clminfo "$clminfo")
+before_peak=$(extract_peak_entries_from_clminfo "$clminfo")
+before_added=$(extract_entries_added_from_clminfo "$clminfo")
+before_removed=$(extract_entries_removed_from_clminfo "$clminfo")
+before_payload=$(extract_payload_lower_bound_from_clminfo "$clminfo")
+before_skipped=$(extract_skipped_from_clminfo "$clminfo")
+if [[ -z "$before_current" || -z "$before_added" || -z "$before_removed" ]]; then
+	echo "FAIL: could not parse commit-map stats from clminfo:"
+	echo "$clminfo"
+	exit 1
+fi
+readonly before_current before_peak before_added before_removed before_payload
+readonly before_skipped
+
+verify_clminfo_matches_systable "$before_current" "before rebuild"
+
+# The measurement.
+run_on_master "rebuild t"
+
+rowcount=$(run_on_master 'select COUNT(*) from t')
+if (( rowcount != N )); then
+	echo "FAIL: expected $N rows after rebuild, got $rowcount"
+	exit 1
+fi
+
+clminfo=$(get_clminfo)
+after_current=$(extract_current_entries_from_clminfo "$clminfo")
+after_peak=$(extract_peak_entries_from_clminfo "$clminfo")
+after_added=$(extract_entries_added_from_clminfo "$clminfo")
+after_removed=$(extract_entries_removed_from_clminfo "$clminfo")
+after_payload=$(extract_payload_lower_bound_from_clminfo "$clminfo")
+after_skipped=$(extract_skipped_from_clminfo "$clminfo")
+readonly after_current after_peak after_added after_removed after_payload
+readonly after_skipped
+
+verify_clminfo_matches_systable "$after_current" "after rebuild"
+
+map_delta=$(( after_current - before_current ))
+add_delta=$(( after_added - before_added ))
+remove_delta=$(( after_removed - before_removed ))
+peak_delta=$(( after_peak - before_peak ))
+payload_delta=$(( after_payload - before_payload ))
+skipped_delta=$(( after_skipped - before_skipped ))
+readonly map_delta add_delta remove_delta peak_delta payload_delta skipped_delta
+
+# Single greppable line, for harvesting across repeated runs when re-deriving
+# the tolerance or plotting the before-graph at larger row counts.
+echo "SC_COMMIT_MAP_GROWTH: rows=$N map_delta=$map_delta add_delta=$add_delta" \
+	"remove_delta=$remove_delta peak_delta=$peak_delta" \
+	"payload_lower_bound_delta=$payload_delta"
+
+# Lifetime accounting must hold across the rebuild as well.
+if (( map_delta != add_delta - remove_delta )); then
+	echo "FAIL: map delta ($map_delta) != added ($add_delta) - removed ($remove_delta)"
+	exit 1
+fi
+
+# A converter transaction that writes one of its own build's replacement
+# files is no longer added to the commit map, so the rebuild should skip about
+# one entry per converted row.
+if (( skipped_delta < N )); then
+	echo "FAIL: rebuilding $N rows skipped only $skipped_delta commit-map" \
+		"entries; expected at least one per converted row"
+	exit 1
+fi
+
+# The point of the change: map growth no longer scales with rows copied.  This
+# is the assertion that would have caught the old behaviour, and the one that
+# catches a regression back to it.
+if (( map_delta > MAX_MAP_DELTA )); then
+	echo "FAIL: rebuilding $N rows still grew the commit map by $map_delta" \
+		"entries (limit $MAX_MAP_DELTA); growth should be fixed schema-change" \
+		"overhead, not proportional to rows"
+	exit 1
+fi
+
+# entries_added counts entries actually inserted, so skipped transactions must
+# not show up in it either.
+if (( add_delta > MAX_MAP_DELTA )); then
+	echo "FAIL: rebuilding $N rows added $add_delta commit-map entries" \
+		"(limit $MAX_MAP_DELTA); skipped transactions must not be counted as added"
+	exit 1
+fi
+
+if (( peak_delta < 0 )); then
+	echo "FAIL: peak entries went backwards across the rebuild"
+	exit 1
+fi
+
+do_verify t
+
+echo "Passed test"
