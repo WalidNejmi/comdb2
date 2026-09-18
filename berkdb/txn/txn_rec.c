@@ -750,6 +750,7 @@ __txn_regop_flags_recover(dbenv, dbtp, lsnp, op, info)
 	if ((ret = __txn_regop_flags_read(dbenv, dbtp->data, &argp)) != 0)
 		return (ret);
 
+	__sc_commit_flags_note(SC_OBS_RECOVERY, argp->commit_flags);
 
 	headp = info;
 
@@ -806,11 +807,18 @@ __txn_regop_flags_recover(dbenv, dbtp, lsnp, op, info)
 		assert(op == DB_TXN_BACKWARD_ROLL);
 
 		/*
-		 * COMMIT F will add:  && !(argp->commit_flags &
-		 *                          TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP)
+		 * Honour the master's durable decision for this ROOT transaction.
+		 * Recovery is the last of the four consumers: without this, a node
+		 * rebuilding its map from its own WAL would re-add every entry the
+		 * cluster agreed to omit, and a simple restart would undo the work.
+		 *
+		 * Only the map entry is affected -- the transaction is still
+		 * recovered normally, its generation and context are still applied,
+		 * and child utxnids are unaffected.
 		 */
 		if (commit_lsn_map
 			&& (argp->opcode == TXN_COMMIT)
+			&& !(argp->commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP)
 			&& (ret = __txn_commit_map_add(dbenv, argp->txnid->utxnid, *lsnp))) {
 			logmsg(LOGMSG_ERROR, "%s: Failed to add %"PRIu64" to the commit map\n", __func__,
 				argp->txnid->utxnid);
@@ -879,6 +887,7 @@ __txn_regop_gen_flags_recover(dbenv, dbtp, lsnp, op, info)
 	if ((ret = __txn_regop_gen_flags_read(dbenv, dbtp->data, &argp)) != 0)
 		return (ret);
 
+	__sc_commit_flags_note(SC_OBS_RECOVERY, argp->commit_flags);
 
 	headp = info;
 
@@ -944,11 +953,18 @@ __txn_regop_gen_flags_recover(dbenv, dbtp, lsnp, op, info)
 		assert(op == DB_TXN_BACKWARD_ROLL);
 
 		/*
-		 * COMMIT F will add:  && !(argp->commit_flags &
-		 *                          TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP)
+		 * Honour the master's durable decision for this ROOT transaction.
+		 * Recovery is the last of the four consumers: without this, a node
+		 * rebuilding its map from its own WAL would re-add every entry the
+		 * cluster agreed to omit, and a simple restart would undo the work.
+		 *
+		 * Only the map entry is affected -- the transaction is still
+		 * recovered normally, its generation and context are still applied,
+		 * and child utxnids are unaffected.
 		 */
 		if (commit_lsn_map
 			&& (argp->opcode == TXN_COMMIT)
+			&& !(argp->commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP)
 			&& (ret = __txn_commit_map_add(dbenv, argp->txnid->utxnid, *lsnp))) {
 			logmsg(LOGMSG_ERROR, "%s: Failed to add %"PRIu64" to the commit map\n", __func__,
 				argp->txnid->utxnid);

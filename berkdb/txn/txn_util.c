@@ -773,6 +773,42 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 	logmsg(lvl, "SC direct-copy txns matched: %"PRIu64"\n",
 					st.sc_direct_copy_matched);
 
+	/*
+	 * Durable-flag observation.  These are how we prove all four consumers
+	 * agree: for the same set of transactions, master / serial replica /
+	 * concurrent replica / recovery must report the SAME would-skip count.
+	 * A node only sees the counters for the roles it actually played.
+	 */
+	{
+		SC_COMMIT_FLAGS_STATS fs;
+
+		__sc_commit_flags_stats(&fs);
+		logmsg(lvl, "SC flags emitted (master): %"PRIu64"\n",
+						fs.flags_emitted_master);
+		logmsg(lvl, "SC would-skip (master): %"PRIu64"\n",
+						fs.would_skip_master);
+		logmsg(lvl, "SC flags decoded (serial replica): %"PRIu64"\n",
+						fs.flags_decoded_serial);
+		logmsg(lvl, "SC would-skip (serial replica): %"PRIu64"\n",
+						fs.would_skip_serial);
+		logmsg(lvl, "SC flags decoded (concurrent replica): %"PRIu64"\n",
+						fs.flags_decoded_concurrent);
+		logmsg(lvl, "SC would-skip (concurrent replica): %"PRIu64"\n",
+						fs.would_skip_concurrent);
+		logmsg(lvl, "SC flags decoded (recovery): %"PRIu64"\n",
+						fs.flags_decoded_recovery);
+		logmsg(lvl, "SC would-skip (recovery): %"PRIu64"\n",
+						fs.would_skip_recovery);
+		logmsg(lvl, "SC unsupported candidate children: %"PRIu64"\n",
+						fs.unsupported_children);
+		logmsg(lvl, "SC unsupported candidate rowlock: %"PRIu64"\n",
+						fs.unsupported_rowlock);
+		logmsg(lvl, "SC unsupported candidate distributed: %"PRIu64"\n",
+						fs.unsupported_distributed);
+		logmsg(lvl, "SC unsupported candidate unknown family: %"PRIu64"\n",
+						fs.unsupported_unknown_family);
+	}
+
 	/* Enough to tell whether the mechanism was available at all. */
 	logmsg(lvl, "SC private registry available: %d\n",
 					st.sc_registry_available);

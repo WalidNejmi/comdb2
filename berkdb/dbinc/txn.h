@@ -168,6 +168,37 @@ void __txn_note_sc_file_write_int __P((DB_TXN *, DB *));
 void __sc_direct_copy_stats __P((u_int64_t *, u_int64_t *));
 
 /*
+ * Durable-flag observation (see txn_sc_skip.c).  Selects which counter
+ * __sc_commit_flags_note() bumps.
+ */
+#define	SC_OBS_MASTER			0
+#define	SC_OBS_SERIAL			1
+#define	SC_OBS_CONCURRENT		2
+#define	SC_OBS_RECOVERY			3
+#define	SC_OBS_UNSUP_CHILDREN		4
+#define	SC_OBS_UNSUP_ROWLOCK		5
+#define	SC_OBS_UNSUP_DISTRIBUTED	6
+#define	SC_OBS_UNSUP_UNKNOWN_FAMILY	7
+
+typedef struct __sc_commit_flags_stats {
+	u_int64_t flags_emitted_master;
+	u_int64_t would_skip_master;
+	u_int64_t flags_decoded_serial;
+	u_int64_t would_skip_serial;
+	u_int64_t flags_decoded_concurrent;
+	u_int64_t would_skip_concurrent;
+	u_int64_t flags_decoded_recovery;
+	u_int64_t would_skip_recovery;
+	u_int64_t unsupported_children;
+	u_int64_t unsupported_rowlock;
+	u_int64_t unsupported_distributed;
+	u_int64_t unsupported_unknown_family;
+} SC_COMMIT_FLAGS_STATS;
+
+void __sc_commit_flags_note __P((int, u_int32_t));
+void __sc_commit_flags_stats __P((SC_COMMIT_FLAGS_STATS *));
+
+/*
  * Physical-write check, called from every generated log function that carries
  * a DB *.  That is every logged page mutation in the database, so the ordinary
  * case must cost almost nothing: three loads and a predictable branch, no

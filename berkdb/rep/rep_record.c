@@ -468,7 +468,7 @@ matchable_log_type(DB_ENV *dbenv, int rectype)
 		ret = ((!dbenv->attr.elect_highest_committed_gen && rectype == DB___txn_regop) ||
 				rectype == DB___txn_regop_gen ||
 				rectype == DB___txn_regop_gen_endianize ||
-				rectype == DB___txn_regop_flags ||
+				(!dbenv->attr.elect_highest_committed_gen && rectype == DB___txn_regop_flags) ||
 				rectype == DB___txn_regop_gen_flags ||
 				rectype == DB___txn_regop_gen_flags_endianize ||
 				rectype == DB___txn_dist_commit ||
@@ -5027,6 +5027,14 @@ __rep_process_txn_int(dbenv, rctl, rec, ltrans, maxlsn, commit_gen, rep_gen, loc
 	void *pglogs = NULL;
 	u_int32_t keycnt = 0;
 	int endianize = 0;
+	/*
+	 * The durable commit-map decision carried by this transaction's commit
+	 * record, or zero for a record family that cannot carry one.  Set once
+	 * where the record is decoded and read once at the root map-add below;
+	 * it is deliberately NOT re-derived from the collected records, which
+	 * describe what the transaction wrote, not what the master decided.
+	 */
+	u_int32_t sc_commit_flags = 0;
 
 	logmsg(LOGMSG_DEBUG, "%s processing [%d:%d]\n", __func__, rctl->lsn.file,
 			rctl->lsn.offset);
@@ -5212,6 +5220,8 @@ __rep_process_txn_int(dbenv, rctl, rec, ltrans, maxlsn, commit_gen, rep_gen, loc
 			__os_free(dbenv, txn_flags_args);
 			return (0);
 		}
+		__sc_commit_flags_note(SC_OBS_SERIAL, txn_flags_args->commit_flags);
+		sc_commit_flags = txn_flags_args->commit_flags;
 		args = txn_flags_args;
 		context = __txn_regop_flags_read_context(txn_flags_args);
 		txnid = txn_flags_args->txnid->txnid;
@@ -5235,6 +5245,8 @@ __rep_process_txn_int(dbenv, rctl, rec, ltrans, maxlsn, commit_gen, rep_gen, loc
 			__os_free(dbenv, txn_gen_flags_args);
 			return (0);
 		}
+		__sc_commit_flags_note(SC_OBS_SERIAL, txn_gen_flags_args->commit_flags);
+		sc_commit_flags = txn_gen_flags_args->commit_flags;
 		args = txn_gen_flags_args;
 		context = txn_gen_flags_args->context;
 		txnid = txn_gen_flags_args->txnid->txnid;
@@ -5428,7 +5440,17 @@ __rep_process_txn_int(dbenv, rctl, rec, ltrans, maxlsn, commit_gen, rep_gen, loc
 			p->rep_lock_time_us += d;
 		}
 
-		if (__txn_commit_map_enabled()) {
+		/*
+		 * Honour the master's durable decision for this ROOT transaction.
+		 * Only the map entry is skipped: the transaction is applied, its
+		 * locks are taken, its context is set, its UTXNID is sequenced and
+		 * its children are added below, all exactly as before.
+		 *
+		 * sc_commit_flags is zero for every record family that cannot carry
+		 * the flag, so those keep ordinary history.
+		 */
+		if (__txn_commit_map_enabled() &&
+		    !(sc_commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP)) {
 			if ((ret = __txn_commit_map_add(dbenv,
 					utxnid, rctl->lsn)), ret != 0) {
 				line = __LINE__;
@@ -5961,6 +5983,24 @@ __rep_process_txn_concurrent_int(dbenv, rctl, rec, ltrans, ctrllsn, maxlsn,
 	int get_schema_lk = 0, got_schema_lk = 0;
 	int dontlock = 0;
 	int endianize = 0;
+	/*
+	 * The durable commit-map decision carried by this transaction's commit
+	 * record; see the identical local in __rep_process_txn_int().
+	 *
+	 * Deliberately a function local rather than processor state. The root
+	 * map-add below happens in THIS invocation, before the processor is
+	 * dispatched -- only the CHILD utxnids are added later, from
+	 * rp->lc.child_utxnids, and children are unaffected by the flag. So
+	 * there is no decision to carry into the processor, nothing to reset
+	 * when one is recycled off the inactive_transactions list, and nothing
+	 * to preserve across deadlock retry: a retry re-enters this function and
+	 * re-decodes the record, which is the authoritative source anyway.
+	 *
+	 * That also means the decision is never inferred from the collected
+	 * physical records, which describe what the transaction wrote rather
+	 * than what the master decided.
+	 */
+	u_int32_t sc_commit_flags = 0;
 
 	Pthread_mutex_lock(&dbenv->recover_lk);
 	rp = listc_rtl(&dbenv->inactive_transactions);
@@ -6199,6 +6239,8 @@ bad_resize:	;
 			return (0);
 		}
 
+		__sc_commit_flags_note(SC_OBS_CONCURRENT, txn_flags_args->commit_flags);
+		sc_commit_flags = txn_flags_args->commit_flags;
 		args = txn_flags_args;
 		rp->context = __txn_regop_flags_read_context(txn_flags_args);
 		(*commit_gen) = 0;
@@ -6226,6 +6268,8 @@ bad_resize:	;
 			return (0);
 		}
 
+		__sc_commit_flags_note(SC_OBS_CONCURRENT, txn_gen_flags_args->commit_flags);
+		sc_commit_flags = txn_gen_flags_args->commit_flags;
 		args = txn_gen_flags_args;
 		rp->context = txn_gen_flags_args->context;
 
@@ -6414,7 +6458,13 @@ bad_resize:	;
 		goto err;
 	}
 
-	if (__txn_commit_map_enabled()) {
+	/*
+	 * Honour the master's durable decision for this ROOT transaction; see
+	 * the matching guard in __rep_process_txn_int().  Child utxnids are
+	 * added later from rp->lc.child_utxnids and are deliberately unaffected.
+	 */
+	if (__txn_commit_map_enabled() &&
+	    !(sc_commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP)) {
 		if ((ret = __txn_commit_map_add(dbenv,
 				utxnid, ctrllsn)), ret != 0) {
 			logmsg(LOGMSG_ERROR, "%s failed at line %d\n", __func__, __LINE__);
@@ -7736,8 +7786,14 @@ restart:
 			if (txnflagsrec->opcode != TXN_ABORT) {
 				undo = 1;
 			}
+			/*
+			 * regop_flags has no endianize twin (see txn_auto.h), so
+			 * its locks follow the plain regop convention -- pass 0
+			 * like the regop branch below, never the loop-scoped
+			 * endianize left set by an earlier _endianize record.
+			 */
 			if (online)
-				ret = recovery_getlocks(dbenv, lockid, &txnflagsrec->locks, lsn, endianize);
+				ret = recovery_getlocks(dbenv, lockid, &txnflagsrec->locks, lsn, 0);
 
 			__os_free(dbenv, txnflagsrec);
 

@@ -2199,9 +2199,13 @@ __scan_logfiles_for_asof_modsnap(dbenv)
 		case DB___txn_regop_gen_flags_endianize:
 		case DB___txn_regop_gen_flags: {
 			/*
-			 * Flag-carrying twin of regop_gen.  Behaves identically here; the
-			 * SC_PRIVATE_SKIP_MAP guard on this map-add is added in the
-			 * recovery-omission commit, alongside the one in txn_rec.c.
+			 * Flag-carrying twin of regop_gen, honouring the master's durable
+			 * decision.
+			 *
+			 * This scan is the SECOND place recovery materializes root
+			 * entries -- the handlers in txn_rec.c are the other.  Guarding
+			 * only those leaves this one rebuilding the whole map at startup,
+			 * which is exactly what sc_commit_map_recovery_equality caught.
 			 */
 			__txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
 			if ((ret =
@@ -2211,6 +2215,7 @@ __scan_logfiles_for_asof_modsnap(dbenv)
 			}
 			free_ptr = txn_gen_flags_args;
 			if (__txn_commit_map_enabled() && (txn_gen_flags_args->opcode == TXN_COMMIT) &&
+					!(txn_gen_flags_args->commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP) &&
 					(ret = __txn_commit_map_add(dbenv, txn_gen_flags_args->txnid->utxnid, lsn))) {
 				logmsg(LOGMSG_ERROR, "%s: Failed to add to commit LSN map\n", __func__);
 				GOTOERR;
@@ -2227,6 +2232,7 @@ __scan_logfiles_for_asof_modsnap(dbenv)
 			}
 			free_ptr = txn_flags_args;
 			if (__txn_commit_map_enabled() && (txn_flags_args->opcode == TXN_COMMIT) &&
+				!(txn_flags_args->commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP) &&
 				(ret = __txn_commit_map_add(dbenv, txn_flags_args->txnid->utxnid, lsn))) {
 				logmsg(LOGMSG_ERROR, "%s: Failed to add to commit LSN map\n", __func__);
 				GOTOERR;

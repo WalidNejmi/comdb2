@@ -66,6 +66,126 @@ static u_int64_t sc_direct_copy_txns_marked = 0;
 static u_int64_t sc_direct_copy_txns_matched = 0;
 
 /*
+ * Durable-flag OBSERVATION counters.
+ *
+ * The flag-carrying commit records (regop_flags / regop_gen_flags) are written
+ * and replicated, but nothing acts on them yet: master, replicas and recovery
+ * all still add every root entry.  These counters are how we prove, before
+ * changing any behaviour, that all four consumers would make the SAME decision
+ * for the same transactions -- which is the gate the plan puts in front of
+ * actually honouring the flag.
+ *
+ * "emitted/decoded" counts records that carried a non-zero commit_flags at that
+ * consumer; "would_skip" counts those whose flags say SC_PRIVATE_SKIP_MAP and
+ * which that consumer would therefore have omitted.  They are separate because
+ * a future flag bit could be set without implying a skip.
+ *
+ * IMPORTANT -- these count DECODE EVENTS, not distinct transactions.  The
+ * master emits each record once, and each live apply path sees each record
+ * once, so for those three the count equals the transaction count.  Recovery
+ * does NOT: it replays the log in more than one pass, so its counters are a
+ * whole-number multiple of the transactions involved (measured 4x on a
+ * replica bounce).  Compare recovery against itself -- decoded vs would_skip --
+ * rather than against the master's absolute number.
+ *
+ * The unsupported_* counters record why a transaction that was otherwise a
+ * direct-copy candidate did NOT get the flag.  They exist so a zero skip count
+ * can be explained rather than merely observed.
+ *
+ * Atomic for the same reason as the counters above: these sit on the commit and
+ * replication-apply paths and must not take a lock merely to count.
+ */
+static u_int64_t sc_flags_emitted_master = 0;
+static u_int64_t sc_would_skip_master = 0;
+static u_int64_t sc_flags_decoded_serial = 0;
+static u_int64_t sc_would_skip_serial = 0;
+static u_int64_t sc_flags_decoded_concurrent = 0;
+static u_int64_t sc_would_skip_concurrent = 0;
+static u_int64_t sc_flags_decoded_recovery = 0;
+static u_int64_t sc_would_skip_recovery = 0;
+static u_int64_t sc_unsupported_children = 0;
+static u_int64_t sc_unsupported_rowlock = 0;
+static u_int64_t sc_unsupported_distributed = 0;
+static u_int64_t sc_unsupported_unknown_family = 0;
+
+/*
+ * __sc_commit_flags_note --
+ *	Record one observation.  `which` selects the counter; see
+ *	SC_OBS_* in dbinc/txn.h.
+ *
+ * PUBLIC: void __sc_commit_flags_note __P((int, u_int32_t));
+ */
+void
+__sc_commit_flags_note(which, commit_flags)
+	int which;
+	u_int32_t commit_flags;
+{
+	int would_skip = (commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP) != 0;
+
+	switch (which) {
+	case SC_OBS_MASTER:
+		(void)ATOMIC_ADD64(sc_flags_emitted_master, 1);
+		if (would_skip)
+			(void)ATOMIC_ADD64(sc_would_skip_master, 1);
+		break;
+	case SC_OBS_SERIAL:
+		(void)ATOMIC_ADD64(sc_flags_decoded_serial, 1);
+		if (would_skip)
+			(void)ATOMIC_ADD64(sc_would_skip_serial, 1);
+		break;
+	case SC_OBS_CONCURRENT:
+		(void)ATOMIC_ADD64(sc_flags_decoded_concurrent, 1);
+		if (would_skip)
+			(void)ATOMIC_ADD64(sc_would_skip_concurrent, 1);
+		break;
+	case SC_OBS_RECOVERY:
+		(void)ATOMIC_ADD64(sc_flags_decoded_recovery, 1);
+		if (would_skip)
+			(void)ATOMIC_ADD64(sc_would_skip_recovery, 1);
+		break;
+	case SC_OBS_UNSUP_CHILDREN:
+		(void)ATOMIC_ADD64(sc_unsupported_children, 1);
+		break;
+	case SC_OBS_UNSUP_ROWLOCK:
+		(void)ATOMIC_ADD64(sc_unsupported_rowlock, 1);
+		break;
+	case SC_OBS_UNSUP_DISTRIBUTED:
+		(void)ATOMIC_ADD64(sc_unsupported_distributed, 1);
+		break;
+	case SC_OBS_UNSUP_UNKNOWN_FAMILY:
+		(void)ATOMIC_ADD64(sc_unsupported_unknown_family, 1);
+		break;
+	default:
+		break;
+	}
+}
+
+/*
+ * __sc_commit_flags_stats --
+ *	Snapshot the observation counters into the caller's struct.
+ *
+ * PUBLIC: void __sc_commit_flags_stats __P((SC_COMMIT_FLAGS_STATS *));
+ */
+void
+__sc_commit_flags_stats(st)
+	SC_COMMIT_FLAGS_STATS *st;
+{
+	st->flags_emitted_master = ATOMIC_LOAD64(sc_flags_emitted_master);
+	st->would_skip_master = ATOMIC_LOAD64(sc_would_skip_master);
+	st->flags_decoded_serial = ATOMIC_LOAD64(sc_flags_decoded_serial);
+	st->would_skip_serial = ATOMIC_LOAD64(sc_would_skip_serial);
+	st->flags_decoded_concurrent = ATOMIC_LOAD64(sc_flags_decoded_concurrent);
+	st->would_skip_concurrent = ATOMIC_LOAD64(sc_would_skip_concurrent);
+	st->flags_decoded_recovery = ATOMIC_LOAD64(sc_flags_decoded_recovery);
+	st->would_skip_recovery = ATOMIC_LOAD64(sc_would_skip_recovery);
+	st->unsupported_children = ATOMIC_LOAD64(sc_unsupported_children);
+	st->unsupported_rowlock = ATOMIC_LOAD64(sc_unsupported_rowlock);
+	st->unsupported_distributed = ATOMIC_LOAD64(sc_unsupported_distributed);
+	st->unsupported_unknown_family =
+	    ATOMIC_LOAD64(sc_unsupported_unknown_family);
+}
+
+/*
  * __sc_private_file_registry_init --
  *	Create the replacement-file registry.  Called once from env open.
  *
