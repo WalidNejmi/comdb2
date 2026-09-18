@@ -945,6 +945,23 @@ Display per-file buffer-pool statistics.
 
 Display commit LSN map information.
 
+The commit-LSN map is maintained for modern snapshot isolation and maps unique
+transaction ids to their commit LSNs. The command reports current and peak entry
+counts, WAL-file grouping, lifetime add/remove counts, and lookup hit/miss
+counts. All values are collected in constant time; the map itself is never
+walked, so the command is safe to run repeatedly on a busy node.
+
+"Payload lower bound bytes" includes only the known `UTXNID_TRACK` and
+`LOGFILE_TXN_LIST` payload objects. It excludes hash-table storage, allocator
+metadata, unused capacity, alignment and fragmentation, and must not be
+interpreted as total process or total commit-map memory.
+
+Counters other than the current counts are lifetime values since the map was
+initialized (i.e. since the node last started); they are not reset when the map
+drains. "Remove misses" counts removal requests for a transaction that was not
+in the map, which is distinct from "Lookup misses" (a snapshot commit-LSN lookup
+that found no entry).
+
 ### bdb repstat
 
 Display replication statistics.

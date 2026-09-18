@@ -94,6 +94,10 @@ function test_add_basic
 		exit 1
 	fi
 
+	# The O(1) stats reported by 'bdb clminfo' must agree with the exhaustive
+	# enumeration above, and with their own lifetime accounting.
+	verify_clminfo_accounting $master
+
 	cdb2sql ${CDB2_OPTIONS} $dbnm default 'drop table data'
 }
 
@@ -194,6 +198,10 @@ function test_add_replicant
                                 echo "FAIL test_add_replicant"
                                 exit 1
                         fi
+                        # Commit-map allocations were observed in the
+                        # replication apply path in production, so check the
+                        # accounting on a replicant too, not just the master.
+                        verify_clminfo_accounting $node
                         break
                 fi
         done
@@ -232,21 +240,37 @@ pushlogs() {
 verify_txmap_deletes_records() {
 	local -r logfile_to_delete=$1 node=$2
 	local initial_num_records_for_file initial_num_records final_num_records
+	local removed_before removed_after
 
 	initial_num_records_for_file=$(cdb2sql --tabs ${CDB2_OPTIONS} --host $node $dbnm \
 		"select COUNT(*) from comdb2_transaction_commit where commitlsnfile=$logfile_to_delete")
 	initial_num_records=$(cdb2sql --tabs ${CDB2_OPTIONS} --host $node $dbnm \
 		"select COUNT(*) from comdb2_transaction_commit")
-	readonly initial_num_records_for_file initial_num_records
+	removed_before=$(extract_entries_removed_from_clminfo "$(get_clminfo $node)")
+	readonly initial_num_records_for_file initial_num_records removed_before
 
 	cdb2sql --tabs ${CDB2_OPTIONS} --host $node $dbnm \
 		"exec procedure sys.cmd.send('clm_delete_logfile $logfile_to_delete')" > /dev/null
 
 	final_num_records=$(cdb2sql --tabs ${CDB2_OPTIONS} --host $node $dbnm "select COUNT(*) from comdb2_transaction_commit")
-	readonly final_num_records
+	removed_after=$(extract_entries_removed_from_clminfo "$(get_clminfo $node)")
+	readonly final_num_records removed_after
 	if (( final_num_records != ( initial_num_records - initial_num_records_for_file ) )); then
 		echo "Did not get expected number of records after deleting logfile $logfile_to_delete"
 	fi
+
+	# The bulk logfile delete reaches the per-entry removal helper once per
+	# entry, so the lifetime removed counter must advance by exactly the
+	# number of entries that were in that logfile group -- no more (double
+	# counting at the bulk layer) and no less.
+	if (( removed_after - removed_before != initial_num_records_for_file )); then
+		echo "FAIL: deleting logfile $logfile_to_delete removed" \
+			"$(( removed_after - removed_before )) entries per clminfo," \
+			"expected $initial_num_records_for_file"
+		exit 1
+	fi
+
+	verify_clminfo_accounting $node
 }
 
 get_clminfo() {
@@ -263,6 +287,90 @@ extract_highest_logfile_from_clminfo() {
 
 extract_remove_misses_from_clminfo() {
 	grep -oP '(?<=Remove misses: )[-]?[0-9]+' <<<"$1"
+}
+
+extract_current_entries_from_clminfo() {
+	grep -oP '(?<=Current entries: )[0-9]+' <<<"$1"
+}
+
+extract_peak_entries_from_clminfo() {
+	grep -oP '(?<=Peak entries: )[0-9]+' <<<"$1"
+}
+
+extract_current_logfile_groups_from_clminfo() {
+	grep -oP '(?<=Current logfile groups: )[0-9]+' <<<"$1"
+}
+
+extract_peak_logfile_groups_from_clminfo() {
+	grep -oP '(?<=Peak logfile groups: )[0-9]+' <<<"$1"
+}
+
+extract_entries_added_from_clminfo() {
+	grep -oP '(?<=Entries added: )[0-9]+' <<<"$1"
+}
+
+extract_entries_removed_from_clminfo() {
+	grep -oP '(?<=Entries removed: )[0-9]+' <<<"$1"
+}
+
+# The map's own O(1) accounting must be self-consistent in a single snapshot:
+# every entry that is in the map was added and not yet removed, peaks are
+# high-water marks, and the current count agrees with an exhaustive walk of
+# the map via the test-only systable.
+verify_clminfo_accounting() {
+	local -r node=$1
+	local clminfo current peak groups peak_groups added removed table_count
+	local -i attempt
+
+	clminfo=$(get_clminfo $node)
+	current=$(extract_current_entries_from_clminfo "$clminfo")
+	peak=$(extract_peak_entries_from_clminfo "$clminfo")
+	groups=$(extract_current_logfile_groups_from_clminfo "$clminfo")
+	peak_groups=$(extract_peak_logfile_groups_from_clminfo "$clminfo")
+	added=$(extract_entries_added_from_clminfo "$clminfo")
+	removed=$(extract_entries_removed_from_clminfo "$clminfo")
+
+	if [[ -z "$current" || -z "$peak" || -z "$groups" || -z "$peak_groups" || -z "$added" || -z "$removed" ]]; then
+		echo "FAIL: could not parse commit-map stats from clminfo on $node:"
+		echo "$clminfo"
+		exit 1
+	fi
+
+	# Lifetime accounting. This is exact -- all three values come from the
+	# same snapshot taken under the map mutex. If it ever fails, some path
+	# added or removed an entry without going through the accounted helpers;
+	# do not paper over it with a tolerance.
+	if (( current != added - removed )); then
+		echo "FAIL: commit-map accounting on $node: current=$current added=$added removed=$removed"
+		exit 1
+	fi
+
+	# Peaks are high-water marks, never below the current value.
+	if (( peak < current )); then
+		echo "FAIL: peak entries ($peak) < current entries ($current) on $node"
+		exit 1
+	fi
+	if (( peak_groups < groups )); then
+		echo "FAIL: peak logfile groups ($peak_groups) < current ($groups) on $node"
+		exit 1
+	fi
+
+	# The O(1) production count must agree with an exhaustive enumeration of
+	# the map. The two are separate queries, so retry a few times to let any
+	# in-flight background traffic settle before failing.
+	for (( attempt=0; attempt<10; attempt++ )); do
+		table_count=$(cdb2sql --tabs ${CDB2_OPTIONS} --host $node $dbnm \
+			'select COUNT(*) from comdb2_transaction_commit')
+		if [[ "$current" == "$table_count" ]]; then
+			return 0
+		fi
+		sleep 1
+		clminfo=$(get_clminfo $node)
+		current=$(extract_current_entries_from_clminfo "$clminfo")
+	done
+
+	echo "FAIL: clminfo current entries ($current) != comdb2_transaction_commit count ($table_count) on $node"
+	exit 1
 }
 
 verify_txmap_has_expected_min_max_files() {
@@ -292,6 +400,37 @@ verify_txmap_has_expected_min_max_files() {
 	fi
 }
 
+# Called when every logfile group has been deleted: the map should report
+# itself empty while the lifetime counters keep their history.
+verify_clminfo_drained() {
+	local -r node=$1
+	local clminfo current groups peak added removed
+
+	clminfo=$(get_clminfo $node)
+	current=$(extract_current_entries_from_clminfo "$clminfo")
+	groups=$(extract_current_logfile_groups_from_clminfo "$clminfo")
+	peak=$(extract_peak_entries_from_clminfo "$clminfo")
+	added=$(extract_entries_added_from_clminfo "$clminfo")
+	removed=$(extract_entries_removed_from_clminfo "$clminfo")
+
+	if (( current != 0 || groups != 0 )); then
+		echo "FAIL: expected an empty commit map on $node, got" \
+			"current entries=$current logfile groups=$groups"
+		exit 1
+	fi
+
+	if (( peak == 0 || added == 0 || removed == 0 )); then
+		echo "FAIL: lifetime commit-map counters were reset when the map" \
+			"drained on $node: peak=$peak added=$added removed=$removed"
+		exit 1
+	fi
+
+	if (( added != removed )); then
+		echo "FAIL: empty commit map on $node but added=$added removed=$removed"
+		exit 1
+	fi
+}
+
 test_delete() {
 	trap 'error $LINENO' ERR
 
@@ -314,6 +453,10 @@ test_delete() {
 
 	verify_txmap_deletes_records 3 $node
 	verify_txmap_has_expected_min_max_files -1 -1 $node
+
+	# The map is now empty, but the lifetime counters describe the whole life
+	# of the map and must not have been reset along with it.
+	verify_clminfo_drained $node
 
 	# Verify that txmap handles adding new files after deletes
 	pushlogs 5

@@ -2919,6 +2919,26 @@ struct __txn_commit_map {
 	int64_t smallest_logfile;
 	hash_t *transactions;
 	hash_t *logfile_lists;
+
+	/*
+	 * Observability counters.  All of these are protected by txmap_mutexp
+	 * and are lifetime-since-map-initialization values: they are never
+	 * reset, so an operator sampling 'bdb clminfo' over time can compute
+	 * rates.  Current entry/group counts are deliberately absent here --
+	 * they are already available in O(1) from hash_get_num_entries() on
+	 * the two hashes, and duplicating them would just create a second
+	 * thing to keep in sync.
+	 */
+	u_int64_t peak_entries;
+	u_int64_t peak_logfile_groups;
+
+	u_int64_t entries_added;
+	u_int64_t entries_removed;
+
+	u_int64_t lookup_hits;
+	u_int64_t lookup_misses;
+
+	u_int64_t peak_payload_lower_bound_bytes;
 };
 
 struct __mempv_cache_page_key

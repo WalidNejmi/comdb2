@@ -65,6 +65,87 @@ int __txn_commit_map_enabled()
  */
 int64_t gbl_commit_map_remove_miss = 0;
 
+/*
+ * A fixed-size copy of the commit-map statistics, filled in under
+ * txmap_mutexp and formatted after the mutex is dropped.
+ */
+struct commit_map_stats_snapshot {
+	int enabled;
+
+	int64_t highest_logfile;
+	int64_t smallest_logfile;
+
+	u_int64_t current_entries;
+	u_int64_t peak_entries;
+
+	u_int64_t current_logfile_groups;
+	u_int64_t peak_logfile_groups;
+
+	u_int64_t entries_added;
+	u_int64_t entries_removed;
+
+	u_int64_t lookup_hits;
+	u_int64_t lookup_misses;
+
+	u_int64_t payload_lower_bound_bytes;
+	u_int64_t peak_payload_lower_bound_bytes;
+
+	int64_t remove_misses;
+};
+
+/*
+ * __txn_commit_map_payload_lower_bound_nolock --
+ *	A *lower bound* on the bytes the commit-LSN map is responsible for.
+ *
+ *	This counts only the payload objects we allocate ourselves: one
+ *	UTXNID_TRACK per tracked transaction and one LOGFILE_TXN_LIST per WAL
+ *	file group.  It deliberately excludes the two top-level hash tables,
+ *	every per-logfile inner hash, their bucket arrays and bookkeeping,
+ *	unused hash capacity, allocator metadata, alignment padding and
+ *	fragmentation.  Actual memory attributable to the map is therefore
+ *	always larger than this number, usually by a wide margin.  It exists so
+ *	that map growth can be compared against itself over time; it must not
+ *	be presented as "commit map memory".
+ *
+ *	Caller must hold txmap_mutexp.
+ */
+static u_int64_t
+__txn_commit_map_payload_lower_bound_nolock(DB_TXN_COMMIT_MAP *txmap)
+{
+	const u_int64_t nentries =
+		(u_int64_t)hash_get_num_entries(txmap->transactions);
+	const u_int64_t ngroups =
+		(u_int64_t)hash_get_num_entries(txmap->logfile_lists);
+
+	return nentries * sizeof(UTXNID_TRACK) + ngroups * sizeof(LOGFILE_TXN_LIST);
+}
+
+/*
+ * __txn_commit_map_update_peaks_nolock --
+ *	Refresh the high-water marks after the map has grown.
+ *
+ *	Caller must hold txmap_mutexp.
+ */
+static void
+__txn_commit_map_update_peaks_nolock(DB_TXN_COMMIT_MAP *txmap)
+{
+	const u_int64_t nentries =
+		(u_int64_t)hash_get_num_entries(txmap->transactions);
+	const u_int64_t ngroups =
+		(u_int64_t)hash_get_num_entries(txmap->logfile_lists);
+	u_int64_t payload;
+
+	if (nentries > txmap->peak_entries)
+		txmap->peak_entries = nentries;
+
+	if (ngroups > txmap->peak_logfile_groups)
+		txmap->peak_logfile_groups = ngroups;
+
+	payload = __txn_commit_map_payload_lower_bound_nolock(txmap);
+	if (payload > txmap->peak_payload_lower_bound_bytes)
+		txmap->peak_payload_lower_bound_bytes = payload;
+}
+
 typedef struct __txn_event TXN_EVENT;
 struct __txn_event {
 	TXN_EVENT_T op;
@@ -574,7 +655,13 @@ static int __txn_commit_map_remove_nolock(dbenv, utxnid, delete_from_logfile_lis
 	}
 
 	hash_del(txmap->transactions, txn);
-	__os_free(dbenv, txn); 
+	/*
+	 * Count the removal here, in the single per-entry path.  The bulk
+	 * logfile delete (__txn_commit_map_delete_logfile_txns) reaches this
+	 * function once per entry, so it must not count again itself.
+	 */
+	++txmap->entries_removed;
+	__os_free(dbenv, txn);
 
 err:
 	return ret;
@@ -610,17 +697,58 @@ int __txn_commit_map_remove(dbenv, utxnid)
  */
 void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 	DB_TXN_COMMIT_MAP * const txmap = dbenv->txmap;
+	struct commit_map_stats_snapshot st;
 
+	/*
+	 * Copy a fixed-size snapshot under the mutex, then format outside it.
+	 * Everything here is O(1): no allocation, and no walk of the map.  This
+	 * command has to be safe to run repeatedly against a node whose map
+	 * holds millions of entries.
+	 */
 	if (should_lock) { Pthread_mutex_lock(&txmap->txmap_mutexp); }
 
+	st.enabled = __txn_commit_map_enabled();
+	st.highest_logfile = txmap->highest_logfile;
+	st.smallest_logfile = txmap->smallest_logfile;
+	st.current_entries = (u_int64_t)hash_get_num_entries(txmap->transactions);
+	st.peak_entries = txmap->peak_entries;
+	st.current_logfile_groups =
+		(u_int64_t)hash_get_num_entries(txmap->logfile_lists);
+	st.peak_logfile_groups = txmap->peak_logfile_groups;
+	st.entries_added = txmap->entries_added;
+	st.entries_removed = txmap->entries_removed;
+	st.lookup_hits = txmap->lookup_hits;
+	st.lookup_misses = txmap->lookup_misses;
+	st.payload_lower_bound_bytes =
+		__txn_commit_map_payload_lower_bound_nolock(txmap);
+	st.peak_payload_lower_bound_bytes = txmap->peak_payload_lower_bound_bytes;
+	st.remove_misses = gbl_commit_map_remove_miss;
+
+	if (should_lock) { Pthread_mutex_unlock(&txmap->txmap_mutexp); }
+
+	/*
+	 * Keep the first line byte-compatible: existing tests and tooling parse
+	 * the "Highest logfile"/"Smallest logfile"/"Remove misses" labels.
+	 */
 	logmsg(lvl, "Highest logfile: %"PRId64"; "
 					"Smallest logfile: %"PRId64"; "
 					"Remove misses: %"PRId64"\n",
-					txmap->highest_logfile,
-					txmap->smallest_logfile,
-					gbl_commit_map_remove_miss);
-
-	if (should_lock) { Pthread_mutex_unlock(&txmap->txmap_mutexp); }
+					st.highest_logfile,
+					st.smallest_logfile,
+					st.remove_misses);
+	logmsg(lvl, "Commit map enabled: %d\n", st.enabled);
+	logmsg(lvl, "Current entries: %"PRIu64"\n", st.current_entries);
+	logmsg(lvl, "Peak entries: %"PRIu64"\n", st.peak_entries);
+	logmsg(lvl, "Current logfile groups: %"PRIu64"\n", st.current_logfile_groups);
+	logmsg(lvl, "Peak logfile groups: %"PRIu64"\n", st.peak_logfile_groups);
+	logmsg(lvl, "Entries added: %"PRIu64"\n", st.entries_added);
+	logmsg(lvl, "Entries removed: %"PRIu64"\n", st.entries_removed);
+	logmsg(lvl, "Lookup hits: %"PRIu64"\n", st.lookup_hits);
+	logmsg(lvl, "Lookup misses: %"PRIu64"\n", st.lookup_misses);
+	logmsg(lvl, "Payload lower bound bytes: %"PRIu64"\n",
+					st.payload_lower_bound_bytes);
+	logmsg(lvl, "Peak payload lower bound bytes: %"PRIu64"\n",
+					st.peak_payload_lower_bound_bytes);
 }
 
 /*
@@ -687,8 +815,10 @@ int __txn_commit_map_get(dbenv, utxnid, commit_lsn)
 	txn = hash_find(txmap->transactions, &utxnid);
 
 	if (txn == NULL) {
+		++txmap->lookup_misses;
 		ret = DB_NOTFOUND;
 	} else {
+		++txmap->lookup_hits;
 		*commit_lsn = txn->commit_lsn;
 	}
 
@@ -772,7 +902,14 @@ int __txn_commit_map_add_nolock(dbenv, utxnid, commit_lsn)
 	txn->commit_lsn = commit_lsn;
 	hash_add(txmap->transactions, txn);
 	hash_add(to_delete->commit_utxnids, txn);
-	
+
+	/*
+	 * Only a genuinely new UTXNID_TRACK counts: the utxnid-0, zero-LSN,
+	 * duplicate and allocation-failure paths all returned above.
+	 */
+	++txmap->entries_added;
+	__txn_commit_map_update_peaks_nolock(txmap);
+
 	return ret;
 err:
 	if (alloc_delete_list) {
