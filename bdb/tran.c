@@ -92,6 +92,120 @@ void bdb_tran_set_is_sc_rebuild(tran_type *tran, int is_sc_rebuild)
     tran->is_sc_rebuild = is_sc_rebuild;
 }
 
+/*
+ * Schema-change replacement-file tracking; see berkdb/txn/txn_sc_skip.c.
+ * Declared here because bdb/ does not include dbinc/.
+ */
+void __txn_set_sc_build(DB_TXN *, uint64_t);
+int __sc_private_file_register(DB_ENV *, const uint8_t *, uint64_t);
+int __sc_private_file_unregister_build(DB_ENV *, uint64_t);
+void __sc_private_registry_note_failure(DB_ENV *);
+
+/*
+ * Mark a base schema-change converter transaction with its build id.
+ *
+ * Deliberately not called from trans_start_sc_lowpri(): that helper also
+ * serves logical redo and other schema-change work, and only the base
+ * converter knows why its transaction exists.
+ */
+void bdb_tran_set_sc_build(tran_type *tran, uint64_t build_id)
+{
+    if (tran == NULL || tran->tid == NULL || build_id == 0)
+        return;
+
+    __txn_set_sc_build(tran->tid, build_id);
+}
+
+/*
+ * Register the rebuilt replacement files of a table as belonging to build_id.
+ *
+ * Only files the caller marks as rebuilt are registered.  A planned schema
+ * change can rename and reuse an existing file rather than rebuild it; those
+ * files are public, and registering one would make ordinary writes to it look
+ * like private construction.
+ *
+ * dta_rebuilt covers dbp_data[0][*].  blob_rebuilt[i] covers dbp_data[i+1][*]
+ * and ix_rebuilt[i] covers dbp_ix[i]; pass NULL for either to mean "all
+ * rebuilt".
+ */
+int bdb_sc_private_register_files(bdb_state_type *bdb_state, uint64_t build_id,
+                                  int dta_rebuilt, const int *blob_rebuilt,
+                                  int nblobs, const int *ix_rebuilt, int nix)
+{
+    int dtanum, stripe, ixnum, nstripes;
+
+    if (bdb_state == NULL || build_id == 0)
+        return -1;
+
+    for (dtanum = 0; dtanum < bdb_state->numdtafiles; dtanum++) {
+        if (dtanum == 0) {
+            if (!dta_rebuilt)
+                continue;
+        } else if (blob_rebuilt != NULL) {
+            int blobix = dtanum - 1;
+
+            if (blobix >= nblobs || !blob_rebuilt[blobix])
+                continue;
+        }
+
+        /* Only the primary data file is striped unless we are in blobstripe
+         * mode; unused slots are NULL and simply skipped. */
+        nstripes = bdb_state->attr->dtastripe;
+        if (nstripes < 1)
+            nstripes = 1;
+
+        for (stripe = 0; stripe < nstripes; stripe++) {
+            DB *dbp = bdb_state->dbp_data[dtanum][stripe];
+
+            if (dbp == NULL)
+                continue;
+
+            if (__sc_private_file_register(bdb_state->dbenv, dbp->fileid,
+                                           build_id) != 0)
+                goto fail;
+        }
+    }
+
+    for (ixnum = 0; ixnum < bdb_state->numix; ixnum++) {
+        DB *dbp = bdb_state->dbp_ix[ixnum];
+
+        if (dbp == NULL)
+            continue;
+
+        if (ix_rebuilt != NULL && (ixnum >= nix || !ix_rebuilt[ixnum]))
+            continue;
+
+        if (__sc_private_file_register(bdb_state->dbenv, dbp->fileid,
+                                       build_id) != 0)
+            goto fail;
+    }
+
+    return 0;
+
+fail:
+    /*
+     * A partial registration would leave some of the build's own files
+     * unmatched, so drop the lot and run without the optimization.  This is
+     * never a reason to fail a schema change.
+     */
+    logmsg(LOGMSG_WARN,
+           "%s: could not register replacement files for build 0x%" PRIx64
+           "; commit-map skip disabled for this build\n",
+           __func__, build_id);
+    __sc_private_file_unregister_build(bdb_state->dbenv, build_id);
+    __sc_private_registry_note_failure(bdb_state->dbenv);
+    return -1;
+}
+
+int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
+                                    uint64_t build_id)
+{
+    if (bdb_state == NULL || build_id == 0)
+        return 0;
+
+    return __sc_private_file_unregister_build(bdb_state->dbenv, build_id);
+}
+
 tran_type *bdb_tran_begin_logical_norowlocks_int(bdb_state_type *bdb_state,
                                                  unsigned long long tranid,
                                                  int trak, int *bdberr)

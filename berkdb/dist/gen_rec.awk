@@ -460,6 +460,15 @@ function log_function() {
 	# Initialization
 	if (has_dbp == 1)
 		printf("\tdbenv = dbp->dbenv;\n") >> CFILE;
+
+	# Schema-change replacement-file check.  Only families that carry a
+	# DB * can attribute the write to a physical file; the rest simply do
+	# nothing for this optimization.  Costs an ordinary transaction three
+	# loads and a predictable branch.  See berkdb/txn/txn_sc_skip.c.
+	if (dbprivate && has_dbp == 1 &&
+	    funcname != "__db_debug" && funcname != "__db_cksum")
+		printf("\t__txn_note_sc_file_write(txnid, dbp);\n") >> CFILE;
+
 	printf("\trectype = DB_%s;\n", funcname) >> CFILE;
 	printf("\tif (utxnid_log)\n") >> CFILE;
 	printf("\t\trectype += 2000;\n") >> CFILE;

@@ -91,6 +91,13 @@ struct commit_map_stats_snapshot {
 	u_int64_t peak_payload_lower_bound_bytes;
 
 	int64_t remove_misses;
+
+	u_int64_t sc_direct_copy_marked;
+	u_int64_t sc_direct_copy_matched;
+
+	int sc_registry_available;
+	u_int64_t sc_registered_files;
+	u_int64_t sc_registry_failures;
 };
 
 /*
@@ -726,6 +733,12 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 
 	if (should_lock) { Pthread_mutex_unlock(&txmap->txmap_mutexp); }
 
+	/* Separate lock; must not be taken while holding txmap_mutexp. */
+	__sc_private_registry_stats(dbenv, &st.sc_registry_available,
+			&st.sc_registered_files, &st.sc_registry_failures);
+	__sc_direct_copy_stats(&st.sc_direct_copy_marked,
+			&st.sc_direct_copy_matched);
+
 	/*
 	 * Keep the first line byte-compatible: existing tests and tooling parse
 	 * the "Highest logfile"/"Smallest logfile"/"Remove misses" labels.
@@ -749,6 +762,24 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 					st.payload_lower_bound_bytes);
 	logmsg(lvl, "Peak payload lower bound bytes: %"PRIu64"\n",
 					st.peak_payload_lower_bound_bytes);
+
+	/*
+	 * Separates "never a copy transaction" from "was one, but wrote nothing
+	 * belonging to its build".  A test needs those apart in order to prove
+	 * an application transaction never entered the classification path.
+	 */
+	logmsg(lvl, "SC direct-copy txns marked: %"PRIu64"\n",
+					st.sc_direct_copy_marked);
+	logmsg(lvl, "SC direct-copy txns matched: %"PRIu64"\n",
+					st.sc_direct_copy_matched);
+
+	/* Enough to tell whether the mechanism was available at all. */
+	logmsg(lvl, "SC private registry available: %d\n",
+					st.sc_registry_available);
+	logmsg(lvl, "SC private registered files: %"PRIu64"\n",
+					st.sc_registered_files);
+	logmsg(lvl, "SC private registry failures: %"PRIu64"\n",
+					st.sc_registry_failures);
 }
 
 /*

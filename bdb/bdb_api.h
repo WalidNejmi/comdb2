@@ -2532,4 +2532,25 @@ typedef int (*collect_unused_files_f)(void *args, int lognum, char *filename);
 
 void oldfile_hash_collect(collect_unused_files_f func, void *arg);
 void bdb_tran_set_is_sc_rebuild(tran_type *tran, int is_sc_rebuild);
+
+/*
+ * Schema-change replacement-file tracking.
+ *
+ * Mark a base converter transaction with its build id.  Call only from the
+ * base converter, immediately after the transaction starts -- never from a
+ * generic transaction-start helper.
+ */
+void bdb_tran_set_sc_build(tran_type *tran, uint64_t build_id);
+
+/*
+ * Register the rebuilt replacement files of a table as belonging to a build.
+ * Only rebuilt, not-yet-public files may be registered.
+ */
+int bdb_sc_private_register_files(bdb_state_type *bdb_state, uint64_t build_id,
+                                  int dta_rebuilt, const int *blob_rebuilt,
+                                  int nblobs, const int *ix_rebuilt, int nix);
+
+/* Drop every registration for a build.  Idempotent. */
+int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
+                                    uint64_t build_id);
 #endif

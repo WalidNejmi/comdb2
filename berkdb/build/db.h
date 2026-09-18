@@ -170,6 +170,9 @@ struct __utxnid_track; typedef struct __utxnid_track UTXNID_TRACK;
 struct __logfile_txn_list; typedef struct __logfile_txn_list LOGFILE_TXN_LIST;
 struct __txn_commit_map; typedef struct __txn_commit_map DB_TXN_COMMIT_MAP;
 struct __modsnap_txn; typedef struct __modsnap_txn MODSNAP_TXN;
+struct __sc_private_file; typedef struct __sc_private_file SC_PRIVATE_FILE;
+struct __sc_private_file_registry;
+	typedef struct __sc_private_file_registry SC_PRIVATE_FILE_REGISTRY;
 
 struct __mempv; typedef struct __mempv DB_MEMPV;
 struct __mempv_cache; typedef struct __mempv_cache MEMPV_CACHE;
@@ -1119,6 +1122,24 @@ struct __db_txn {
 	u_int32_t coordinator_gen;
 	DBT blkseq_key;
 	int wrote_regop_gen;
+
+	/*
+	 * Schema-change replacement-file tracking.
+	 *
+	 * sc_build_id is set only on transactions the base schema-change
+	 * converter explicitly marks.  sc_skip_commit_map is set when such a
+	 * transaction writes a physical file registered to that same build,
+	 * and means: do not add this transaction to the commit-LSN map.
+	 *
+	 * The bit is monotonic.  A later write to anything else -- llmeta,
+	 * schema-change progress, an unregistered file -- deliberately does
+	 * NOT clear it.
+	 *
+	 * Zero for both preserves existing behaviour, which is what a freshly
+	 * allocated (zeroed) transaction gets.
+	 */
+	u_int64_t sc_build_id;
+	u_int8_t sc_skip_commit_map;
 };
 
 typedef enum {
@@ -2884,6 +2905,13 @@ struct __db_env {
 
 	DB_TXN_COMMIT_MAP* txmap;
 
+	/*
+	 * Physical files belonging to an in-progress schema-change build,
+	 * keyed by Berkeley file id.  Consulted only by transactions the base
+	 * converter marked, so an ordinary write never touches it.
+	 */
+	SC_PRIVATE_FILE_REGISTRY *sc_private_files;
+
 	DB_MEMPV *mempv;
 
 	pthread_mutex_t outstanding_modsnap_lock;
@@ -2939,6 +2967,28 @@ struct __txn_commit_map {
 	u_int64_t lookup_misses;
 
 	u_int64_t peak_payload_lower_bound_bytes;
+};
+
+/*
+ * One physical file that belongs to an active schema-change build.
+ *
+ * Keyed by Berkeley file id rather than by name or DB * -- names can be
+ * reused and pointers are process-local.
+ */
+struct __sc_private_file {
+	u_int8_t fileid[DB_FILE_ID_LEN];
+	u_int64_t build_id;
+};
+
+struct __sc_private_file_registry {
+	pthread_mutex_t lk;
+	hash_t *files;
+
+	/*
+	 * Builds that asked to be registered and could not be.  Those schema
+	 * changes simply run without the optimization.
+	 */
+	u_int64_t failed_registrations;
 };
 
 struct __mempv_cache_page_key
