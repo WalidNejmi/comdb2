@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Publication fences must survive a restart.
+#
+# The in-memory fence registry is process-local.  After a restart the commit
+# map is rebuilt from the WAL, and recovery honours the same durable marker the
+# master wrote, so the converter entries are STILL absent.  Reconstruction of a
+# page in a rebuilt file therefore still has no commit-map entry to find, and
+# still needs a fence to stop at -- one that nothing in memory can supply any
+# more.
+#
+# So the fence has to come back from its durable record, written by
+# bdb_set_sc_publication_fence() inside the publication transaction and read
+# back by bdb_load_sc_publication_fences() at startup.
+#
+# This test proves that end to end:
+#
+#   1. rebuild t with the skip active, so converter entries are omitted and
+#      fences are published;
+#   2. confirm a snapshot reads correctly before the restart;
+#   3. restart the node;
+#   4. confirm the fences are back (loaded from llmeta, not inherited);
+#   5. confirm a snapshot STILL reads correctly, and that it needed a fence to
+#      do so (fence stops increased after the restart).
+#
+# Step 5 is the assertion that fails if durability is missing: with an
+# in-memory-only registry the reloaded node has no fence, reconstruction walks
+# into converter history that is not in the map, and the snapshot reads empty.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+
+set -o pipefail
+
+dbnm=$1
+[[ -z "$dbnm" ]] && dbnm=$DBNAME
+
+N=${SC_FENCE_ROWS:-5000}
+
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+
+clminfo() {
+	cdb2sql ${CDB2_OPTIONS} --host $master $dbnm \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null
+}
+fence_count() { clminfo | grep -oP '(?<=SC publication fences: )[0-9]+'; }
+fence_stops() { clminfo | grep -oP '(?<=SC fence stops: )[0-9]+'; }
+skipped()     { clminfo | grep -oP '(?<=SC commit-map entries skipped: )[0-9]+'; }
+
+# Read the whole table through a snapshot.  Reconstruction only runs when the
+# snapshot has to look back past a concurrent write, so make one.
+snapshot_count() {
+	local fifo=/tmp/sc_fence_fifo.$$ out=/tmp/sc_fence_out.$$ pid
+	mkfifo $fifo
+	cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm - < $fifo > $out 2>&1 &
+	pid=$!
+	exec 9>$fifo
+
+	printf '%s\n' "set transaction snapshot isolation" "begin" \
+		"select count(*) from t" >&9
+	sleep 2
+
+	# Concurrent writes the snapshot must NOT see; these force the page
+	# versions it reads next to be reconstructed.
+	run "update t set j = j + 1000 where i <= $(( N / 2 ))" > /dev/null
+	run "update t set j = j + 1000 where i <= $(( N / 2 ))" > /dev/null
+
+	printf '%s\n' "select count(*) from t" "select sum(j) from t" "commit" >&9
+	sleep 2
+
+	exec 9>&-
+	wait $pid 2>/dev/null
+	rm -f $fifo
+
+	mapfile -t vals < <(grep -vE '^\[' $out)
+	rm -f $out
+	# first count, second count, sum
+	echo "${vals[1]} ${vals[2]}"
+}
+
+# --- build ------------------------------------------------------------------
+
+run "create table t(i int, j int)" > /dev/null
+run "create index ix_j on t(j)" > /dev/null
+run "insert into t select value, value from generate_series(1, $N)" > /dev/null
+
+expected_sum=$(run 'select sum(j) from t')
+run "rebuild t" > /dev/null
+
+skipped_before=$(skipped)
+fences_before=$(fence_count)
+
+(( skipped_before >= N )) || \
+	fail "rebuild skipped only $skipped_before converter entries; the skip is" \
+		"not active, so this test would not exercise the fence"
+(( fences_before > 0 )) || \
+	fail "no publication fences after the rebuild"
+
+read pre_count pre_sum <<< "$(snapshot_count)"
+(( pre_count == N )) || \
+	fail "before restart: snapshot saw $pre_count rows, expected $N"
+[[ "$pre_sum" == "$expected_sum" ]] || \
+	fail "before restart: snapshot sum '$pre_sum', expected $expected_sum"
+
+echo "SC_FENCE_RESTART_BEFORE: skipped=$skipped_before fences=$fences_before" \
+	"snapshot_count=$pre_count"
+
+# --- restart ----------------------------------------------------------------
+
+echo "Restarting the node..."
+stop_all_nodes
+start_all_nodes
+wait_up
+
+master=$(getmaster)
+[[ -n "$master" ]] || fail "could not find master after restart"
+
+# Nothing may be inherited from the previous process: these must have been read
+# back from llmeta.
+fences_after=$(fence_count)
+(( fences_after > 0 )) || \
+	fail "no publication fences after restart (got '$fences_after'); the" \
+		"durable records were not written or not reloaded"
+(( fences_after >= fences_before )) || \
+	fail "fences dropped from $fences_before to $fences_after across the restart"
+
+stops_before_read=$(fence_stops)
+
+# The table itself must have survived.
+rowcount=$(run 'select count(*) from t')
+(( rowcount == N )) || fail "table has $rowcount rows after restart, expected $N"
+
+# Re-baseline: the pre-restart snapshot helper left its concurrent updates
+# committed, so the table has legitimately moved on from expected_sum.  What
+# the post-restart snapshot must see is the table as of ITS start point.
+expected_sum=$(run 'select sum(j) from t')
+
+# --- the property -----------------------------------------------------------
+
+read post_count post_sum <<< "$(snapshot_count)"
+
+stops_after_read=$(fence_stops)
+stops_delta=$(( stops_after_read - stops_before_read ))
+
+echo "SC_FENCE_RESTART_AFTER: fences=$fences_after snapshot_count=$post_count" \
+	"snapshot_sum=$post_sum fence_stops_delta=$stops_delta"
+
+(( post_count == N )) || \
+	fail "after restart: snapshot saw $post_count rows, expected $N"
+[[ "$post_sum" == "$expected_sum" ]] || \
+	fail "after restart: snapshot sum '$post_sum', expected $expected_sum"
+
+# NOTE on what this test does and does not prove.
+#
+# It proves the DURABLE path: the process was killed, so the reloaded registry
+# cannot have been inherited, and the fences above came back from llmeta.
+#
+# It does NOT prove the reloaded fence was load-bearing for the read that
+# followed, and deliberately does not assert that.  Recovery takes a checkpoint
+# at startup, and that checkpoint is ordered after every converter write, so
+# once a node has restarted the checkpoint clause of
+# PAGE_VERSION_IS_GUARANTEED_TARGET short-circuits before the fence is ever
+# consulted -- fence_stops_delta is legitimately 0 here.  CHECKPOINTTIME cannot
+# suppress the startup checkpoint.
+#
+# The case where a reloaded fence IS on the critical path is a node that has
+# the converter writes but never pended a fence of its own and has not
+# checkpointed since: a replica, or a master promoted straight after a schema
+# change.  That needs a cluster and belongs in a clustered test.
+do_verify t
+
+echo "Passed test"

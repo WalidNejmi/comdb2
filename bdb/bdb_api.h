@@ -2565,4 +2565,24 @@ int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
                                      unsigned int fence_offset);
 int bdb_sc_publication_fence_discard(bdb_state_type *bdb_state,
                                      uint64_t build_id);
+int bdb_sc_publication_fence_install(bdb_state_type *bdb_state,
+                                     const uint8_t *fileid, uint64_t build_id,
+                                     unsigned int fence_file,
+                                     unsigned int fence_offset);
+
+/*
+ * Durable publication fences, keyed by physical file id.  Written inside the
+ * publication transaction so the record exists exactly when the generation it
+ * describes is visible, and read back to rebuild the in-memory registry after
+ * a restart, recovery or promotion.
+ */
+int bdb_set_sc_publication_fence(tran_type *tran, const uint8_t *fileid,
+                                 unsigned int lsn_file, unsigned int lsn_offset,
+                                 uint64_t build_id, int *bdberr);
+int bdb_del_sc_publication_fence(tran_type *tran, const uint8_t *fileid,
+                                 int *bdberr);
+int bdb_load_sc_publication_fences(tran_type *tran, int *nloaded, int *bdberr);
+int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
+                                     uint64_t build_id, unsigned int fence_file,
+                                     unsigned int fence_offset);
 #endif

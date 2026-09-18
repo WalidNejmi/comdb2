@@ -354,7 +354,7 @@ int llog_scdone_rename_wrapper(bdb_state_type *bdb_state,
  * Until this runs the build's entries carry a zero fence and are inert, so a
  * schema change that never reaches here changes nothing.
  */
-static void sc_publish_fences(struct schema_change_type *s,
+static void sc_publish_fences(struct schema_change_type *s, tran_type *tran,
                               unsigned int fence_file,
                               unsigned int fence_offset)
 {
@@ -365,6 +365,14 @@ static void sc_publish_fences(struct schema_change_type *s,
 
     if ((build_id = sc_private_build_id(s)) == 0)
         return;
+
+    /*
+     * Durable first, in the publication transaction, so the record shares the
+     * generation's fate.  Then the in-memory registry this node reads from;
+     * other nodes build theirs from the durable record instead.
+     */
+    bdb_sc_publication_fence_persist(s->db->handle, tran, build_id, fence_file,
+                                     fence_offset);
 
     bdb_sc_publication_fence_publish(s->db->handle, build_id, fence_file,
                                      fence_offset);
@@ -457,7 +465,7 @@ static int do_finalize(ddl_t func, struct ireq *iq,
          * are readable but reconstruction has no stopping proof for them.
          * The failure paths below discard it again.
          */
-        sc_publish_fences(s, fence_file, fence_offset);
+        sc_publish_fences(s, tran, fence_file, fence_offset);
 
         if (s->keep_locked) {
             rc = trans_commit(iq, tran, gbl_myhostname);
@@ -492,7 +500,7 @@ static int do_finalize(ddl_t func, struct ireq *iq,
         }
 
         /* Caller owns the commit; see the note at the sibling call above. */
-        sc_publish_fences(s, fence_file, fence_offset);
+        sc_publish_fences(s, tran, fence_file, fence_offset);
     }
     return rc;
 abort:

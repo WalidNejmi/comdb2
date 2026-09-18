@@ -103,6 +103,9 @@ void __sc_private_registry_note_failure(DB_ENV *);
 int __sc_publication_fence_pend(DB_ENV *, const uint8_t *, uint64_t);
 int __sc_publication_fence_publish(DB_ENV *, uint64_t, DB_LSN);
 int __sc_publication_fence_discard_build(DB_ENV *, uint64_t);
+int __sc_publication_fence_install(DB_ENV *, const uint8_t *, uint64_t, DB_LSN);
+int __sc_publication_fence_list_build(DB_ENV *, uint64_t, uint8_t *, int,
+                                      int *);
 
 /*
  * Mark a base schema-change converter transaction with its build id.
@@ -243,6 +246,79 @@ int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
     fence.offset = fence_offset;
 
     return __sc_publication_fence_publish(bdb_state->dbenv, build_id, fence);
+}
+
+/*
+ * Install an already-published fence, as read back from its durable record.
+ *
+ * The registry is process-local, so every node rebuilds it this way after a
+ * restart, recovery or promotion rather than inheriting anything.
+ */
+int bdb_sc_publication_fence_install(bdb_state_type *bdb_state,
+                                     const uint8_t *fileid, uint64_t build_id,
+                                     unsigned int fence_file,
+                                     unsigned int fence_offset)
+{
+    DB_LSN fence;
+
+    if (bdb_state == NULL || fileid == NULL || fence_file == 0)
+        return -1;
+
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    fence.file = fence_file;
+    fence.offset = fence_offset;
+
+    return __sc_publication_fence_install(bdb_state->dbenv, fileid, build_id,
+                                          fence);
+}
+
+/*
+ * Make this build's fences durable, inside the publication transaction.
+ *
+ * Writing them here rather than after the commit is what gives the metadata
+ * the same fate as the generation it describes: if publication aborts there is
+ * no record, and there is never a window where the new files are readable but
+ * reconstruction has no stopping proof for them.
+ */
+int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
+                                     uint64_t build_id, unsigned int fence_file,
+                                     unsigned int fence_offset)
+{
+    /* A table's data stripes, indexes and blob files; generous. */
+    enum { MAX_BUILD_FILES = 256 };
+    uint8_t fileids[MAX_BUILD_FILES * DB_FILE_ID_LEN];
+    int nfiles = 0, i, rc, bdberr = 0;
+
+    if (bdb_state == NULL || tran == NULL || build_id == 0 || fence_file == 0)
+        return -1;
+
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    rc = __sc_publication_fence_list_build(bdb_state->dbenv, build_id, fileids,
+                                           MAX_BUILD_FILES, &nfiles);
+    if (rc != 0) {
+        logmsg(LOGMSG_ERROR,
+               "%s: could not list fences for build 0x%" PRIx64 " rc %d\n",
+               __func__, build_id, rc);
+        return -1;
+    }
+
+    for (i = 0; i < nfiles; i++) {
+        rc = bdb_set_sc_publication_fence(tran, fileids + (size_t)i * DB_FILE_ID_LEN, fence_file, fence_offset,
+                                          build_id, &bdberr);
+        if (rc != 0) {
+            logmsg(LOGMSG_ERROR,
+                   "%s: failed to persist fence %d/%d for build 0x%" PRIx64
+                   " rc %d bdberr %d\n",
+                   __func__, i + 1, nfiles, build_id, rc, bdberr);
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 /*

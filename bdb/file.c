@@ -3427,6 +3427,25 @@ int bdb_env_init_after_llmeta(bdb_state_type *bdb_state)
     if (!gbl_rowlocks) {
         rc = bdb_delete_file_lwm(bdb_state, NULL, &bdberr);
     }
+
+    /*
+     * Rebuild the schema-change publication-fence registry from its durable
+     * records.  It is process-local, so every node does this for itself after
+     * a restart, recovery or promotion rather than inheriting anything from a
+     * previous master.  Without it, reconstruction of a rebuilt file whose
+     * converter entries were omitted has no stopping proof.
+     */
+    {
+        int nfences = 0, fbdberr = 0;
+
+        if (bdb_load_sc_publication_fences(NULL, &nfences, &fbdberr) != 0) {
+            logmsg(LOGMSG_ERROR,
+                   "Failed to load schema-change publication fences "
+                   "(bdberr %d)\n",
+                   fbdberr);
+        }
+    }
+
     bdb_state->after_llmeta_init_done = 1;
     return 0;
 }

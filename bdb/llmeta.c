@@ -180,6 +180,15 @@ typedef enum {
     LLMETA_SCHEMACHANGE_LIST = 57,            /* list of all sc-s in a uuid txh */
     LLMETA_SCHEMACHANGE_STATUS_PROTOBUF = 58, /* Indicate protobuf sc */
     LLMETA_MAX_SEQNO = 59,
+    /* key = 60 + Berkeley file id[DB_FILE_ID_LEN]
+     * data = llmeta_sc_publication_fence_data
+     *
+     * The publication fence of one physical file a schema change rebuilt.
+     * Written in the publication transaction itself, so it exists exactly
+     * when the generation it describes is visible.  See
+     * berkdb/txn/txn_sc_skip.c and __mempv_fget().
+     */
+    LLMETA_SC_PUBLICATION_FENCE = 60,
 } llmetakey_t;
 
 struct llmeta_file_type_key {
@@ -11578,5 +11587,206 @@ int bdb_del_seqno(tran_type *t)
     rc = kv_del(t, &k, &bdberr);
     if (rc != 0)
         logmsg(LOGMSG_WARN, "%s: kv_del rc %d bdberr %d\n", __func__, rc, bdberr);
+    return rc;
+}
+
+/*
+ * Publication fences of rebuilt schema-change files.
+ *
+ * key:   LLMETA_SC_PUBLICATION_FENCE + Berkeley file id
+ * value: llmeta_sc_publication_fence_data
+ *
+ * Keyed by physical file id, not table name: successive generations of one
+ * table are different physical objects, and a name can be dropped and reused.
+ * The in-memory registry that __mempv_fget() consults is rebuilt from these
+ * records, so the fence survives restart, recovery and promotion.
+ */
+struct llmeta_sc_publication_fence_key {
+    int file_type;
+    uint8_t fileid[DB_FILE_ID_LEN];
+};
+
+struct llmeta_sc_publication_fence_data {
+    int version;
+    int lsn_file;
+    int lsn_offset;
+    uint64_t build_id;
+};
+
+enum {
+    LLMETA_SC_PUBLICATION_FENCE_KEY_LEN = 4 + DB_FILE_ID_LEN,
+    LLMETA_SC_PUBLICATION_FENCE_DATA_LEN = 4 + 4 + 4 + 8,
+    LLMETA_SC_PUBLICATION_FENCE_VERSION = 1
+};
+
+static uint8_t *
+llmeta_sc_publication_fence_key_put(const struct llmeta_sc_publication_fence_key *p_key, uint8_t *p_buf,
+                                    const uint8_t *p_buf_end)
+{
+    if (p_buf_end < p_buf || (p_buf_end - p_buf) < LLMETA_SC_PUBLICATION_FENCE_KEY_LEN)
+        return NULL;
+
+    p_buf = buf_put(&(p_key->file_type), sizeof(p_key->file_type), p_buf, p_buf_end);
+    p_buf = buf_no_net_put(p_key->fileid, sizeof(p_key->fileid), p_buf, p_buf_end);
+
+    return p_buf;
+}
+
+static uint8_t *
+llmeta_sc_publication_fence_data_put(const struct llmeta_sc_publication_fence_data *p_data, uint8_t *p_buf,
+                                     const uint8_t *p_buf_end)
+{
+    if (p_buf_end < p_buf || (p_buf_end - p_buf) < LLMETA_SC_PUBLICATION_FENCE_DATA_LEN)
+        return NULL;
+
+    p_buf = buf_put(&(p_data->version), sizeof(p_data->version), p_buf, p_buf_end);
+    p_buf = buf_put(&(p_data->lsn_file), sizeof(p_data->lsn_file), p_buf, p_buf_end);
+    p_buf = buf_put(&(p_data->lsn_offset), sizeof(p_data->lsn_offset), p_buf, p_buf_end);
+    p_buf = buf_put(&(p_data->build_id), sizeof(p_data->build_id), p_buf, p_buf_end);
+
+    return p_buf;
+}
+
+static const uint8_t *
+llmeta_sc_publication_fence_data_get(struct llmeta_sc_publication_fence_data *p_data, const uint8_t *p_buf,
+                                     const uint8_t *p_buf_end)
+{
+    if (p_buf_end < p_buf || (p_buf_end - p_buf) < LLMETA_SC_PUBLICATION_FENCE_DATA_LEN)
+        return NULL;
+
+    p_buf = buf_get(&(p_data->version), sizeof(p_data->version), p_buf, p_buf_end);
+    p_buf = buf_get(&(p_data->lsn_file), sizeof(p_data->lsn_file), p_buf, p_buf_end);
+    p_buf = buf_get(&(p_data->lsn_offset), sizeof(p_data->lsn_offset), p_buf, p_buf_end);
+    p_buf = buf_get(&(p_data->build_id), sizeof(p_data->build_id), p_buf, p_buf_end);
+
+    return p_buf;
+}
+
+static int llmeta_sc_publication_fence_key(const uint8_t *fileid, char *key)
+{
+    struct llmeta_sc_publication_fence_key k;
+    uint8_t *p_buf = (uint8_t *)key, *p_buf_end = p_buf + LLMETA_IXLEN;
+
+    memset(key, 0, LLMETA_IXLEN);
+    k.file_type = LLMETA_SC_PUBLICATION_FENCE;
+    memcpy(k.fileid, fileid, DB_FILE_ID_LEN);
+
+    return llmeta_sc_publication_fence_key_put(&k, p_buf, p_buf_end) == NULL ? -1 : 0;
+}
+
+/*
+ * Record a rebuilt file's publication fence.
+ *
+ * Must be called inside the publication transaction, so the record exists
+ * exactly when the generation it describes does: if publication aborts, the
+ * fence never appears, and reconstruction of those files keeps its ordinary
+ * commit-map behaviour.
+ */
+int bdb_set_sc_publication_fence(tran_type *tran, const uint8_t *fileid, unsigned int lsn_file,
+                                 unsigned int lsn_offset, uint64_t build_id, int *bdberr)
+{
+    char key[LLMETA_IXLEN];
+    uint8_t data[LLMETA_SC_PUBLICATION_FENCE_DATA_LEN];
+    struct llmeta_sc_publication_fence_data d;
+
+    *bdberr = BDBERR_NOERROR;
+
+    if (fileid == NULL || lsn_file == 0)
+        return -1;
+
+    if (llmeta_sc_publication_fence_key(fileid, key) != 0) {
+        *bdberr = BDBERR_BADARGS;
+        return -1;
+    }
+
+    d.version = LLMETA_SC_PUBLICATION_FENCE_VERSION;
+    d.lsn_file = (int)lsn_file;
+    d.lsn_offset = (int)lsn_offset;
+    d.build_id = build_id;
+
+    if (llmeta_sc_publication_fence_data_put(&d, data, data + sizeof(data)) == NULL) {
+        *bdberr = BDBERR_BADARGS;
+        return -1;
+    }
+
+    return kv_put(tran, key, data, sizeof(data), bdberr);
+}
+
+int bdb_del_sc_publication_fence(tran_type *tran, const uint8_t *fileid, int *bdberr)
+{
+    char key[LLMETA_IXLEN];
+    int rc;
+
+    *bdberr = BDBERR_NOERROR;
+
+    if (fileid == NULL)
+        return -1;
+
+    if (llmeta_sc_publication_fence_key(fileid, key) != 0) {
+        *bdberr = BDBERR_BADARGS;
+        return -1;
+    }
+
+    rc = kv_del(tran, key, bdberr);
+    if (rc != 0 && *bdberr == BDBERR_DEL_DTA) /* absent is not an error */
+        rc = 0;
+
+    return rc;
+}
+
+static int load_one_sc_publication_fence(void *k, void *v, void *data)
+{
+    const uint8_t *key = k;
+    struct llmeta_sc_publication_fence_data d;
+    int *nloaded = data;
+
+    if (llmeta_sc_publication_fence_data_get(&d, v, (const uint8_t *)v + LLMETA_SC_PUBLICATION_FENCE_DATA_LEN) ==
+        NULL) {
+        logmsg(LOGMSG_ERROR, "%s: unreadable publication-fence record\n", __func__);
+        return 0; /* skip it; a missing fence fails closed, see __mempv_fget */
+    }
+
+    if (d.version != LLMETA_SC_PUBLICATION_FENCE_VERSION) {
+        logmsg(LOGMSG_ERROR, "%s: unknown publication-fence version %d\n", __func__, d.version);
+        return 0;
+    }
+
+    if (bdb_sc_publication_fence_install(llmeta_bdb_state, key + 4, d.build_id, (unsigned int)d.lsn_file,
+                                         (unsigned int)d.lsn_offset) == 0)
+        ++(*nloaded);
+
+    return 0;
+}
+
+/*
+ * Rebuild the in-memory publication-fence registry from llmeta.
+ *
+ * Called once the llmeta table is readable, on every node and after every
+ * restart, recovery or promotion -- the registry is process-local, so nothing
+ * may be inherited from a previous master's memory.
+ */
+int bdb_load_sc_publication_fences(tran_type *tran, int *nloaded, int *bdberr)
+{
+    int file_type = LLMETA_SC_PUBLICATION_FENCE;
+    uint8_t prefix[sizeof(int)];
+    int n = 0, rc;
+
+    *bdberr = BDBERR_NOERROR;
+    if (nloaded)
+        *nloaded = 0;
+
+    if (buf_put(&file_type, sizeof(file_type), prefix, prefix + sizeof(prefix)) == NULL)
+        return -1;
+
+    rc = kv_for_each_pair(tran, prefix, sizeof(prefix), load_one_sc_publication_fence, &n);
+
+    if (nloaded)
+        *nloaded = n;
+
+    if (rc)
+        logmsg(LOGMSG_ERROR, "%s: failed to load publication fences rc %d\n", __func__, rc);
+    else if (n > 0)
+        logmsg(LOGMSG_INFO, "Loaded %d schema-change publication fence(s)\n", n);
+
     return rc;
 }

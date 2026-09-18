@@ -583,6 +583,56 @@ done:
 	return (ret);
 }
 
+/*
+ * __sc_publication_fence_install --
+ *	Install an already-published fence directly.
+ *
+ *	Used when rebuilding the registry from its durable records, where each
+ *	file's fence is known up front and there is no pending phase.
+ *
+ * PUBLIC: int __sc_publication_fence_install __P((DB_ENV *, const u_int8_t *,
+ * PUBLIC:	   u_int64_t, DB_LSN));
+ */
+int
+__sc_publication_fence_install(dbenv, fileid, build_id, fence_lsn)
+	DB_ENV *dbenv;
+	const u_int8_t *fileid;
+	u_int64_t build_id;
+	DB_LSN fence_lsn;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	SC_PUBLICATION_FENCE *f;
+	int ret = 0;
+
+	if (reg == NULL || fileid == NULL || IS_ZERO_LSN(fence_lsn))
+		return (EINVAL);
+
+	Pthread_mutex_lock(&reg->lk);
+
+	f = hash_find(reg->files, fileid);
+	if (f != NULL) {
+		f->fence_lsn = fence_lsn;
+		f->build_id = build_id;
+		goto done;
+	}
+
+	if ((ret = __os_calloc(dbenv, 1, sizeof(*f), &f)) != 0)
+		goto done;
+
+	memcpy(f->fileid, fileid, DB_FILE_ID_LEN);
+	f->fence_lsn = fence_lsn;
+	f->build_id = build_id;
+
+	if (hash_add(reg->files, f) != 0) {
+		__os_free(dbenv, f);
+		ret = ENOMEM;
+	}
+
+done:
+	Pthread_mutex_unlock(&reg->lk);
+	return (ret);
+}
+
 struct sc_fence_build_arg {
 	u_int64_t build_id;
 	DB_LSN fence_lsn;
@@ -636,6 +686,73 @@ __sc_publication_fence_publish(dbenv, build_id, fence_lsn)
 	hash_for(reg->files, &stamp_one_build_fence, &arg);
 	Pthread_mutex_unlock(&reg->lk);
 
+	return (0);
+}
+
+struct sc_fence_list_arg {
+	u_int64_t build_id;
+	u_int8_t *out;
+	int max;
+	int n;
+};
+
+static int
+collect_one_build_fence(void *obj, void *arg)
+{
+	SC_PUBLICATION_FENCE *f = obj;
+	struct sc_fence_list_arg *a = arg;
+
+	if (f->build_id != a->build_id)
+		return (0);
+
+	if (a->n >= a->max) {
+		a->n = -1;	/* caller's buffer is too small; say so */
+		return (1);
+	}
+
+	memcpy(a->out + (size_t)a->n * DB_FILE_ID_LEN, f->fileid,
+	    DB_FILE_ID_LEN);
+	a->n++;
+	return (0);
+}
+
+/*
+ * __sc_publication_fence_list_build --
+ *	Copy out the file ids belonging to a build, so its caller can make them
+ *	durable.  Returns -1 if they do not fit in max entries.
+ *
+ * PUBLIC: int __sc_publication_fence_list_build __P((DB_ENV *, u_int64_t,
+ * PUBLIC:	   u_int8_t *, int, int *));
+ */
+int
+__sc_publication_fence_list_build(dbenv, build_id, out, max, nout)
+	DB_ENV *dbenv;
+	u_int64_t build_id;
+	u_int8_t *out;
+	int max;
+	int *nout;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	struct sc_fence_list_arg arg;
+
+	*nout = 0;
+
+	if (reg == NULL || build_id == 0 || out == NULL || max <= 0)
+		return (EINVAL);
+
+	arg.build_id = build_id;
+	arg.out = out;
+	arg.max = max;
+	arg.n = 0;
+
+	Pthread_mutex_lock(&reg->lk);
+	hash_for(reg->files, &collect_one_build_fence, &arg);
+	Pthread_mutex_unlock(&reg->lk);
+
+	if (arg.n < 0)
+		return (ENOMEM);
+
+	*nout = arg.n;
 	return (0);
 }
 

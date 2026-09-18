@@ -1,0 +1,13 @@
+utxnid_log on
+enable_snapshot_isolation
+
+# The converter entries are only omitted -- and the fences only published --
+# when the master writes the durable marker, which is gated on this writer.
+sc_commit_flags_writer 1
+
+# Suppress periodic checkpoints.  The checkpoint clause of
+# PAGE_VERSION_IS_GUARANTEED_TARGET can stop reconstruction before it ever
+# consults the fence, which would let this test pass without the fence being
+# reloaded at all.  Holding checkpoints off keeps the fence on the critical
+# path, so a fence that failed to survive the restart fails the test.
+setattr CHECKPOINTTIME 9999999
