@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# A reused physical file must never be fenced.
+#
+# The publication fence says "every write forming this file's initial image is
+# at or before this LSN".  That is true of a file the schema change built
+# privately.  It is NOT true of a file the plan reused: that file is public,
+# applications have been writing to it all along, and its history did not begin
+# at this schema change.  Fencing one would let reconstruction stop early and
+# hand a snapshot writes that were not committed at its target -- silent wrong
+# answers, which is worse than the bug the fence exists to fix.
+#
+# Fences are pended inside bdb_sc_private_register_files(), which walks the
+# schema-change plan and skips files it did not rebuild.  This test pins that
+# behaviour down by counting.
+#
+#   full rebuild of t   -> every file rebuilt      -> N_full fences
+#   add an index to t   -> only the index rebuilt  -> exactly 1 more fence
+#
+# If the plan were ignored and every file were fenced, adding one index would
+# fence the data file(s) again and the count would jump by more than one.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+
+set -o pipefail
+
+dbnm=$1
+[[ -z "$dbnm" ]] && dbnm=$DBNAME
+
+N=${SC_FENCE_ROWS:-2000}
+
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+
+fence_count() {
+	cdb2sql ${CDB2_OPTIONS} --host $master $dbnm \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+		grep -oP '(?<=SC publication fences: )[0-9]+'
+}
+
+run "create table t(i int, j int, k int)" > /dev/null
+run "create index ix_j on t(j)" > /dev/null
+run "insert into t select value, value, value from generate_series(1, $N)" > /dev/null
+
+base=$(fence_count)
+[[ -n "$base" ]] || fail "could not read the publication-fence count"
+
+# A full rebuild: every physical file of t is rebuilt, so every one is fenced.
+run "rebuild t" > /dev/null
+after_rebuild=$(fence_count)
+full=$(( after_rebuild - base ))
+
+skipped=$(cdb2sql ${CDB2_OPTIONS} --host $master $dbnm \
+	"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+	grep -oP '(?<=SC commit-map entries skipped: )[0-9]+')
+echo "SC_FENCE_REUSED: full_rebuild_fences=$full skipped=$skipped" \
+	"base=$base after=$after_rebuild"
+
+(( full > 0 )) || \
+	fail "a full rebuild fenced $full files; expected at least one"
+
+# Adding an index builds the new index only; the data file is reused, keeps its
+# identity, and must not be fenced again.
+run "create index ix_k on t(k)" > /dev/null
+after_index=$(fence_count)
+delta=$(( after_index - after_rebuild ))
+
+echo "SC_FENCE_REUSED: add_index_fence_delta=$delta (full rebuild was $full)"
+
+# Adding one index rebuilds exactly one physical file, so exactly one fence
+# may appear.  Two means the reused data file was fenced as well.
+#
+# This count is the assertion that discriminates, and it is deliberately exact.
+# A behavioural check does NOT catch a false fence here: the data the fence
+# wrongly covers was in fact committed before the snapshot, so reconstruction
+# still produces the right answer.  Catching it that way would need a write to
+# the reused file ordered before the fence but committed after the snapshot's
+# target -- an in-flight transaction spanning publication, which this harness
+# cannot arrange.  Verified by mutation: ignoring the plan in
+# sc_private_register_build() takes this delta from 1 to 2.
+(( delta == 1 )) || \
+	fail "adding one index produced $delta fences, expected exactly 1 --" \
+		"a reused file is being fenced, which lets reconstruction stop early" \
+		"on a public file"
+
+# The data must still read correctly through a snapshot: reconstruction over a
+# reused file has to fall back to ordinary commit-map behaviour, because those
+# transactions were never skipped.
+fifo=/tmp/sc_fence_reused_fifo.$$
+out=/tmp/sc_fence_reused_out.$$
+expected_sum=$(run 'select sum(j) from t')
+mkfifo $fifo
+cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm - < $fifo > $out 2>&1 &
+pid=$!
+exec 9>$fifo
+printf '%s\n' "set transaction snapshot isolation" "begin" \
+	"select count(*) from t" >&9
+sleep 2
+run "update t set j = j + 7 where i <= $(( N / 2 ))" > /dev/null
+printf '%s\n' "select count(*) from t" "select sum(j) from t" "commit" >&9
+sleep 2
+exec 9>&-
+wait $pid 2>/dev/null
+rm -f $fifo
+mapfile -t vals < <(grep -vE '^\[' $out)
+rm -f $out
+
+(( ${vals[1]} == N )) || \
+	fail "snapshot over the reused data file saw ${vals[1]} rows, expected $N"
+[[ "${vals[2]}" == "$expected_sum" ]] || \
+	fail "snapshot over the reused data file summed ${vals[2]}, expected" \
+		"$expected_sum -- it saw a write that postdates its target"
+
+do_verify t
+
+echo "Passed test"
