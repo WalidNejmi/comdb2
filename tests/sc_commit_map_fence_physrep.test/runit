@@ -212,6 +212,89 @@ echo "-----------------------------------"
 		"it is not omitting converter entries, so its fences are not being" \
 		"exercised"
 
+# --- the fence must be LOAD-BEARING for a read served by the physrep --------
+#
+# Holding the fences is necessary but not sufficient.  Everything above is
+# still true of a physrep that never reconstructs anything.  Drive a snapshot
+# read against the physrep across concurrent source writes, so it has to walk
+# a page back through the converter history it omitted, and require that it
+# stopped at a fence to do so.
+
+phys_sql() {
+	cdb2sql --tabs --allow-incoherent ${CDB2_OPTIONS} --host localhost \
+		"$destdb" "$1" 2>/dev/null
+}
+
+expected_sum=$(phys_sql 'select sum(i) from t')
+[[ -n "$expected_sum" ]] || \
+	fail "physrep could not serve a baseline read; cannot drive a snapshot" \
+		"against it"
+
+stops_before=$(physrep_clminfo | grep -oP '(?<=SC fence stops: )[0-9]+')
+
+fifo=/tmp/sc_fence_physrep_fifo.$$
+out=/tmp/sc_fence_physrep_out.$$
+mkfifo $fifo
+cdb2sql --tabs --allow-incoherent ${CDB2_OPTIONS} --host localhost "$destdb" \
+	- < $fifo > $out 2>&1 &
+pid=$!
+exec 9>$fifo
+
+printf '%s\n' "set transaction snapshot isolation" "begin" \
+	"select count(*) from t" "select sum(i) from t" >&9
+sleep 3
+
+# Writes on the SOURCE.  The physrep replays them, which is what forces it to
+# reconstruct the pages its open snapshot is reading.
+master=$(cluster_master)
+for r in 1 2 3; do
+	sql_node "$master" "update t set i = i + 1" > /dev/null
+done
+
+# Give the physrep time to replay them before the snapshot reads again.
+sleep 10
+
+printf '%s\n' "select count(*) from t" "select sum(i) from t" "commit" >&9
+sleep 3
+exec 9>&-
+wait $pid 2>/dev/null
+rm -f $fifo
+
+mapfile -t vals < <(grep -vE '^\[' $out)
+rm -f $out
+
+stops_after=$(physrep_clminfo | grep -oP '(?<=SC fence stops: )[0-9]+')
+stops_delta=$(( ${stops_after:-0} - ${stops_before:-0} ))
+
+echo "SC_FENCE_PHYSREP_SNAPSHOT: first=(${vals[0]}, ${vals[1]})" \
+	"second=(${vals[2]}, ${vals[3]}) expected_sum=$expected_sum" \
+	"fence_stops_delta=$stops_delta"
+
+# Guard: the writes must have reached the physrep, or "the snapshot did not
+# move" is trivially true and proves nothing.
+phys_now=$(phys_sql 'select sum(i) from t')
+(( phys_now == expected_sum + 3 * N )) || \
+	fail "the source's updates did not reach the physrep (sum $expected_sum ->" \
+		"${phys_now:-none}, wanted $(( expected_sum + 3 * N ))); the snapshot" \
+		"assertions below would be vacuous"
+
+(( ${vals[0]} == N )) || \
+	fail "physrep snapshot saw ${vals[0]} rows at start, expected $N"
+[[ "${vals[1]}" == "$expected_sum" ]] || \
+	fail "physrep snapshot summed ${vals[1]} at start, expected $expected_sum"
+
+(( ${vals[2]} == N )) || \
+	fail "physrep snapshot saw ${vals[2]} rows after the source's writes," \
+		"expected $N"
+[[ "${vals[3]}" == "$expected_sum" ]] || \
+	fail "physrep snapshot sum changed under it: '${vals[3]}' vs" \
+		"'$expected_sum' -- it saw writes that postdate its target"
+
+(( stops_delta > 0 )) || \
+	fail "physrep served a correct snapshot but never stopped at a fence" \
+		"(delta $stops_delta); the fence is not load-bearing here and this" \
+		"does not prove the physrep's fences work"
+
 cluster_log_delete_on
 
 echo "Passed test"
