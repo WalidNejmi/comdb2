@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Does a PHYSICAL REPLICA pick up publication fences?
+#
+# A physrep is the last consumer of the commit map whose fence story was
+# unverified.  It matters for the same reason a logical replica does: it
+# replays the converter transactions and, honouring the durable marker, leaves
+# their commit-map entries out -- so reconstruction of a page in a rebuilt file
+# has nothing to look up and needs a fence to stop at.
+#
+# Whether it gets one was an open question, because a physrep does not take the
+# logical-replication path.  It pulls raw log records and replays them:
+#
+#   db/phys_rep.c:745   handle_record()
+#     -> db/phys_rep.c:806          apply_log()
+#     -> berkdb/rep/rep_record.c    __dbenv_apply_log() -> __rep_apply(.., 2)
+#
+# Reading the code suggests it does reach the same place a logical replica
+# does: llog records dispatch through bdb_apprec() (bdb/custom_recover.c),
+# whose DB_llog_scdone case calls handle_scdone(), which on DB_TXN_APPLY calls
+# bdb_scdone_int() and thence the registered scdone_rtn -- scdone_callback(),
+# where the fence reload lives.  No physrep gate appears anywhere on that
+# chain.  But that is reasoning from reading, and this test is the measurement.
+#
+# Asserts the physrep ends up holding at least the fences the source published.
+#
+# Skips cleanly (exit 0) when the harness cannot provide a physrep: no source
+# cluster, no copycomdb2, or a physrep that fails to come up.  A physrep that
+# IS up and caught up but holds no fences is a real failure and fails loudly.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+source "$(dirname "$0")/cluster_commit_map_lib.sh"
+
+set -o pipefail
+
+dbname=$1
+[[ -z "$dbname" ]] && dbname=$DBNAME
+
+require_cluster
+
+export COPYCOMDB2_EXE=${COPYCOMDB2_EXE:-${BUILDDIR}/db/copycomdb2}
+if [[ ! -x "$COPYCOMDB2_EXE" ]]; then
+	echo "copycomdb2 not available ($COPYCOMDB2_EXE); skipping"
+	exit 0
+fi
+
+N=${SC_FENCE_ROWS:-200}
+
+destdb=${TESTCASE}dest${TESTID}
+COPY_DBDIR=${DBDIR}/$destdb
+DEST_DBDIR=${COPY_DBDIR}/$dbname
+destpid=0
+
+# clminfo against the physrep, which is a separate local instance.  Read with
+# --allow-incoherent: a physrep is never "coherent" in the cluster sense, but
+# its fence registry is meaningful as soon as it has applied the schema change.
+physrep_clminfo() {
+	cdb2sql --allow-incoherent ${CDB2_OPTIONS} --host localhost "$destdb" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null
+}
+physrep_fences() {
+	physrep_clminfo | grep -oP '(?<=SC publication fences: )[0-9]+'
+}
+# A physrep is a CONSUMER of the commit map, not a producer.  It never reaches
+# the master-only skip at __txn_commit_int(), so "SC commit-map entries
+# skipped" stays 0 on it by design; it omits entries through the apply-path
+# guards instead, and reports that through the would-skip counters.  Sum the
+# consumer roles -- a physrep applies via __rep_apply, so it lands on the
+# serial or concurrent replica counter depending on configuration.
+physrep_would_skip() {
+	physrep_clminfo | awk -F': ' '
+		/SC would-skip \(serial replica\)/     { s += $2 }
+		/SC would-skip \(concurrent replica\)/ { s += $2 }
+		/SC would-skip \(recovery\)/           { s += $2 }
+		END { print s + 0 }'
+}
+
+override_physrep_sp() {
+	local mnode
+	mnode=$(getmaster)
+	${CDB2SQL_EXE} $CDB2_OPTIONS "$dbname" --host "$mnode" \
+		"create procedure 'sys.physrep.register_replicant' version '1' { $(cat "$(dirname "$0")/register_replicant.lua") }" \
+		> /dev/null 2>&1
+}
+
+setup_replicant() {
+	local mnode cl rmt
+	mnode=$(getmaster)
+	[[ -z "$mnode" ]] && return 1
+	mkdir -p "$DEST_DBDIR"
+
+	cl="-y @$(echo $CLUSTER | tr ' ' ',')"
+	if [[ "$CLUSTER" =~ .*$myhost.* ]]; then
+		rmt=""
+	else
+		local clarray=($CLUSTER)
+		rmt="${clarray[0]}:"
+	fi
+
+	${COPYCOMDB2_EXE} -x ${COMDB2_EXE} -H "$destdb" $cl \
+		${rmt}${DBDIR}/${DBNAME}.lrl "$DEST_DBDIR" "$DEST_DBDIR" || return 1
+
+	# The physrep must maintain its own commit-LSN map for this to mean
+	# anything; state the same requirements the source runs with.
+	{
+		echo "utxnid_log on"
+		echo "enable_snapshot_isolation"
+		echo "verbose_fills on"
+	} >> "$DEST_DBDIR/${destdb}.lrl"
+	df "$DBDIR" | awk '{print $1}' | grep -q "tmpfs\|nfs" && \
+		echo "setattr directio 0" >> "$DEST_DBDIR/${destdb}.lrl"
+	if [ -n "$PMUXPORT" ] ; then
+		echo "portmux_port $PMUXPORT" >> "$DEST_DBDIR/${destdb}.lrl"
+		echo "portmux_bind_path $pmux_socket" >> "$DEST_DBDIR/${destdb}.lrl"
+	fi
+
+	local replog=$TESTDIR/logs/$destdb.db
+	(cd "$DBDIR"; timeout --kill-after=5s ${TEST_TIMEOUT:-15m} \
+		$COMDB2_EXE "$destdb" --lrl "$DEST_DBDIR/${destdb}.lrl" \
+		--pidfile "$DEST_DBDIR/${destdb}.pid" > "$replog" 2>&1) &
+
+	local out="" retries=0
+	while [[ "$out" != "1" ]]; do
+		out=$(${CDB2SQL_EXE} --tabs "$destdb" --host localhost 'select 1' 2>/dev/null)
+		sleep 1
+		let retries=retries+1
+		if [ $retries -eq 60 ]; then
+			return 1
+		fi
+	done
+	[[ -f "$DEST_DBDIR/${destdb}.pid" ]] && destpid=$(cat "$DEST_DBDIR/${destdb}.pid")
+	return 0
+}
+
+cleanup() {
+	cluster_log_delete_on
+	[[ "$destpid" != 0 ]] && kill -9 "$destpid" 2>/dev/null
+}
+trap cleanup EXIT
+
+# --- run --------------------------------------------------------------------
+
+master=$(cluster_master)
+[[ -n "$master" ]] || fail "could not find source master"
+echo "source_master=$master physrep=$destdb rows=$N"
+
+cluster_log_delete_off
+
+override_physrep_sp
+if ! setup_replicant; then
+	echo "physrep $destdb failed to come up; treating as infra-unavailable -- skipping"
+	exit 0
+fi
+
+# A physrep that does not maintain a commit map at all cannot exercise this.
+if [[ -z "$(physrep_clminfo)" ]]; then
+	echo "physrep exposes no clminfo block; skipping"
+	exit 0
+fi
+
+before_fences=$(physrep_fences)
+echo "SC_FENCE_PHYSREP: physrep fences before rebuild: ${before_fences:-unknown}"
+
+# Rebuild on the source: one converter commit per copied row.
+seed_table "$master" "$N"
+sleep 2
+master=$(cluster_master)
+sql_node "$master" "rebuild t" > /dev/null || fail "rebuild failed"
+
+src_fences=$(node_clminfo "$master" | grep -oP '(?<=SC publication fences: )[0-9]+')
+src_skipped=$(node_skipped "$master")
+
+echo "SC_FENCE_PHYSREP: source skipped=$src_skipped fences=$src_fences"
+
+(( src_skipped > 0 )) || \
+	fail "source skipped $src_skipped converter entries; the skip is not" \
+		"active, so this test would not exercise the fence"
+(( src_fences > 0 )) || fail "source published no fences"
+
+# Wait for the physrep to replay the schema change and pick the fences up.
+for (( i = 0; i < 150; i++ )); do
+	pf=$(physrep_fences)
+	[[ -n "$pf" ]] && (( pf >= src_fences )) && break
+	sleep 2
+done
+
+pf=$(physrep_fences)
+pw=$(physrep_would_skip)
+
+echo "SC_FENCE_PHYSREP: physrep fences=${pf:-none} would_skip=${pw:-none}" \
+	"(source fences=$src_fences skipped=$src_skipped)"
+
+echo "--- physrep commit-map counters ---"
+physrep_clminfo | grep -E "SC |Current entries|Entries added" || true
+echo "-----------------------------------"
+
+[[ -n "$pf" ]] || fail "physrep reported no fence count at all"
+
+# The physrep never pended a fence -- it did not run the schema change.  Any
+# it holds came from the durable records replayed out of the source's log.
+(( pf >= src_fences )) || \
+	fail "physrep holds $pf fences, source published $src_fences; a physrep" \
+		"that omits converter entries without a fence cannot reconstruct a" \
+		"page in a rebuilt file"
+
+# It must also be honouring the durable marker, or it is not in the state the
+# fence is needed for and the assertion above proves nothing.
+(( pw > 0 )) || \
+	fail "physrep decoded no flag-carrying commit records (would-skip $pw);" \
+		"it is not omitting converter entries, so its fences are not being" \
+		"exercised"
+
+cluster_log_delete_on
+
+echo "Passed test"
