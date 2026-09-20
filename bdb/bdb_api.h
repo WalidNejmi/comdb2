@@ -2585,4 +2585,6 @@ int bdb_load_sc_publication_fences(tran_type *tran, int *nloaded, int *bdberr);
 int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
                                      uint64_t build_id, unsigned int fence_file,
                                      unsigned int fence_offset);
+int bdb_get_log_end_lsn(bdb_state_type *bdb_state, unsigned int *file,
+                        unsigned int *offset);
 #endif

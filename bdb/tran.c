@@ -280,6 +280,37 @@ int bdb_sc_publication_fence_install(bdb_state_type *bdb_state,
 }
 
 /*
+ * Current end of the log.
+ *
+ * Used to date a schema change's publication fence.  Everything written before
+ * this point -- in particular every modification to the generation's
+ * replacement files -- is ordered before the returned LSN, and the publication
+ * commit comes after it, which is exactly the window the fence has to sit in.
+ */
+int bdb_get_log_end_lsn(bdb_state_type *bdb_state, unsigned int *file,
+                        unsigned int *offset)
+{
+    DB_LSN lsn;
+    int rc;
+
+    if (bdb_state == NULL)
+        return -1;
+
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    rc = bdb_state->dbenv->log_get_last_lsn(bdb_state->dbenv, &lsn);
+    if (rc != 0) {
+        logmsg(LOGMSG_ERROR, "%s: log_get_last_lsn rc %d\n", __func__, rc);
+        return -1;
+    }
+
+    *file = lsn.file;
+    *offset = lsn.offset;
+    return 0;
+}
+
+/*
  * Make this build's fences durable, inside the publication transaction.
  *
  * Writing them here rather than after the commit is what gives the metadata

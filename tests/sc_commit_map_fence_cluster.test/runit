@@ -38,11 +38,37 @@ require_cluster
 
 N=${SC_FENCE_ROWS:-5000}
 
+# Read clminfo with --allow-incoherent.
+#
+# A schema change leaves replicas behind, and an incoherent node refuses
+# ordinary queries ("wait_for_leader: new query on incoherent node").  But
+# coherency is about serving clients up-to-date data; the fence registry is
+# internal state that is meaningful as soon as the node has applied the
+# schema change.  Gating this read on coherency measures cluster throughput,
+# not the property under test.
+node_clminfo_anystate() {
+	cdb2sql --allow-incoherent ${CDB2_OPTIONS} --host "$1" "$dbname" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null
+}
 node_fences() {
-	node_clminfo "$1" | grep -oP '(?<=SC publication fences: )[0-9]+'
+	node_clminfo_anystate "$1" | grep -oP '(?<=SC publication fences: )[0-9]+'
 }
 node_fence_stops() {
-	node_clminfo "$1" | grep -oP '(?<=SC fence stops: )[0-9]+'
+	node_clminfo_anystate "$1" | grep -oP '(?<=SC fence stops: )[0-9]+'
+}
+
+# Wait for a replica to have APPLIED the schema change, which is what makes its
+# fence count meaningful -- not for it to be fully caught up.  Polls until the
+# node reports at least want_fences, or gives up.
+wait_for_replica_fences() {
+	local node=$1 want=$2 i rf
+	for (( i = 0; i < 150; i++ )); do
+		rf=$(node_fences "$node")
+		[[ -n "$rf" ]] && (( rf >= want )) && { echo "$rf"; return 0; }
+		sleep 2
+	done
+	echo "${rf:-}"
+	return 1
 }
 
 master=$(cluster_master)
@@ -72,15 +98,14 @@ echo "SC_FENCE_CLUSTER_MASTER: skipped=$master_skipped fences=$master_fences"
 # --- B: every replica has them too ------------------------------------------
 
 for node in $(cluster_replicas); do
-	rf=$(node_fences "$node")
-	[[ -n "$rf" ]] || fail "replica $node reported no fence count at all"
-
 	# The replica never pended a fence -- it did not run the schema change.
-	# Anything it has came from the durable record via scdone_callback().
-	(( rf >= master_fences )) || \
-		fail "replica $node holds $rf fences, master holds $master_fences;" \
-			"the replica did not pick up the published fences and cannot" \
-			"reconstruct a page in a rebuilt file"
+	# Anything it has came from the durable record via scdone_callback(), so
+	# this is the assertion the whole durable path exists for.
+	if ! rf=$(wait_for_replica_fences "$node" "$master_fences"); then
+		fail "replica $node holds '${rf:-none}' fences after waiting," \
+			"master holds $master_fences; the replica did not pick up the" \
+			"published fences and cannot reconstruct a page in a rebuilt file"
+	fi
 
 	echo "SC_FENCE_CLUSTER_REPLICA: node=$node fences=$rf"
 done
@@ -90,7 +115,12 @@ done
 replica=$(cluster_replicas | head -1)
 [[ -n "$replica" ]] || fail "no replica to read from"
 
-expected_sum=$(sql_node "$master" 'select sum(j) from t')
+# seed_table() creates t(i int) -- one column, no index.  Query that column;
+# referring to anything else silently yields empty results and turns the
+# assertions below into empty-vs-empty comparisons that always pass.
+expected_sum=$(sql_node "$master" 'select sum(i) from t')
+[[ -n "$expected_sum" ]] || fail "could not read the baseline sum"
+
 stops_before=$(node_fence_stops "$replica")
 
 fifo=/tmp/sc_fence_cluster_fifo.$$
@@ -100,14 +130,18 @@ cdb2sql --tabs ${CDB2_OPTIONS} --host "$replica" "$dbname" - < $fifo > $out 2>&1
 pid=$!
 exec 9>$fifo
 printf '%s\n' "set transaction snapshot isolation" "begin" \
-	"select count(*) from t" >&9
+	"select count(*) from t" "select sum(i) from t" >&9
 sleep 3
 
-# Writes the replica's snapshot must not see; they force reconstruction.
-sql_node "$master" "update t set j = j + 1000 where i <= $(( N / 2 ))" > /dev/null
+# Writes the replica's snapshot must not see; they force reconstruction of
+# pages whose history runs back through the converter writes.  "+ 1" touches
+# every row on every pass, so each one definitely lands.
+for r in 1 2 3; do
+	sql_node "$master" "update t set i = i + 1" > /dev/null
+done
 sleep 3
 
-printf '%s\n' "select count(*) from t" "select sum(j) from t" "commit" >&9
+printf '%s\n' "select count(*) from t" "select sum(i) from t" "commit" >&9
 sleep 3
 exec 9>&-
 wait $pid 2>/dev/null
@@ -119,15 +153,38 @@ rm -f $out
 stops_after=$(node_fence_stops "$replica")
 stops_delta=$(( stops_after - stops_before ))
 
-echo "SC_FENCE_CLUSTER_SNAPSHOT: node=$replica count=${vals[1]} sum=${vals[2]}" \
+# Guard: the updates must really have landed, or "the snapshot did not move"
+# proves nothing.
+now_sum=$(sql_node "$master" 'select sum(i) from t')
+(( now_sum == expected_sum + 3 * N )) || \
+	fail "concurrent updates did not land as expected (sum $expected_sum ->" \
+		"$now_sum, wanted $(( expected_sum + 3 * N ))); the snapshot" \
+		"assertions below would be vacuous"
+
+echo "SC_FENCE_CLUSTER_SNAPSHOT: node=$replica first=(${vals[0]}, ${vals[1]})" \
+	"second=(${vals[2]}, ${vals[3]}) expected_sum=$expected_sum" \
 	"fence_stops_delta=$stops_delta"
 
-(( ${vals[1]} == N )) || \
-	fail "replica snapshot saw ${vals[1]} rows, expected $N -- without the" \
-		"fence, reconstruction walks into converter history the replica" \
+(( ${vals[0]} == N )) || \
+	fail "replica snapshot saw ${vals[0]} rows at start, expected $N -- without" \
+		"the fence, reconstruction walks into converter history the replica" \
 		"also left out of its commit map"
-[[ "${vals[2]}" == "$expected_sum" ]] || \
-	fail "replica snapshot summed ${vals[2]}, expected $expected_sum"
+[[ "${vals[1]}" == "$expected_sum" ]] || \
+	fail "replica snapshot summed ${vals[1]} at start, expected $expected_sum"
+
+# The real assertion: the snapshot must be unchanged by the concurrent writes.
+(( ${vals[2]} == N )) || \
+	fail "replica snapshot saw ${vals[2]} rows after concurrent updates," \
+		"expected $N"
+[[ "${vals[3]}" == "$expected_sum" ]] || \
+	fail "replica snapshot sum changed under it: '${vals[3]}' vs" \
+		"'$expected_sum' -- it saw writes that postdate its target"
+
+# Reconstruction must actually have stopped at a fence, or this passed for
+# some other reason.
+(( stops_delta > 0 )) || \
+	fail "replica served a correct snapshot but never stopped at a fence" \
+		"(delta $stops_delta); this is not proving the replica's fence works"
 
 # --- D: the fence survives a promotion --------------------------------------
 

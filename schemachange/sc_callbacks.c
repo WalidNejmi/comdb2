@@ -1349,6 +1349,8 @@ int scdone_callback(bdb_state_type *bdb_state, const char table[], void *arg,
 {
     int rc = SCDONE_CALLBACKS[type](table, arg, type);
     int nfences = 0, bdberr = 0;
+    uint32_t lid = 0;
+    tran_type *tran;
 
     /*
      * Refresh this node's publication-fence registry from llmeta.
@@ -1368,17 +1370,35 @@ int scdone_callback(bdb_state_type *bdb_state, const char table[], void *arg,
      * schema out of llmeta here, so llmeta is readable.  Hooking the scdone
      * log record itself would be too early: the record would not be there yet.
      *
+     * Read under _tran(), which swaps in replication's locker id.  On a
+     * replicant the transaction carrying the schema change still holds write
+     * locks on the llmeta pages this reads, so querying on any other locker
+     * self-deadlocks against it: the apply thread stops acking and the master
+     * waits out its full seqnum timeout on every schema change.  The sibling
+     * scdone handlers read llmeta this way for exactly the same reason.
+     *
      * Reloading the whole set rather than one build's worth keeps this
      * independent of which schema change just landed; installing an entry that
      * is already present just overwrites it with the same values.
      */
-    if (bdb_load_sc_publication_fences(NULL, &nfences, &bdberr) != 0) {
+    tran = _tran(&lid, &bdberr, __func__, __LINE__);
+    if (tran == NULL) {
+        logmsg(LOGMSG_ERROR,
+               "%s: could not begin a transaction to refresh publication "
+               "fences (bdberr %d)\n",
+               __func__, bdberr);
+        return rc;
+    }
+
+    if (bdb_load_sc_publication_fences(tran, &nfences, &bdberr) != 0) {
         logmsg(LOGMSG_ERROR,
                "%s: failed to refresh schema-change publication fences "
                "(bdberr %d); snapshot reconstruction of rebuilt files on this "
                "node may be unable to stop\n",
                __func__, bdberr);
     }
+
+    _untran(tran, lid);
 
     return rc;
 }

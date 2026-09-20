@@ -299,8 +299,7 @@ int replication_only_error_code(int rc)
 
 int llog_scdone_rename_wrapper(bdb_state_type *bdb_state,
                                struct schema_change_type *s, tran_type *tran,
-                               unsigned int *fence_file,
-                               unsigned int *fence_offset, int *bdberr)
+                               int *bdberr)
 {
     int rc;
     char *mashup = NULL;
@@ -335,9 +334,8 @@ int llog_scdone_rename_wrapper(bdb_state_type *bdb_state,
         rc = bdb_llog_scdone(bdb_state, s->done_type, mashup, oldlen + newlen,
                              1, bdberr);
     else
-        rc = bdb_llog_scdone_tran_lsn(bdb_state, s->done_type, tran, mashup,
-                                      oldlen + newlen, fence_file, fence_offset,
-                                      bdberr);
+        rc = bdb_llog_scdone_tran(bdb_state, s->done_type, tran, mashup,
+                                  oldlen + newlen, bdberr);
 
     return rc;
 }
@@ -450,22 +448,41 @@ static int do_finalize(ddl_t func, struct ireq *iq,
                    bdb_get_scdone_str(s->done_type), s->tablename, tran);
         }
 
-        rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &fence_file,
-                                        &fence_offset, &bdberr);
+        /*
+         * Publish BEFORE writing scdone, and before the commit.
+         *
+         * Before the commit because the generation is not visible until the
+         * commit lands, so an early fence cannot be observed, while a late one
+         * leaves a window in which the new files are readable but
+         * reconstruction has no stopping proof for them.
+         *
+         * Before scdone because of how a replicant picks the fence up.  It
+         * loads the durable rows from scdone_callback(), which runs while the
+         * scdone log record is being applied -- so any row written *after*
+         * that record has not been applied yet and the replicant reads
+         * nothing.  Ordering the rows first makes them present by the time the
+         * replicant looks.
+         *
+         * The fence is therefore the log end here rather than the scdone LSN.
+         * Both sit in the required window: every modification to the
+         * generation's replacement files was made by func() above and so
+         * precedes this point, and the publication commit follows it.
+         *
+         * The failure paths below discard it again.
+         */
+        if (bdb_get_log_end_lsn(thedb->bdb_env, &fence_file, &fence_offset)) {
+            sc_errf(s, "Failed to read log end for the publication fence\n");
+            rc = -1;
+            goto abort;
+        }
+        sc_publish_fences(s, tran, fence_file, fence_offset);
+
+        rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &bdberr);
         if (rc || bdberr != BDBERR_NOERROR) {
             sc_errf(s, "Failed to send scdone rc=%d bdberr=%d\n", rc, bdberr);
             rc = -1;
             goto abort;
         }
-
-        /*
-         * Publish before the commit rather than after it: the generation is
-         * not visible until the commit lands, so an early fence cannot be
-         * observed, while a late one leaves a window in which the new files
-         * are readable but reconstruction has no stopping proof for them.
-         * The failure paths below discard it again.
-         */
-        sc_publish_fences(s, tran, fence_file, fence_offset);
 
         if (s->keep_locked) {
             rc = trans_commit(iq, tran, gbl_myhostname);
@@ -492,15 +509,20 @@ static int do_finalize(ddl_t func, struct ireq *iq,
         sc_del_unused_files(s->db);
     } else {
         int bdberr = 0;
-        rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &fence_file,
-                                        &fence_offset, &bdberr);
+
+        /* Caller owns the commit; see the note at the sibling call above for
+         * why this has to precede the scdone record. */
+        if (bdb_get_log_end_lsn(thedb->bdb_env, &fence_file, &fence_offset)) {
+            sc_errf(s, "Failed to read log end for the publication fence\n");
+            return -1;
+        }
+        sc_publish_fences(s, tran, fence_file, fence_offset);
+
+        rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &bdberr);
         if (rc || bdberr != BDBERR_NOERROR) {
             sc_errf(s, "Failed to send scdone rc=%d bdberr=%d\n", rc, bdberr);
             return -1;
         }
-
-        /* Caller owns the commit; see the note at the sibling call above. */
-        sc_publish_fences(s, tran, fence_file, fence_offset);
     }
     return rc;
 abort:
