@@ -1,25 +1,32 @@
 #!/usr/bin/env bash
 bash -n "$0" || exit 1
 
-# A reused physical file must never be fenced.
+# The fence must cover exactly the physical files the schema change rebuilt:
+# every one of them, and nothing else.  This test pins down both directions by
+# counting, because neither is visible behaviourally.
 #
-# The publication fence says "every write forming this file's initial image is
-# at or before this LSN".  That is true of a file the schema change built
-# privately.  It is NOT true of a file the plan reused: that file is public,
-# applications have been writing to it all along, and its history did not begin
-# at this schema change.  Fencing one would let reconstruction stop early and
-# hand a snapshot writes that were not committed at its target -- silent wrong
-# answers, which is worse than the bug the fence exists to fix.
+# TOO FEW -- a rebuilt file left unfenced.  Its converter entries are still
+# omitted from the commit map, so reconstruction walks into history it cannot
+# resolve and the snapshot reads short.  That is the original bug, unguarded.
+#
+# TOO MANY -- a reused file fenced.  A reused file is public: applications have
+# been writing to it all along and its history did not begin at this schema
+# change.  Fencing one lets reconstruction stop early and hand a snapshot
+# writes that were not committed at its target -- silent wrong answers, worse
+# than the bug the fence exists to fix.
 #
 # Fences are pended inside bdb_sc_private_register_files(), which walks the
-# schema-change plan and skips files it did not rebuild.  This test pins that
-# behaviour down by counting.
+# schema-change plan.  That function has a loop for data/blob files and a
+# separate loop for index files, so the two directions are checked separately:
 #
-#   full rebuild of t   -> every file rebuilt      -> N_full fences
-#   add an index to t   -> only the index rebuilt  -> exactly 1 more fence
+#   rebuild a table with NO index -> data files fenced      -> > 0 fences
+#   add an index to a table       -> only the index rebuilt -> exactly 1 more
 #
-# If the plan were ignored and every file were fenced, adding one index would
-# fence the data file(s) again and the count would jump by more than one.
+# The no-index case is not hypothetical.  The pend call was once present only
+# in the index loop, so a table without an index got zero fences while still
+# skipping one converter entry per row.  Every test that used an indexed table
+# passed anyway, because reads were served from the index pages, which were
+# fenced.  Only a table with no index at all exposes it.
 
 source ${TESTSROOTDIR}/tools/runit_common.sh
 
@@ -63,11 +70,57 @@ echo "SC_FENCE_REUSED: full_rebuild_fences=$full skipped=$skipped" \
 (( full > 0 )) || \
 	fail "a full rebuild fenced $full files; expected at least one"
 
+# --- direction 1: every rebuilt file is fenced, including data files --------
+#
+# A table with NO index isolates the data/blob loop of
+# bdb_sc_private_register_files(): if only the index loop pends fences, this
+# rebuild produces zero even though it skips one converter entry per row.
+# An indexed table cannot catch that, because its reads are served from the
+# fenced index pages.
+run "create table nodx(i int)" > /dev/null
+run "insert into nodx select value from generate_series(1, $N)" > /dev/null
+
+before_nodx=$(fence_count)
+nodx_skipped_before=$(cdb2sql ${CDB2_OPTIONS} --host $master $dbnm \
+	"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+	grep -oP '(?<=SC commit-map entries skipped: )[0-9]+')
+
+run "rebuild nodx" > /dev/null
+
+after_nodx=$(fence_count)
+nodx_skipped_after=$(cdb2sql ${CDB2_OPTIONS} --host $master $dbnm \
+	"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+	grep -oP '(?<=SC commit-map entries skipped: )[0-9]+')
+
+nodx_fences=$(( after_nodx - before_nodx ))
+nodx_skipped=$(( nodx_skipped_after - nodx_skipped_before ))
+
+echo "SC_FENCE_REUSED: no_index_fences=$nodx_fences no_index_skipped=$nodx_skipped"
+
+# Guard: the rebuild must actually have skipped entries, or this proves nothing.
+(( nodx_skipped > 0 )) || \
+	fail "rebuilding an index-less table skipped $nodx_skipped converter" \
+		"entries; the skip was not active so the fence is not being exercised"
+
+(( nodx_fences > 0 )) || \
+	fail "rebuilding an index-less table skipped $nodx_skipped converter" \
+		"entries but fenced $nodx_fences files -- its data files were elided" \
+		"from the commit map with no stopping proof, which is the original bug"
+
+run "drop table nodx" > /dev/null
+
+# --- direction 2: a reused file is never fenced -----------------------------
+#
 # Adding an index builds the new index only; the data file is reused, keeps its
 # identity, and must not be fenced again.
+#
+# Re-baseline here: the no-index section above added its own fences, so the
+# delta has to be measured from immediately before this schema change, not
+# from after the full rebuild.
+before_index=$(fence_count)
 run "create index ix_k on t(k)" > /dev/null
 after_index=$(fence_count)
-delta=$(( after_index - after_rebuild ))
+delta=$(( after_index - before_index ))
 
 echo "SC_FENCE_REUSED: add_index_fence_delta=$delta (full rebuild was $full)"
 

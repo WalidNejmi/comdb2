@@ -169,6 +169,16 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state, uint64_t build_id,
             if (__sc_private_file_register(bdb_state->dbenv, dbp->fileid,
                                            build_id) != 0)
                 goto fail;
+
+            /*
+             * Same file, same moment, same rebuilt-only rule: this is where
+             * the exact set of rebuilt files is authoritative, so the
+             * publication fence is pended here rather than recomputed at
+             * finalization.  It stays inert until the build publishes.
+             */
+            if (__sc_publication_fence_pend(bdb_state->dbenv, dbp->fileid,
+                                            build_id) != 0)
+                goto fail;
         }
     }
 
@@ -185,12 +195,7 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state, uint64_t build_id,
                                        build_id) != 0)
             goto fail;
 
-        /*
-         * Same file, same moment, same rebuilt-only rule: this is where the
-         * exact set of rebuilt files is authoritative, so the publication
-         * fence is pended here rather than recomputed at finalization.  It
-         * stays inert until the build publishes.
-         */
+        /* Fence it too; see the data loop above. */
         if (__sc_publication_fence_pend(bdb_state->dbenv, dbp->fileid,
                                         build_id) != 0)
             goto fail;
