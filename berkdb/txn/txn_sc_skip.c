@@ -583,6 +583,47 @@ done:
 	return (ret);
 }
 
+extern int __mempv_cache_invalidate_file __P((DB_ENV *, u_int8_t *));
+
+/*
+ * __sc_publication_fence_drop_cached_pages --
+ *	Throw away any reconstructed pages cached for a file whose fence has
+ *	just become known.
+ *
+ *	A page reconstructed while the fence was absent can have been unwound
+ *	past the published image -- exactly the bug the fence prevents -- and
+ *	the bad image is cached under the target LSN that produced it.
+ *	Installing the fence fixes later reconstructions but not what is
+ *	already cached, and __mempv_cache_get() serves a cached image to any
+ *	snapshot with the same target LSN.  Drop them; the re-reconstruction
+ *	they force now has a fence to stop at.
+ *
+ *	Called with no registry lock held, so the cache lock is never nested
+ *	inside it.
+ */
+static void
+__sc_publication_fence_drop_cached_pages(dbenv, fileid)
+	DB_ENV *dbenv;
+	const u_int8_t *fileid;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	int ndropped;
+
+	ndropped = __mempv_cache_invalidate_file(dbenv, (u_int8_t *)fileid);
+	if (ndropped <= 0)
+		return;
+
+	logmsg(LOGMSG_INFO,
+	    "Dropped %d cached page version(s) for a file that just gained a "
+	    "schema-change publication fence\n", ndropped);
+
+	if (reg != NULL) {
+		Pthread_mutex_lock(&reg->lk);
+		reg->cached_pages_dropped += (u_int64_t)ndropped;
+		Pthread_mutex_unlock(&reg->lk);
+	}
+}
+
 /*
  * __sc_publication_fence_install --
  *	Install an already-published fence directly.
@@ -602,7 +643,7 @@ __sc_publication_fence_install(dbenv, fileid, build_id, fence_lsn)
 {
 	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
 	SC_PUBLICATION_FENCE *f;
-	int ret = 0;
+	int ret = 0, changed = 0;
 
 	if (reg == NULL || fileid == NULL || IS_ZERO_LSN(fence_lsn))
 		return (EINVAL);
@@ -611,6 +652,7 @@ __sc_publication_fence_install(dbenv, fileid, build_id, fence_lsn)
 
 	f = hash_find(reg->files, fileid);
 	if (f != NULL) {
+		changed = log_compare(&f->fence_lsn, &fence_lsn) != 0;
 		f->fence_lsn = fence_lsn;
 		f->build_id = build_id;
 		goto done;
@@ -626,10 +668,23 @@ __sc_publication_fence_install(dbenv, fileid, build_id, fence_lsn)
 	if (hash_add(reg->files, f) != 0) {
 		__os_free(dbenv, f);
 		ret = ENOMEM;
+	} else {
+		changed = 1;
 	}
 
 done:
 	Pthread_mutex_unlock(&reg->lk);
+
+	/*
+	 * Only when the fence actually moved.  This runs once per fence per
+	 * scdone -- the reload reinstalls every fence it finds -- so
+	 * invalidating unconditionally would flush the cache for every fenced
+	 * file on every schema change, for no benefit: a fence that did not
+	 * change cannot have invalidated anything cached under it.
+	 */
+	if (ret == 0 && changed)
+		__sc_publication_fence_drop_cached_pages(dbenv, fileid);
+
 	return (ret);
 }
 
@@ -674,6 +729,10 @@ __sc_publication_fence_publish(dbenv, build_id, fence_lsn)
 {
 	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
 	struct sc_fence_build_arg arg;
+	/* A table's data stripes, indexes and blob files; generous. */
+	enum { MAX_BUILD_FILES = 256 };
+	u_int8_t fileids[MAX_BUILD_FILES * DB_FILE_ID_LEN];
+	int nfiles = 0, i;
 
 	if (reg == NULL || build_id == 0 || IS_ZERO_LSN(fence_lsn))
 		return (EINVAL);
@@ -685,6 +744,18 @@ __sc_publication_fence_publish(dbenv, build_id, fence_lsn)
 	Pthread_mutex_lock(&reg->lk);
 	hash_for(reg->files, &stamp_one_build_fence, &arg);
 	Pthread_mutex_unlock(&reg->lk);
+
+	/*
+	 * These files have just gained a fence, so anything reconstructed for
+	 * them before now was reconstructed without one.  Collect them and drop
+	 * their cached pages, outside the registry lock.
+	 */
+	if (__sc_publication_fence_list_build(dbenv, build_id, fileids,
+	    MAX_BUILD_FILES, &nfiles) == 0) {
+		for (i = 0; i < nfiles; i++)
+			__sc_publication_fence_drop_cached_pages(dbenv,
+			    fileids + (size_t)i * DB_FILE_ID_LEN);
+	}
 
 	return (0);
 }
@@ -872,21 +943,23 @@ __sc_publication_fence_note(dbenv, stopped)
  * __sc_publication_fence_stats --
  *
  * PUBLIC: void __sc_publication_fence_stats __P((DB_ENV *, u_int64_t *,
- * PUBLIC:	   u_int64_t *, u_int64_t *, u_int64_t *, u_int64_t *));
+ * PUBLIC:	   u_int64_t *, u_int64_t *, u_int64_t *, u_int64_t *,
+ * PUBLIC:	   u_int64_t *));
  */
 void
-__sc_publication_fence_stats(dbenv, entries, stops, hits, misses, early)
+__sc_publication_fence_stats(dbenv, entries, stops, hits, misses, early, dropped)
 	DB_ENV *dbenv;
 	u_int64_t *entries;
 	u_int64_t *stops;
 	u_int64_t *hits;
 	u_int64_t *misses;
 	u_int64_t *early;
+	u_int64_t *dropped;
 {
 	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
 
 	if (reg == NULL) {
-		*entries = *stops = *hits = *misses = *early = 0;
+		*entries = *stops = *hits = *misses = *early = *dropped = 0;
 		return;
 	}
 
@@ -896,6 +969,7 @@ __sc_publication_fence_stats(dbenv, entries, stops, hits, misses, early)
 	*hits = reg->lookup_hits;
 	*misses = reg->lookup_misses;
 	*early = reg->target_before_publication;
+	*dropped = reg->cached_pages_dropped;
 	Pthread_mutex_unlock(&reg->lk);
 }
 

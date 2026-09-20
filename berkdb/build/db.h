@@ -3039,6 +3039,13 @@ struct __sc_publication_fence_registry {
 	u_int64_t lookup_hits;
 	u_int64_t lookup_misses;
 	u_int64_t target_before_publication;
+
+	/*
+	 * Reconstructed page versions thrown out of the mempv cache because the
+	 * file they belong to gained a fence after they were cached.  Anything
+	 * reconstructed before the fence arrived may have been unwound too far.
+	 */
+	u_int64_t cached_pages_dropped;
 };
 
 struct __mempv_cache_page_key

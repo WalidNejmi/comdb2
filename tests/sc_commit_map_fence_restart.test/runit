@@ -52,6 +52,18 @@ fence_count() { clminfo | grep -oP '(?<=SC publication fences: )[0-9]+'; }
 fence_stops() { clminfo | grep -oP '(?<=SC fence stops: )[0-9]+'; }
 skipped()     { clminfo | grep -oP '(?<=SC commit-map entries skipped: )[0-9]+'; }
 
+# Page versions thrown out of the mempv cache because a fence was installed for
+# a file that already had entries there.  Expected to be 0: a rebuilt file is
+# not readable under its table's name until scdone, and the fence is installed
+# in the same callback, so nothing should have cached a page of it first.  The
+# drop exists because that argument spans several code paths and a narrow
+# window inside scdone; it is cheap insurance, not a hot path.  Read it here so
+# the counter is wired end to end and a future non-zero value is visible rather
+# than silent.
+fence_drops() {
+	clminfo | grep -oP '(?<=SC fence cached pages dropped: )[0-9]+'
+}
+
 # Read the whole table through a snapshot.  Reconstruction only runs when the
 # snapshot has to look back past a concurrent write, so make one.
 snapshot_count() {
@@ -107,8 +119,13 @@ read pre_count pre_sum <<< "$(snapshot_count)"
 [[ "$pre_sum" == "$expected_sum" ]] || \
 	fail "before restart: snapshot sum '$pre_sum', expected $expected_sum"
 
+drops_before=$(fence_drops)
+[[ -n "$drops_before" ]] || \
+	fail "clminfo does not report the mempv cache drop count; the fence" \
+		"invalidation is unobservable"
+
 echo "SC_FENCE_RESTART_BEFORE: skipped=$skipped_before fences=$fences_before" \
-	"snapshot_count=$pre_count"
+	"snapshot_count=$pre_count cache_drops=$drops_before"
 
 # --- restart ----------------------------------------------------------------
 
@@ -155,7 +172,8 @@ stops_after_read=$(fence_stops)
 stops_delta=$(( stops_after_read - stops_before_read ))
 
 echo "SC_FENCE_RESTART_AFTER: fences=$fences_after snapshot_count=$post_count" \
-	"snapshot_sum=$post_sum fence_stops_delta=$stops_delta"
+	"snapshot_sum=$post_sum fence_stops_delta=$stops_delta" \
+	"cache_drops=$(fence_drops)"
 
 (( post_count == N )) || \
 	fail "after restart: snapshot saw $post_count rows, expected $N"

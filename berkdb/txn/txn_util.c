@@ -829,16 +829,18 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 	 * shows the skip is actually being made safe.
 	 */
 	{
-		u_int64_t fentries, fstops, fhits, fmisses, fearly;
+		u_int64_t fentries, fstops, fhits, fmisses, fearly, fdropped;
 
 		__sc_publication_fence_stats(dbenv, &fentries, &fstops, &fhits,
-				&fmisses, &fearly);
+				&fmisses, &fearly, &fdropped);
 		logmsg(lvl, "SC publication fences: %"PRIu64"\n", fentries);
 		logmsg(lvl, "SC fence stops: %"PRIu64"\n", fstops);
 		logmsg(lvl, "SC fence lookup hits: %"PRIu64"\n", fhits);
 		logmsg(lvl, "SC fence lookup misses: %"PRIu64"\n", fmisses);
 		logmsg(lvl, "SC fence target before publication: %"PRIu64"\n",
 				fearly);
+		logmsg(lvl, "SC fence cached pages dropped: %"PRIu64"\n",
+				fdropped);
 	}
 
 	/* Enough to tell whether the mechanism was available at all. */
