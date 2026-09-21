@@ -1,0 +1,4 @@
+utxnid_log on
+enable_snapshot_isolation
+sc_commit_flags_writer 1
+setattr CHECKPOINTTIME 9999999

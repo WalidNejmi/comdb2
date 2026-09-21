@@ -3780,6 +3780,8 @@ int bdb_cluster_supports_commit_flags(void *bdb_state_in)
         bdb_state = bdb_state->parent;
     if (!gbl_sc_commit_flags_advertise)
         return 0;
+    if (ATOMIC_LOAD32(bdb_state->sc_incapable_log_streams) != 0)
+        return 0;
 
     nsanctioned = net_get_sanctioned_node_list_interned(
         bdb_state->repinfo->netinfo, REPMAX, sanctioned);
@@ -3812,6 +3814,40 @@ int bdb_cluster_supports_commit_flags(void *bdb_state_in)
     }
     Pthread_mutex_unlock(&bdb_state->seqnum_info->lock);
     return capable;
+}
+
+void bdb_sc_log_stream_open(void *bdb_state_in, int commit_flags_capable)
+{
+    bdb_state_type *bdb_state = bdb_state_in;
+
+    if (bdb_state == NULL || commit_flags_capable)
+        return;
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+    ATOMIC_ADD32(bdb_state->sc_incapable_log_streams, 1);
+}
+
+void bdb_sc_log_stream_close(void *bdb_state_in, int commit_flags_capable)
+{
+    bdb_state_type *bdb_state = bdb_state_in;
+
+    if (bdb_state == NULL || commit_flags_capable)
+        return;
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+    assert(ATOMIC_LOAD32(bdb_state->sc_incapable_log_streams) > 0);
+    ATOMIC_ADD32(bdb_state->sc_incapable_log_streams, -1);
+}
+
+int bdb_sc_incapable_log_streams(void *bdb_state_in)
+{
+    bdb_state_type *bdb_state = bdb_state_in;
+
+    if (bdb_state == NULL)
+        return 0;
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+    return ATOMIC_LOAD32(bdb_state->sc_incapable_log_streams);
 }
 
 void bdb_exiting(bdb_state_type *bdb_state)

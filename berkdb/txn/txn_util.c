@@ -822,6 +822,10 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 						fs.unsupported_unknown_family);
 	}
 
+	extern int bdb_sc_incapable_log_streams(void *);
+	logmsg(lvl, "SC incapable log streams: %d\n",
+	    bdb_sc_incapable_log_streams(dbenv->app_private));
+
 	/*
 	 * Publication fences of rebuilt schema-change files.  'stops' is the
 	 * number of times reconstruction ended at a fence instead of walking

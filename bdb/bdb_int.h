@@ -675,6 +675,7 @@ struct sc_redo_lsn {
 struct bdb_state_tag {
     pthread_attr_t pthread_attr_detach;
     seqnum_info_type *seqnum_info;
+    int sc_incapable_log_streams;
     bdb_attr_type *attr;         /* attributes that have defaults */
     bdb_callback_type *callback; /* callback functions */
     DB_ENV *dbenv;               /* transactional environment */
