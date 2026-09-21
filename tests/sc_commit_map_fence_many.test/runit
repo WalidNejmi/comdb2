@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+set -o pipefail
+
+dbnm=$1
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+fences() {
+	cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+		grep -oP '(?<=SC publication fences: )[0-9]+'
+}
+
+run "create table t(i int)" >/dev/null
+run "insert into t select value from generate_series(1, 100)" >/dev/null
+before=$(fences)
+run "rebuild t" >/dev/null || fail "rebuild failed"
+after=$(fences)
+delta=$(( after - before ))
+(( delta > 256 )) || fail "published only $delta fences; expected more than 256"
+
+stop_all_nodes
+sleep 10
+start_all_nodes
+wait_up
+master=$(getmaster)
+[[ -n "$master" ]] || fail "could not find master after restart"
+reloaded=$(fences)
+(( reloaded == after )) || fail "reloaded $reloaded fences, expected $after"
+[[ "$(run 'select count(*) from t')" == "100" ]] || fail "table contents changed"
+
+echo "SC_FENCE_MANY: delta=$delta reloaded=$reloaded"
+echo "Passed test"

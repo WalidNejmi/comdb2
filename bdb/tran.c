@@ -68,6 +68,7 @@ int gbl_flush_on_prepare = 1;
 int gbl_wait_for_prepare_seqnum = 1;
 int gbl_debug_sleep_before_prepare = 0;
 int gbl_sc_fence_persist_fail_after = INT_MAX;
+int gbl_sc_fence_test_extra_files = 0;
 extern int gbl_debug_txn_sleep;
 extern int gbl_debug_disttxn_trace;
 extern int __txn_getpriority(DB_TXN *txnp, int *priority);
@@ -212,6 +213,19 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state,
         /* Fence it too; see the data loop above. */
         if (__sc_publication_fence_pend(bdb_state->dbenv, dbp->fileid,
                                         build_id) != 0)
+            goto fail;
+        ++count;
+    }
+
+    for (ixnum = 0; ixnum < gbl_sc_fence_test_extra_files; ixnum++) {
+        uint8_t fileid[DB_FILE_ID_LEN];
+        uint32_t suffix = (uint32_t)ixnum;
+
+        memcpy(fileid, build_id->bytes, SC_BUILD_ID_LEN);
+        memcpy(fileid + SC_BUILD_ID_LEN, &suffix, sizeof(suffix));
+        if (__sc_private_file_register(bdb_state->dbenv, fileid, build_id) != 0)
+            goto fail;
+        if (__sc_publication_fence_pend(bdb_state->dbenv, fileid, build_id) != 0)
             goto fail;
         ++count;
     }

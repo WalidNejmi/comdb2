@@ -79,14 +79,16 @@ select value from comdb2_tunables where name = 'max_query_fingerprints'
 
 # Test schema-change fence hardening controls.
 PUT TUNABLE mask_internal_tunables 0;
-SELECT name, value FROM comdb2_tunables WHERE name IN ('sc_commit_flags_advertise', 'sc_fence_force_unready', 'sc_fence_persist_fail_after', 'sc_fence_publish_fail_after') ORDER BY name;
+SELECT name, value FROM comdb2_tunables WHERE name IN ('sc_commit_flags_advertise', 'sc_fence_force_unready', 'sc_fence_persist_fail_after', 'sc_fence_publish_fail_after', 'sc_fence_test_extra_files') ORDER BY name;
 PUT TUNABLE sc_commit_flags_advertise 0;
 PUT TUNABLE sc_fence_force_unready 1;
 PUT TUNABLE sc_fence_persist_fail_after 0;
 PUT TUNABLE sc_fence_publish_fail_after 1;
-SELECT name, value FROM comdb2_tunables WHERE name IN ('sc_commit_flags_advertise', 'sc_fence_force_unready', 'sc_fence_persist_fail_after', 'sc_fence_publish_fail_after') ORDER BY name;
+PUT TUNABLE sc_fence_test_extra_files 300;
+SELECT name, value FROM comdb2_tunables WHERE name IN ('sc_commit_flags_advertise', 'sc_fence_force_unready', 'sc_fence_persist_fail_after', 'sc_fence_publish_fail_after', 'sc_fence_test_extra_files') ORDER BY name;
 PUT TUNABLE sc_commit_flags_advertise 1;
 PUT TUNABLE sc_fence_force_unready 0;
 PUT TUNABLE sc_fence_persist_fail_after 2147483647;
 PUT TUNABLE sc_fence_publish_fail_after 2147483647;
+PUT TUNABLE sc_fence_test_extra_files 0;
 
