@@ -79,7 +79,7 @@ select value from comdb2_tunables where name = 'max_query_fingerprints'
 
 # Test schema-change fence hardening controls.
 PUT TUNABLE mask_internal_tunables 0;
-SELECT name, value FROM comdb2_tunables WHERE name IN ('mempv_test_bump_fence_epoch', 'mempv_test_pause_before_cache_put', 'mempv_test_paused', 'sc_commit_flags_advertise', 'sc_fence_force_unready', 'sc_fence_persist_fail_after', 'sc_fence_publish_fail_after', 'sc_fence_test_drop_pending', 'sc_fence_test_extra_files', 'sc_pause_after_fence') ORDER BY name;
+SELECT name, value FROM comdb2_tunables WHERE name IN ('mempv_test_bump_fence_epoch', 'mempv_test_pause_before_cache_put', 'mempv_test_paused', 'sc_commit_flags_advertise', 'sc_fence_force_unready', 'sc_fence_persist_fail_after', 'sc_fence_publish_fail_after', 'sc_fence_test_drop_pending', 'sc_fence_test_extra_files', 'sc_pause_after_fence', 'sc_test_converter_public_write') ORDER BY name;
 PUT TUNABLE mempv_test_bump_fence_epoch 1;
 PUT TUNABLE mempv_test_pause_before_cache_put 1;
 PUT TUNABLE sc_commit_flags_advertise 0;
@@ -89,7 +89,8 @@ PUT TUNABLE sc_fence_publish_fail_after 1;
 PUT TUNABLE sc_fence_test_drop_pending 1;
 PUT TUNABLE sc_fence_test_extra_files 300;
 PUT TUNABLE sc_pause_after_fence 1;
-SELECT name, value FROM comdb2_tunables WHERE name IN ('mempv_test_bump_fence_epoch', 'mempv_test_pause_before_cache_put', 'mempv_test_paused', 'sc_commit_flags_advertise', 'sc_fence_force_unready', 'sc_fence_persist_fail_after', 'sc_fence_publish_fail_after', 'sc_fence_test_drop_pending', 'sc_fence_test_extra_files', 'sc_pause_after_fence') ORDER BY name;
+PUT TUNABLE sc_test_converter_public_write 1;
+SELECT name, value FROM comdb2_tunables WHERE name IN ('mempv_test_bump_fence_epoch', 'mempv_test_pause_before_cache_put', 'mempv_test_paused', 'sc_commit_flags_advertise', 'sc_fence_force_unready', 'sc_fence_persist_fail_after', 'sc_fence_publish_fail_after', 'sc_fence_test_drop_pending', 'sc_fence_test_extra_files', 'sc_pause_after_fence', 'sc_test_converter_public_write') ORDER BY name;
 PUT TUNABLE mempv_test_bump_fence_epoch 0;
 PUT TUNABLE mempv_test_pause_before_cache_put 0;
 PUT TUNABLE sc_commit_flags_advertise 1;
@@ -99,4 +100,5 @@ PUT TUNABLE sc_fence_publish_fail_after 2147483647;
 PUT TUNABLE sc_fence_test_drop_pending 0;
 PUT TUNABLE sc_fence_test_extra_files 0;
 PUT TUNABLE sc_pause_after_fence 0;
+PUT TUNABLE sc_test_converter_public_write 0;
 

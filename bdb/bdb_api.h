@@ -2548,6 +2548,8 @@ void bdb_tran_set_is_sc_rebuild(tran_type *tran, int is_sc_rebuild);
  * generic transaction-start helper.
  */
 void bdb_tran_set_sc_build(tran_type *tran, const sc_build_id_t *build_id);
+void bdb_tran_test_note_sc_public_write(tran_type *tran,
+                                        bdb_state_type *bdb_state, int stripe);
 
 /*
  * Register the rebuilt replacement files of a table as belonging to a build.

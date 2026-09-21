@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# A converter transaction may omit its commit-map entry only when all user
+# file writes are to private replacement files owned by the same build. This
+# test injects a source-table classification after each real private write and
+# proves that the final decision retains those mixed private/public commits.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+
+set -o pipefail
+
+dbnm=$1
+N=${SC_COMMIT_MAP_ROWS:-1000}
+
+master=$(getmaster)
+if [[ -z "$master" ]]; then
+	echo "FAIL: could not find master"
+	exit 1
+fi
+readonly master N
+
+run_on_master() {
+	cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"
+}
+
+send_to_master() {
+	cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+		"exec procedure sys.cmd.send(\"$1\")"
+}
+
+get_clminfo() {
+	cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+		"exec procedure sys.cmd.send('bdb clminfo')"
+}
+
+counter() {
+	local label=$1
+	awk -v needle="$label: " '
+		index($0, needle) {
+			value = substr($0, index($0, needle) + length(needle))
+			sub(/[^0-9].*/, "", value)
+			print value
+			exit
+		}' <<<"$2"
+}
+
+restore_log_deletion() {
+	send_to_master "sync log-delete on" >/dev/null 2>&1
+}
+
+trap restore_log_deletion EXIT
+send_to_master "sync log-delete off 10"
+
+run_on_master "create table t(i int)"
+run_on_master "insert into t select value from generate_series(1, $N)"
+
+before=$(get_clminfo)
+before_current=$(counter "Current entries" "$before")
+before_marked=$(counter "SC direct-copy txns marked" "$before")
+before_matched=$(counter "SC direct-copy txns matched" "$before")
+before_skipped=$(counter "SC commit-map entries skipped" "$before")
+before_would_skip=$(counter "SC would-skip (master)" "$before")
+
+if [[ -z "$before_current" || -z "$before_marked" ||
+      -z "$before_matched" || -z "$before_skipped" ||
+      -z "$before_would_skip" ]]; then
+	echo "FAIL: could not parse commit-map classifier stats"
+	echo "$before"
+	exit 1
+fi
+
+run_on_master "rebuild t"
+
+rowcount=$(run_on_master "select count(*) from t")
+if (( rowcount != N )); then
+	echo "FAIL: expected $N rows after rebuild, got $rowcount"
+	exit 1
+fi
+
+after=$(get_clminfo)
+after_current=$(counter "Current entries" "$after")
+after_marked=$(counter "SC direct-copy txns marked" "$after")
+after_matched=$(counter "SC direct-copy txns matched" "$after")
+after_skipped=$(counter "SC commit-map entries skipped" "$after")
+after_would_skip=$(counter "SC would-skip (master)" "$after")
+
+map_delta=$((after_current - before_current))
+marked_delta=$((after_marked - before_marked))
+matched_delta=$((after_matched - before_matched))
+skipped_delta=$((after_skipped - before_skipped))
+would_skip_delta=$((after_would_skip - before_would_skip))
+
+echo "SC_COMMIT_MAP_CLASSIFIER: rows=$N map_delta=$map_delta" \
+	"marked_delta=$marked_delta matched_delta=$matched_delta" \
+	"skipped_delta=$skipped_delta would_skip_delta=$would_skip_delta"
+
+if (( marked_delta < N || matched_delta < N )); then
+	echo "FAIL: rebuilding $N rows marked $marked_delta and matched" \
+		"$matched_delta converter transactions; the test did not exercise" \
+		"the private-write classifier before injecting the public write"
+	exit 1
+fi
+
+if (( skipped_delta != 0 || would_skip_delta != 0 )); then
+	echo "FAIL: mixed private/public converter writes produced" \
+		"$skipped_delta skipped entries and $would_skip_delta skip flags"
+	exit 1
+fi
+
+if (( map_delta < N )); then
+	echo "FAIL: only $map_delta commit-map entries were retained for" \
+		"$N mixed private/public converter transactions"
+	exit 1
+fi
+
+do_verify t
+
+echo "Passed test"

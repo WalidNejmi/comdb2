@@ -68,6 +68,7 @@
 (name='sc_fence_test_drop_pending', value='OFF')
 (name='sc_fence_test_extra_files', value='0')
 (name='sc_pause_after_fence', value='0')
+(name='sc_test_converter_public_write', value='OFF')
 (name='mempv_test_bump_fence_epoch', value='ON')
 (name='mempv_test_pause_before_cache_put', value='ON')
 (name='mempv_test_paused', value='OFF')
@@ -78,3 +79,4 @@
 (name='sc_fence_test_drop_pending', value='ON')
 (name='sc_fence_test_extra_files', value='300')
 (name='sc_pause_after_fence', value='1')
+(name='sc_test_converter_public_write', value='ON')
