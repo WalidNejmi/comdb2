@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+set -o pipefail
+
+dbnm=$1
+N=${SC_FENCE_ROWS:-5000}
+master=$(getmaster)
+rebuild_pid=""
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+counter() {
+	cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+		sed -n "s/.*$1: \([0-9][0-9]*\).*/\1/p" | head -1
+}
+asof_query() {
+	local target=$1
+	cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" - 2>&1 <<EOF
+set transaction snapshot isolation
+begin transaction as of datetime $target
+select count(*), sum(j) from t
+commit
+EOF
+
+}
+asof_result() {
+	local target=$1 output row
+	output=$(asof_query "$target")
+	row=$(grep -E '^[0-9]+[[:space:]]+[0-9]+$' <<<"$output" | tail -1)
+	if [[ -z "$row" ]]; then
+		echo "AS-OF $target returned no result: $output" >&2
+		return 1
+	fi
+	echo "$row"
+}
+cleanup() {
+	[[ -n "$rebuild_pid" ]] && wait "$rebuild_pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+run "create table t(i int, j int)" >/dev/null
+run "insert into t select value, value from generate_series(1, $N)" >/dev/null
+expected_sum=$(run "select sum(j) from t")
+
+before_target=$(date +%s)
+sleep 2
+run "put tunable 'sc_pause_after_fence' 10" >/dev/null
+run "rebuild t" >/dev/null 2>&1 &
+rebuild_pid=$!
+
+at_fence=0
+for _ in $(seq 1 200); do
+	if grep -q "TEST: pausing .* after publication fence and before scdone" \
+		"${TESTDIR}/logs/${dbnm}.db" 2>/dev/null; then
+		at_fence=1
+		break
+	fi
+	sleep 0.1
+done
+(( at_fence == 1 )) || fail "schema change did not pause between fence and publication"
+
+interval_target=$(date +%s)
+wait "$rebuild_pid" || fail "rebuild failed after boundary pause"
+rebuild_pid=""
+sleep 2
+after_target=$(date +%s)
+sleep 2
+
+early_before=$(counter "SC fence target before publication")
+before_output=$(asof_query "$before_target")
+interval_output=$(asof_query "$interval_target")
+early_after=$(counter "SC fence target before publication")
+
+grep -q "failed with rc" <<<"$before_output" ||
+	fail "target before F did not fail closed: $before_output"
+grep -q "failed with rc" <<<"$interval_output" ||
+	fail "F < target < P did not fail closed: $interval_output"
+(( early_after > early_before )) ||
+	fail "pre-publication targets did not hit the visibility guard"
+
+run "update t set j = j + 1000 where i <= $((N / 2))" >/dev/null
+stops_before=$(counter "SC fence stops")
+read after_count after_sum <<<"$(asof_result "$after_target")" ||
+	fail "post-publication AS-OF query failed"
+stops_after=$(counter "SC fence stops")
+(( after_count == N )) || fail "post-publication AS-OF saw $after_count rows, expected $N"
+[[ "$after_sum" == "$expected_sum" ]] ||
+	fail "post-publication AS-OF sum changed: $after_sum vs $expected_sum"
+(( stops_after > stops_before )) ||
+	fail "post-publication AS-OF reconstruction never stopped at a fence"
+
+echo "SC_FENCE_ASOF_BOUNDARY: before=$before_target interval=$interval_target after=$after_target" \
+	"early_delta=$((early_after-early_before)) fence_stops_delta=$((stops_after-stops_before))"
+echo "Passed test"

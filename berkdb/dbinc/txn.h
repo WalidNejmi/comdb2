@@ -177,7 +177,7 @@ int __sc_publication_fence_registry_destroy __P((DB_ENV *));
 int __sc_publication_fence_pend __P((DB_ENV *, const u_int8_t *,
 	   const sc_build_id_t *));
 int __sc_publication_fence_publish __P((DB_ENV *, const sc_build_id_t *,
-	   DB_LSN, int));
+	   DB_LSN, u_int64_t, int));
 int __sc_publication_fence_install __P((DB_ENV *, const u_int8_t *,
 	   const sc_build_id_t *, DB_LSN));
 int __sc_publication_fence_reconcile __P((DB_ENV *,
@@ -185,7 +185,8 @@ int __sc_publication_fence_reconcile __P((DB_ENV *,
 int __sc_publication_fence_discard_build __P((DB_ENV *, const sc_build_id_t *));
 int __sc_publication_fence_list_build __P((DB_ENV *, const sc_build_id_t *,
 	   u_int8_t *, int, int *));
-int __sc_publication_fence_get __P((DB_ENV *, const u_int8_t *, DB_LSN *));
+int __sc_publication_fence_get __P((DB_ENV *, const u_int8_t *, DB_LSN *,
+	   u_int64_t *));
 int __sc_publication_fence_ready __P((DB_ENV *));
 void __sc_publication_fence_set_failed __P((DB_ENV *));
 u_int64_t __sc_publication_fence_epoch __P((DB_ENV *));

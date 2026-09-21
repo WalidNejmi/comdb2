@@ -11641,6 +11641,7 @@ struct llmeta_sc_publication_fence_data {
     int lsn_file;
     int lsn_offset;
     sc_build_id_t build_id;
+    uint64_t publication_utxnid;
 };
 
 enum {
@@ -11674,6 +11675,8 @@ llmeta_sc_publication_fence_data_put(const struct llmeta_sc_publication_fence_da
     p_buf = buf_put(&(p_data->lsn_offset), sizeof(p_data->lsn_offset), p_buf, p_buf_end);
     p_buf = buf_no_net_put(p_data->build_id.bytes,
                            sizeof(p_data->build_id.bytes), p_buf, p_buf_end);
+    p_buf = buf_put(&p_data->publication_utxnid,
+                    sizeof(p_data->publication_utxnid), p_buf, p_buf_end);
 
     return p_buf;
 }
@@ -11708,7 +11711,9 @@ int bdb_set_sc_publication_fence(tran_type *tran, const uint8_t *fileid, unsigne
 
     *bdberr = BDBERR_NOERROR;
 
-    if (fileid == NULL || lsn_file == 0 || sc_build_id_is_zero(build_id))
+    if (fileid == NULL || tran == NULL || tran->tid == NULL ||
+        tran->tid->utxnid == 0 || lsn_file == 0 ||
+        sc_build_id_is_zero(build_id))
         return -1;
 
     if (llmeta_sc_publication_fence_key(fileid, key) != 0) {
@@ -11720,6 +11725,7 @@ int bdb_set_sc_publication_fence(tran_type *tran, const uint8_t *fileid, unsigne
     d.lsn_file = (int)lsn_file;
     d.lsn_offset = (int)lsn_offset;
     d.build_id = *build_id;
+    d.publication_utxnid = tran->tid->utxnid;
 
     if (llmeta_sc_publication_fence_data_put(&d, data, data + sizeof(data)) == NULL) {
         *bdberr = BDBERR_BADARGS;

@@ -2402,6 +2402,11 @@ REGISTER_TUNABLE("sc_is_at_end",
                  TUNABLE_BOOLEAN, &gbl_sc_is_at_end, EXPERIMENTAL, NULL, NULL,
                  NULL, NULL);
 
+REGISTER_TUNABLE("sc_pause_after_fence",
+                 "TEST ONLY. Seconds to pause schema-change after fence establishment and before scdone.",
+                 TUNABLE_INTEGER, &gbl_sc_pause_after_fence,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+
 REGISTER_TUNABLE("cached_output_buffer_max_bytes",
                  "Maximum size in bytes of the output buffer of an appsock "
                  "thread.  (Default: 8 MiB)",

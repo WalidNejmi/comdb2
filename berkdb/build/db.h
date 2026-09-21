@@ -3030,12 +3030,14 @@ struct __sc_private_file_registry {
 struct __sc_publication_fence {
 	u_int8_t fileid[DB_FILE_ID_LEN];
 	DB_LSN fence_lsn;
+	u_int64_t publication_utxnid;
 	sc_build_id_t build_id;
 };
 
 struct __sc_publication_fence_record {
 	u_int8_t fileid[DB_FILE_ID_LEN];
 	DB_LSN fence_lsn;
+	u_int64_t publication_utxnid;
 	sc_build_id_t build_id;
 };
 typedef struct __sc_publication_fence_record SC_PUBLICATION_FENCE_RECORD;

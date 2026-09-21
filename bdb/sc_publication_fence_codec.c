@@ -23,17 +23,26 @@ int sc_publication_fence_decode(const uint8_t *key, size_t keylen,
         return -1;
 
     memset(&record->build_id, 0, sizeof(record->build_id));
+    record->publication_utxnid = 0;
     if (valuelen == SC_PUBLICATION_FENCE_DATA_V1_LEN && version == 1) {
         cursor = buf_get(&old_build_id, sizeof(old_build_id), cursor, end);
         if (cursor == NULL || old_build_id == 0)
             return -1;
         memset(&record->build_id, 0xff, sizeof(record->build_id));
         memcpy(record->build_id.bytes, &old_build_id, sizeof(old_build_id));
+    } else if (valuelen == SC_PUBLICATION_FENCE_DATA_V2_LEN && version == 2) {
+        cursor = buf_no_net_get(record->build_id.bytes,
+                                sizeof(record->build_id.bytes), cursor, end);
+        if (cursor == NULL || sc_build_id_is_zero(&record->build_id))
+            return -1;
     } else if (valuelen == SC_PUBLICATION_FENCE_DATA_LEN &&
                version == SC_PUBLICATION_FENCE_VERSION) {
         cursor = buf_no_net_get(record->build_id.bytes,
                                 sizeof(record->build_id.bytes), cursor, end);
-        if (cursor == NULL || sc_build_id_is_zero(&record->build_id))
+        cursor = buf_get(&record->publication_utxnid,
+                         sizeof(record->publication_utxnid), cursor, end);
+        if (cursor == NULL || sc_build_id_is_zero(&record->build_id) ||
+            record->publication_utxnid == 0)
             return -1;
     } else {
         return -1;

@@ -26,7 +26,8 @@ extern char *optostr(int op);
 
 extern int __txn_commit_map_get(DB_ENV *, u_int64_t, DB_LSN *);
 
-extern int __sc_publication_fence_get(DB_ENV *, const u_int8_t *, DB_LSN *);
+extern int __sc_publication_fence_get(DB_ENV *, const u_int8_t *, DB_LSN *,
+	u_int64_t *);
 extern int __sc_publication_fence_ready(DB_ENV *);
 extern u_int64_t __sc_publication_fence_epoch(DB_ENV *);
 extern void __sc_publication_fence_test_bump_epoch(DB_ENV *);
@@ -48,7 +49,8 @@ int gbl_mempv_test_bump_fence_epoch = 0;
  *	before the generation's fence, and no snapshot may read the generation
  *	before it is published.  So when
  *
- *		page_lsn <= fence <= target_lsn
+ *		page_lsn <= fence
+ *		publication_commit_lsn <= target_lsn
  *
  *	the page in hand is at or before an image that was already complete and
  *	visible by the time the snapshot started, and unwinding it further
@@ -66,24 +68,31 @@ __mempv_sc_fence_guarantees_target(dbenv, fileid, target_lsn, page_lsn)
 	DB_LSN target_lsn;
 	DB_LSN page_lsn;
 {
-	DB_LSN fence;
+	DB_LSN fence, visible_from;
+	u_int64_t publication_utxnid;
 
-	if (__sc_publication_fence_get(dbenv, fileid, &fence) != 0)
-		return (0);
-
-	if (log_compare(&page_lsn, &fence) > 0)
+	if (__sc_publication_fence_get(dbenv, fileid, &fence,
+	    &publication_utxnid) != 0)
 		return (0);
 
 	/*
-	 * The generation had not published yet at the snapshot's target, so
-	 * this fence proves nothing about it.  Counted, because a legal
-	 * snapshot of a rebuilt file should not be able to reach here: the
-	 * table-version check fails such a transaction first.
+	 * New records identify the publication transaction, whose ordinary
+	 * commit-map entry supplies the exact visibility boundary.  Legacy fence
+	 * records did not store it, so retain their historical fence-as-boundary
+	 * behavior for on-disk compatibility.
 	 */
-	if (log_compare(&fence, &target_lsn) > 0) {
+	visible_from = fence;
+	if (publication_utxnid != 0 &&
+	    __txn_commit_map_get(dbenv, publication_utxnid, &visible_from) != 0)
+		return (-1);
+
+	if (log_compare(&visible_from, &target_lsn) > 0) {
 		__sc_publication_fence_note(dbenv, 0);
-		return (0);
+		return (-1);
 	}
+
+	if (log_compare(&page_lsn, &fence) > 0)
+		return (0);
 
 	__sc_publication_fence_note(dbenv, 1);
 	return (1);
@@ -297,8 +306,22 @@ retry:
 		highest_checkpoint_lsn.offset);
 	}
 
-	if (PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn, smallest_logfile, target_lsn, initial_lsn) ||
-	    __mempv_sc_fence_guarantees_target(dbenv, mpf->fileid, target_lsn, initial_lsn)) {
+	int fence_result;
+	if (PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn,
+	    smallest_logfile, target_lsn, initial_lsn)) {
+		found = 1;
+		page_image = page;
+		goto found_page;
+	}
+	fence_result = __mempv_sc_fence_guarantees_target(
+	    dbenv, mpf->fileid, target_lsn, initial_lsn);
+	if (fence_result < 0) {
+		__mempv_logmsg(LOGMSG_ERROR, caller_id,
+		    "Snapshot target predates the selected file generation's publication\n");
+		ret = EINVAL;
+		goto err;
+	}
+	if (fence_result > 0) {
 		if (mempv_debug) {
 			__mempv_logmsg(LOGMSG_USER, caller_id,
 				"Page's LSN (%"PRIu32":%"PRIu32") indicates that it is at the right version\n",
@@ -349,8 +372,21 @@ retry:
 	DB_LSN current_lsn = initial_lsn;
 	while (!found) 
 	{
-		if (PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn, smallest_logfile, target_lsn, current_lsn) ||
-		    __mempv_sc_fence_guarantees_target(dbenv, mpf->fileid, target_lsn, current_lsn)) {
+		if (PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn,
+		    smallest_logfile, target_lsn, current_lsn)) {
+			add_to_cache = 1;
+			found = 1;
+			break;
+		}
+		fence_result = __mempv_sc_fence_guarantees_target(
+		    dbenv, mpf->fileid, target_lsn, current_lsn);
+		if (fence_result < 0) {
+			__mempv_logmsg(LOGMSG_ERROR, caller_id,
+			    "Snapshot target predates the selected file generation's publication\n");
+			ret = EINVAL;
+			goto err;
+		}
+		if (fence_result > 0) {
 			if (mempv_debug) {
 				__mempv_logmsg(LOGMSG_USER, caller_id,
 					"Page's LSN (%"PRIu32":%"PRIu32") indicates that it is at the right version\n",

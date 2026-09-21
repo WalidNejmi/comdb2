@@ -106,7 +106,7 @@ void __sc_private_registry_note_failure(DB_ENV *);
 int __sc_publication_fence_pend(DB_ENV *, const uint8_t *,
                                 const sc_build_id_t *);
 int __sc_publication_fence_publish(DB_ENV *, const sc_build_id_t *, DB_LSN,
-                                   int);
+                                   uint64_t, int);
 int __sc_publication_fence_discard_build(DB_ENV *, const sc_build_id_t *);
 int __sc_publication_fence_install(DB_ENV *, const uint8_t *,
                                    const sc_build_id_t *, DB_LSN);
@@ -267,6 +267,7 @@ int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
  * are switched and inside the publication transaction.
  */
 int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
+                                     tran_type *tran,
                                      const sc_build_id_t *build_id,
                                      unsigned int fence_file,
                                      unsigned int fence_offset,
@@ -274,7 +275,9 @@ int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
 {
     DB_LSN fence;
 
-    if (bdb_state == NULL || sc_build_id_is_zero(build_id) || fence_file == 0)
+    if (bdb_state == NULL || tran == NULL || tran->tid == NULL ||
+        tran->tid->utxnid == 0 || sc_build_id_is_zero(build_id) ||
+        fence_file == 0)
         return -1;
 
     if (bdb_state->parent)
@@ -284,7 +287,7 @@ int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
     fence.offset = fence_offset;
 
     return __sc_publication_fence_publish(bdb_state->dbenv, build_id, fence,
-                                          expected_count);
+                                          tran->tid->utxnid, expected_count);
 }
 
 /*

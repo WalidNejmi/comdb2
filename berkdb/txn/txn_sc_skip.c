@@ -747,7 +747,8 @@ collect_changed_fence(void *obj, void *arg)
 	other = hash_find(a->other, f->fileid);
 	if (a->removed ? other == NULL :
 	    (other == NULL || IS_ZERO_LSN(other->fence_lsn) ||
-	     log_compare(&f->fence_lsn, &other->fence_lsn) != 0)) {
+	     log_compare(&f->fence_lsn, &other->fence_lsn) != 0 ||
+	     f->publication_utxnid != other->publication_utxnid)) {
 		memcpy(a->fileids + a->n * DB_FILE_ID_LEN, f->fileid,
 		    DB_FILE_ID_LEN);
 		a->n++;
@@ -806,6 +807,7 @@ __sc_publication_fence_reconcile(dbenv, records, nrecords)
 		}
 		memcpy(f->fileid, records[i].fileid, DB_FILE_ID_LEN);
 		f->fence_lsn = records[i].fence_lsn;
+		f->publication_utxnid = records[i].publication_utxnid;
 		f->build_id = records[i].build_id;
 		if (hash_add(newfiles, f) != 0) {
 			__os_free(dbenv, f);
@@ -866,6 +868,7 @@ err:
 struct sc_fence_build_arg {
 	const sc_build_id_t *build_id;
 	DB_LSN fence_lsn;
+	u_int64_t publication_utxnid;
 	SC_PUBLICATION_FENCE *found;
 	u_int64_t nstamped;
 	int fail_after;
@@ -886,6 +889,7 @@ stamp_one_build_fence(void *obj, void *arg)
 	}
 
 	f->fence_lsn = a->fence_lsn;
+	f->publication_utxnid = a->publication_utxnid;
 	a->nstamped++;
 	return (0);
 }
@@ -901,13 +905,15 @@ stamp_one_build_fence(void *obj, void *arg)
  *
  * PUBLIC: int __sc_publication_fence_publish __P((DB_ENV *,
  * PUBLIC:     const sc_build_id_t *,
- * PUBLIC:     DB_LSN, int));
+ * PUBLIC:     DB_LSN, u_int64_t, int));
  */
 int
-__sc_publication_fence_publish(dbenv, build_id, fence_lsn, expected_count)
+__sc_publication_fence_publish(dbenv, build_id, fence_lsn,
+    publication_utxnid, expected_count)
 	DB_ENV *dbenv;
 	const sc_build_id_t *build_id;
 	DB_LSN fence_lsn;
+	u_int64_t publication_utxnid;
 	int expected_count;
 {
 	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
@@ -916,7 +922,7 @@ __sc_publication_fence_publish(dbenv, build_id, fence_lsn, expected_count)
 	int nfiles = 0, i;
 
 	if (reg == NULL || sc_build_id_is_zero(build_id) || IS_ZERO_LSN(fence_lsn) ||
-	    expected_count <= 0)
+	    publication_utxnid == 0 || expected_count <= 0)
 		return (EINVAL);
 
 	if (__sc_publication_fence_list_build(dbenv, build_id, NULL, 0,
@@ -935,6 +941,7 @@ __sc_publication_fence_publish(dbenv, build_id, fence_lsn, expected_count)
 
 	arg.build_id = build_id;
 	arg.fence_lsn = fence_lsn;
+	arg.publication_utxnid = publication_utxnid;
 	arg.nstamped = 0;
 	arg.fail_after = gbl_sc_fence_publish_fail_after;
 	arg.failed = 0;
@@ -1097,13 +1104,14 @@ __sc_publication_fence_discard_build(dbenv, build_id)
  *	not a rebuilt schema-change file, or is one that has not published.
  *
  * PUBLIC: int __sc_publication_fence_get __P((DB_ENV *, const u_int8_t *,
- * PUBLIC:	   DB_LSN *));
+ * PUBLIC:	   DB_LSN *, u_int64_t *));
  */
 int
-__sc_publication_fence_get(dbenv, fileid, fence_lsn)
+__sc_publication_fence_get(dbenv, fileid, fence_lsn, publication_utxnid)
 	DB_ENV *dbenv;
 	const u_int8_t *fileid;
 	DB_LSN *fence_lsn;
+	u_int64_t *publication_utxnid;
 {
 	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
 	SC_PUBLICATION_FENCE *f;
@@ -1117,6 +1125,7 @@ __sc_publication_fence_get(dbenv, fileid, fence_lsn)
 	f = hash_find(reg->files, fileid);
 	if (f != NULL && !IS_ZERO_LSN(f->fence_lsn)) {
 		*fence_lsn = f->fence_lsn;
+		*publication_utxnid = f->publication_utxnid;
 		reg->lookup_hits++;
 		ret = 0;
 	} else {
