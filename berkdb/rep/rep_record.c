@@ -5212,7 +5212,8 @@ __rep_process_txn_int(dbenv, rctl, rec, ltrans, maxlsn, commit_gen, rep_gen, loc
 		 * txn_flags_args->commit_flags and is honoured at the root map-add in
 		 * the serial-omission commit.
 		 */
-		if ((ret = __txn_regop_flags_read(dbenv, rec->data, &txn_flags_args)) != 0) {
+		if ((ret = __txn_regop_flags_read(dbenv, rec->data, rec->size,
+		    &txn_flags_args)) != 0) {
 			logmsg(LOGMSG_DEBUG, "%s failed at line %d\n", __func__, __LINE__);
 			return (ret);
 		}
@@ -5236,7 +5237,7 @@ __rep_process_txn_int(dbenv, rctl, rec, ltrans, maxlsn, commit_gen, rep_gen, loc
 			endianize = 1;
 		}
 		if ((ret =
-			__txn_regop_gen_flags_read(dbenv, rec->data,
+			__txn_regop_gen_flags_read(dbenv, rec->data, rec->size,
 				&txn_gen_flags_args)) != 0) {
 			logmsg(LOGMSG_DEBUG, "%s failed at line %d\n", __func__, __LINE__);
 			return (ret);
@@ -6232,7 +6233,8 @@ bad_resize:	;
 		 * the processor state (and reset on processor reuse / preserved across
 		 * deadlock retry).
 		 */
-		if ((ret = __txn_regop_flags_read(dbenv, rec->data, &txn_flags_args)) != 0)
+		if ((ret = __txn_regop_flags_read(dbenv, rec->data, rec->size,
+		    &txn_flags_args)) != 0)
 			return (ret);
 		if (txn_flags_args->opcode != TXN_COMMIT) {
 			__os_free(dbenv, txn_flags_args);
@@ -6260,7 +6262,7 @@ bad_resize:	;
 		}
 
 		if ((ret =
-			__txn_regop_gen_flags_read(dbenv, rec->data,
+			__txn_regop_gen_flags_read(dbenv, rec->data, rec->size,
 				&txn_gen_flags_args)) != 0)
 			return (ret);
 		if (txn_gen_flags_args->opcode != TXN_COMMIT) {
@@ -7755,7 +7757,7 @@ restart:
 				endianize = 1;
 			}
 			if ((ret =
-				__txn_regop_gen_flags_read(dbenv, mylog.data,
+				__txn_regop_gen_flags_read(dbenv, mylog.data, mylog.size,
 					&txngenflagsrec)) != 0)
 				goto err;
 			if (txngenflagsrec->opcode != TXN_ABORT) {
@@ -7780,7 +7782,7 @@ restart:
 		if (rectype == DB___txn_regop_flags) {
 			__txn_regop_flags_args *txnflagsrec = NULL;
 			if ((ret =
-				__txn_regop_flags_read(dbenv, mylog.data,
+				__txn_regop_flags_read(dbenv, mylog.data, mylog.size,
 					&txnflagsrec)) != 0)
 				goto err;
 			if (txnflagsrec->opcode != TXN_ABORT) {
@@ -8130,7 +8132,7 @@ get_committed_lsns(dbenv, inlsns, n_lsns, epoch, file, offset)
 
 				if (rectype == DB___txn_regop_flags) {
 					__txn_regop_flags_args *fa = NULL;
-					if ((ret = __txn_regop_flags_read(dbenv, mylog.data,
+					if ((ret = __txn_regop_flags_read(dbenv, mylog.data, mylog.size,
 													&fa)) != 0)
 						return (ret);
 					ftimestamp = (u_int64_t)fa->timestamp;
@@ -8139,7 +8141,7 @@ get_committed_lsns(dbenv, inlsns, n_lsns, epoch, file, offset)
 					__os_free(dbenv, fa);
 				} else {
 					__txn_regop_gen_flags_args *fa = NULL;
-					if ((ret = __txn_regop_gen_flags_read(dbenv, mylog.data,
+					if ((ret = __txn_regop_gen_flags_read(dbenv, mylog.data, mylog.size,
 													&fa)) != 0)
 						return (ret);
 					ftimestamp = fa->timestamp;
@@ -8476,7 +8478,7 @@ get_lsn_context_from_timestamp(dbenv, timestamp, ret_lsn, ret_context)
 
 		if (rectype == DB___txn_regop_flags) {
 			__txn_regop_flags_args *txn_flags_args = NULL;
-			if ((rc = __txn_regop_flags_read(dbenv, logdta.data,
+			if ((rc = __txn_regop_flags_read(dbenv, logdta.data, logdta.size,
 					&txn_flags_args)) != 0)
 				goto err;
 			if (txn_flags_args->timestamp <= timestamp) {
@@ -8500,7 +8502,7 @@ get_lsn_context_from_timestamp(dbenv, timestamp, ret_lsn, ret_context)
 		if (rectype == DB___txn_regop_gen_flags ||
 			rectype == DB___txn_regop_gen_flags_endianize) {
 			__txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
-			if ((rc = __txn_regop_gen_flags_read(dbenv, logdta.data,
+			if ((rc = __txn_regop_gen_flags_read(dbenv, logdta.data, logdta.size,
 					&txn_gen_flags_args)) != 0)
 				goto err;
 			if (txn_gen_flags_args->timestamp <= timestamp) {
@@ -8678,7 +8680,7 @@ get_context_from_lsn(dbenv, lsn, ret_context)
 		return 0;
 	} else if (rectype == DB___txn_regop_flags) {
 		__txn_regop_flags_args *txn_flags_args = NULL;
-		if ((rc = __txn_regop_flags_read(dbenv, logdta.data,
+		if ((rc = __txn_regop_flags_read(dbenv, logdta.data, logdta.size,
 				&txn_flags_args)) != 0)
 			goto err;
 		*ret_context = __txn_regop_flags_read_context(txn_flags_args);
@@ -8692,7 +8694,7 @@ get_context_from_lsn(dbenv, lsn, ret_context)
 	} else if (rectype == DB___txn_regop_gen_flags ||
 			   rectype == DB___txn_regop_gen_flags_endianize) {
 		__txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
-		if ((rc = __txn_regop_gen_flags_read(dbenv, logdta.data,
+		if ((rc = __txn_regop_gen_flags_read(dbenv, logdta.data, logdta.size,
 				&txn_gen_flags_args)) != 0)
 			goto err;
 		*ret_context = txn_gen_flags_args->context;

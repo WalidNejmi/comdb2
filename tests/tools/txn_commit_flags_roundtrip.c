@@ -266,7 +266,7 @@ test_regop_flags(int utxnid_logged, u_int32_t commit_flags)
     len = encode_regop_flags(buf, utxnid_logged, commit_flags);
     (void)len;
 
-    ret = __txn_regop_flags_read_int(NULL, buf, 0, &argp);
+    ret = __txn_regop_flags_read_int(NULL, buf, len, 0, &argp);
     CHECK(ret == 0 && argp != NULL, "read_int failed ret=%d", ret);
     if (ret != 0 || argp == NULL)
         return;
@@ -300,7 +300,7 @@ test_regop_gen_flags(u_int32_t rectype, int utxnid_logged,
     len = encode_regop_gen_flags(buf, rectype, utxnid_logged, commit_flags);
     (void)len;
 
-    ret = __txn_regop_gen_flags_read_int(NULL, buf, 0, &argp);
+    ret = __txn_regop_gen_flags_read_int(NULL, buf, len, 0, &argp);
     CHECK(ret == 0 && argp != NULL, "read_int failed ret=%d", ret);
     if (ret != 0 || argp == NULL)
         return;
@@ -435,6 +435,50 @@ test_parent_prefix_equivalence(int utxnid_logged)
     }
 }
 
+static void
+test_truncated_records(int utxnid_logged)
+{
+    u_int8_t buf[512];
+    __txn_regop_flags_args *regop = NULL;
+    __txn_regop_gen_flags_args *gen = NULL;
+    size_t len, i, locks_offset;
+    u_int32_t oversized = UINT32_MAX;
+    int ret;
+
+    len = encode_regop_flags(buf, utxnid_logged,
+                             TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP);
+    for (i = 0; i < len; i++) {
+        regop = NULL;
+        ret = __txn_regop_flags_read_int(NULL, buf, i, 0, &regop);
+        CHECK(ret != 0 && regop == NULL,
+              "regop_flags accepted truncated size %zu/%zu", i, len);
+        free(regop);
+    }
+    locks_offset = len - T_LOCKS_SZ - sizeof(u_int32_t);
+    LOGCOPY_32(buf + locks_offset, &oversized);
+    ret = __txn_regop_flags_read_int(NULL, buf, len, 0, &regop);
+    CHECK(ret != 0 && regop == NULL,
+          "regop_flags accepted oversized locks payload");
+    free(regop);
+
+    len = encode_regop_gen_flags(buf, DB___txn_regop_gen_flags_endianize,
+                                 utxnid_logged,
+                                 TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP);
+    for (i = 0; i < len; i++) {
+        gen = NULL;
+        ret = __txn_regop_gen_flags_read_int(NULL, buf, i, 0, &gen);
+        CHECK(ret != 0 && gen == NULL,
+              "regop_gen_flags accepted truncated size %zu/%zu", i, len);
+        free(gen);
+    }
+    locks_offset = len - T_LOCKS_SZ - sizeof(u_int32_t);
+    LOGCOPY_32(buf + locks_offset, &oversized);
+    ret = __txn_regop_gen_flags_read_int(NULL, buf, len, 0, &gen);
+    CHECK(ret != 0 && gen == NULL,
+          "regop_gen_flags accepted oversized locks payload");
+    free(gen);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -461,6 +505,7 @@ main(int argc, char *argv[])
         test_regop_gen_flags(DB___txn_regop_gen_flags, utxnid, 0x00000002u);
 
         test_parent_prefix_equivalence(utxnid);
+        test_truncated_records(utxnid);
     }
 
     printf("txn_commit_flags_roundtrip: %d checks, %d failures\n", checks,

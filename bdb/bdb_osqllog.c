@@ -4307,7 +4307,8 @@ static inline int retrieve_start_lsn(DBT *data, u_int32_t rectype, DB_LSN *lsn)
 
     case DB___txn_regop_flags: {
         __txn_regop_flags_args *txn_flags_args = NULL;
-        if ((rc = __txn_regop_flags_read(dbenv, data->data, &txn_flags_args)) !=
+        if ((rc = __txn_regop_flags_read(dbenv, data->data, data->size,
+                         &txn_flags_args)) !=
             0) {
             logmsg(LOGMSG_ERROR,
                    "%s line %d regop_flags read returns %d for "
@@ -4327,7 +4328,7 @@ static inline int retrieve_start_lsn(DBT *data, u_int32_t rectype, DB_LSN *lsn)
     case DB___txn_regop_gen_flags:
     case DB___txn_regop_gen_flags_endianize: {
         __txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
-        if ((rc = __txn_regop_gen_flags_read(dbenv, data->data,
+        if ((rc = __txn_regop_gen_flags_read(dbenv, data->data, data->size,
                                              &txn_gen_flags_args)) != 0) {
             logmsg(LOGMSG_ERROR,
                    "%s line %d regop_gen_flags read returns %d for "

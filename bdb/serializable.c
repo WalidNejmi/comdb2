@@ -491,7 +491,8 @@ static int osql_serial_check(bdb_state_type *bdb_state, void *ranges,
                  * fixed fields and does not affect the chain).
                  */
                 __txn_regop_flags_args *argrfp = NULL;
-                rc = __txn_regop_flags_read(bdb_state->dbenv, logdta.data, &argrfp);
+                rc = __txn_regop_flags_read(bdb_state->dbenv, logdta.data,
+                                            logdta.size, &argrfp);
                 prevlsn = argrfp->prev_lsn;
                 free(logdta.data);
                 logdta.data = NULL;
@@ -511,7 +512,8 @@ static int osql_serial_check(bdb_state_type *bdb_state, void *ranges,
             } else if (rectype == DB___txn_regop_gen_flags ||
                        rectype == DB___txn_regop_gen_flags_endianize) {
                 __txn_regop_gen_flags_args *argflagsp = NULL;
-                rc = __txn_regop_gen_flags_read(bdb_state->dbenv, logdta.data, &argflagsp);
+                rc = __txn_regop_gen_flags_read(bdb_state->dbenv, logdta.data,
+                                                logdta.size, &argflagsp);
                 prevlsn = argflagsp->prev_lsn;
                 free(logdta.data);
                 logdta.data = NULL;

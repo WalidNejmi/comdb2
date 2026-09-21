@@ -45,16 +45,16 @@ unsigned long long __txn_regop_read_context __P((__txn_regop_args *));
 int __txn_regop_flags_log __P((DB_ENV *, DB_TXN *, DB_LSN *, u_int64_t *, u_int32_t, u_int32_t, int32_t, u_int32_t, const DBT *, void *));
 int __txn_regop_flags_getpgnos __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
 int __txn_regop_flags_getallpgnos __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
-int __txn_regop_flags_read_int __P((DB_ENV *, void *, int, __txn_regop_flags_args **));
+int __txn_regop_flags_read_int __P((DB_ENV *, void *, size_t, int, __txn_regop_flags_args **));
 int __txn_regop_flags_print __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
-int __txn_regop_flags_read __P((DB_ENV *, void *, __txn_regop_flags_args **));
+int __txn_regop_flags_read __P((DB_ENV *, void *, size_t, __txn_regop_flags_args **));
 unsigned long long __txn_regop_flags_read_context __P((__txn_regop_flags_args *));
 int __txn_regop_gen_flags_log __P((DB_ENV *, u_int32_t, DB_TXN *, DB_LSN *, u_int64_t *, u_int32_t, u_int32_t, u_int32_t, u_int64_t, u_int32_t, const DBT *, void *));
 int __txn_regop_gen_flags_getpgnos __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
 int __txn_regop_gen_flags_getallpgnos __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
-int __txn_regop_gen_flags_read_int __P((DB_ENV *, void *, int, __txn_regop_gen_flags_args **));
+int __txn_regop_gen_flags_read_int __P((DB_ENV *, void *, size_t, int, __txn_regop_gen_flags_args **));
 int __txn_regop_gen_flags_print __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
-int __txn_regop_gen_flags_read __P((DB_ENV *, void *, __txn_regop_gen_flags_args **));
+int __txn_regop_gen_flags_read __P((DB_ENV *, void *, size_t, __txn_regop_gen_flags_args **));
 
 /* For 2pc */
 int __txn_dist_prepare_log __P((DB_ENV *, u_int32_t, DB_TXN *, DB_LSN *, u_int32_t, u_int32_t, DB_LSN *, const DBT *, u_int64_t, u_int32_t, u_int32_t, const DBT *, const DBT *, const DBT *, const DBT *));

@@ -3434,27 +3434,37 @@ __txn_regop_flags_getallpgnos(dbenv, rec, lsnp, notused1, summary)
 #endif /* HAVE_REPLICATION */
 
 /*
- * PUBLIC: int __txn_regop_flags_read_int __P((DB_ENV *, void *,
- * PUBLIC:	 int do_pgswp,  __txn_regop_flags_args **));
+ * PUBLIC: int __txn_regop_flags_read_int __P((DB_ENV *, void *, size_t,
+ * PUBLIC:     int do_pgswp,  __txn_regop_flags_args **));
  */
 int
-__txn_regop_flags_read_int(dbenv, recbuf, do_pgswp, argpp)
+__txn_regop_flags_read_int(dbenv, recbuf, recsize, do_pgswp, argpp)
 	DB_ENV *dbenv;
 	void *recbuf;
+	size_t recsize;
 	int do_pgswp;
 	__txn_regop_flags_args **argpp;
 {
 	__txn_regop_flags_args *argp;
 	u_int32_t uinttmp;
-	u_int8_t *bp;
+	u_int8_t *bp, *end;
 	int ret;
+
+	*argpp = NULL;
+	if (recbuf == NULL || recsize < sizeof(u_int32_t))
+		return (EINVAL);
+	bp = recbuf;
+	end = bp + recsize;
+	LOGCOPY_32(&uinttmp, bp);
+	if (recsize < sizeof(u_int32_t) * 6 + sizeof(DB_LSN) +
+	    ((uinttmp == DB___txn_regop_flags + 2000) ? sizeof(u_int64_t) : 0))
+		return (EINVAL);
 
 	if ((ret = __os_malloc(dbenv,
 		sizeof(__txn_regop_flags_args) + sizeof(DB_TXN), &argp)) != 0)
 		return (ret);
 	argp->txnid = (DB_TXN *)&argp[1];
 
-	bp = recbuf;
 	LOGCOPY_32(&argp->type, bp);
 	bp += sizeof(argp->type);
 
@@ -3486,6 +3496,10 @@ __txn_regop_flags_read_int(dbenv, recbuf, do_pgswp, argpp)
 	memset(&argp->locks, 0, sizeof(argp->locks));
 	LOGCOPY_32(&argp->locks.size, bp);
 	bp += sizeof(u_int32_t);
+	if (argp->locks.size > (size_t)(end - bp)) {
+		__os_free(dbenv, argp);
+		return (EINVAL);
+	}
 	argp->locks.data = bp;
 	bp += argp->locks.size;
 
@@ -3507,12 +3521,14 @@ __txn_regop_flags_print(dbenv, dbtp, lsnp, notused2, notused3)
 {
 	__txn_regop_flags_args *argp;
 	struct tm *lt;
+	time_t timestamp;
 	int ret;
 
 	notused2 = DB_TXN_ABORT;
 	notused3 = NULL;
 
-	if ((ret = __txn_regop_flags_read_int(dbenv, dbtp->data, 0, &argp)) != 0)
+	if ((ret = __txn_regop_flags_read_int(dbenv, dbtp->data, dbtp->size,
+	    0, &argp)) != 0)
 		return (ret);
 
 	(void)printf(
@@ -3526,12 +3542,13 @@ __txn_regop_flags_print(dbenv, dbtp, lsnp, notused2, notused3)
 		(u_long)argp->prev_lsn.offset,
 		argp->txnid->utxnid);
 	(void)printf("\topcode: %lu\n", (u_long)argp->opcode);
-	lt = localtime((time_t *)&argp->timestamp);
+	timestamp = (time_t)argp->timestamp;
+	lt = localtime(&timestamp);
 	if (lt)
 	{
 		(void)printf(
 				"\ttimestamp: %ld (%.24s, 20%02lu%02lu%02lu%02lu%02lu.%02lu)\n",
-				(long)argp->timestamp, ctime((time_t *)&argp->timestamp),
+				(long)argp->timestamp, ctime(&timestamp),
 				(u_long)lt->tm_year - 100, (u_long)lt->tm_mon+1,
 				(u_long)lt->tm_mday, (u_long)lt->tm_hour,
 				(u_long)lt->tm_min, (u_long)lt->tm_sec);
@@ -3566,16 +3583,17 @@ __txn_regop_flags_print(dbenv, dbtp, lsnp, notused2, notused3)
 }
 
 /*
- * PUBLIC: int __txn_regop_flags_read __P((DB_ENV *, void *,
+ * PUBLIC: int __txn_regop_flags_read __P((DB_ENV *, void *, size_t,
  * PUBLIC:	  __txn_regop_flags_args **));
  */
 int
-__txn_regop_flags_read(dbenv, recbuf, argpp)
+__txn_regop_flags_read(dbenv, recbuf, recsize, argpp)
 	DB_ENV *dbenv;
 	void *recbuf;
+	size_t recsize;
 	__txn_regop_flags_args **argpp;
 {
-	return __txn_regop_flags_read_int (dbenv, recbuf, 1, argpp);
+	return __txn_regop_flags_read_int(dbenv, recbuf, recsize, 1, argpp);
 }
 
 /*
@@ -3884,28 +3902,41 @@ __txn_regop_gen_flags_getallpgnos(dbenv, rec, lsnp, notused1, summary)
 #endif /* HAVE_REPLICATION */
 
 /*
- * PUBLIC: int __txn_regop_gen_flags_read_int __P((DB_ENV *, void *,
+ * PUBLIC: int __txn_regop_gen_flags_read_int __P((DB_ENV *, void *, size_t,
  * PUBLIC:	 int do_pgswp,  __txn_regop_gen_flags_args **));
  */
 int
-__txn_regop_gen_flags_read_int(dbenv, recbuf, do_pgswp, argpp)
+__txn_regop_gen_flags_read_int(dbenv, recbuf, recsize, do_pgswp, argpp)
 	DB_ENV *dbenv;
 	void *recbuf;
+	size_t recsize;
 	int do_pgswp;
 	__txn_regop_gen_flags_args **argpp;
 {
 	__txn_regop_gen_flags_args *argp;
 	u_int32_t uinttmp;
 	u_int64_t uint64tmp;
-	u_int8_t *bp;
+	u_int8_t *bp, *end;
 	int ret;
+
+	*argpp = NULL;
+	if (recbuf == NULL || recsize < sizeof(u_int32_t))
+		return (EINVAL);
+	bp = recbuf;
+	end = bp + recsize;
+	LOGCOPY_32(&uinttmp, bp);
+	if (recsize < sizeof(u_int32_t) * 6 + sizeof(DB_LSN) +
+	    sizeof(u_int64_t) * 2 +
+	    ((uinttmp == DB___txn_regop_gen_flags + 2000 ||
+	      uinttmp == DB___txn_regop_gen_flags_endianize + 2000) ?
+	         sizeof(u_int64_t) : 0))
+		return (EINVAL);
 
 	if ((ret = __os_malloc(dbenv,
 		sizeof(__txn_regop_gen_flags_args) + sizeof(DB_TXN), &argp)) != 0)
 		return (ret);
 	argp->txnid = (DB_TXN *)&argp[1];
 
-	bp = recbuf;
 	LOGCOPY_32(&argp->type, bp);
 	bp += sizeof(argp->type);
 
@@ -3946,6 +3977,10 @@ __txn_regop_gen_flags_read_int(dbenv, recbuf, do_pgswp, argpp)
 	memset(&argp->locks, 0, sizeof(argp->locks));
 	LOGCOPY_32(&argp->locks.size, bp);
 	bp += sizeof(u_int32_t);
+	if (argp->locks.size > (size_t)(end - bp)) {
+		__os_free(dbenv, argp);
+		return (EINVAL);
+	}
 	argp->locks.data = bp;
 	bp += argp->locks.size;
 
@@ -3972,7 +4007,8 @@ __txn_regop_gen_flags_print(dbenv, dbtp, lsnp, notused2, notused3)
 	notused2 = DB_TXN_ABORT;
 	notused3 = NULL;
 
-	if ((ret = __txn_regop_gen_flags_read_int(dbenv, dbtp->data, 0, &argp)) != 0)
+	if ((ret = __txn_regop_gen_flags_read_int(dbenv, dbtp->data, dbtp->size,
+	    0, &argp)) != 0)
 		return (ret);
 
 	u_int32_t type = argp->type & ~DB_debug_FLAG;
@@ -4048,16 +4084,17 @@ __txn_regop_gen_flags_print(dbenv, dbtp, lsnp, notused2, notused3)
 }
 
 /*
- * PUBLIC: int __txn_regop_gen_flags_read __P((DB_ENV *, void *,
+ * PUBLIC: int __txn_regop_gen_flags_read __P((DB_ENV *, void *, size_t,
  * PUBLIC:	  __txn_regop_gen_flags_args **));
  */
 int
-__txn_regop_gen_flags_read(dbenv, recbuf, argpp)
+__txn_regop_gen_flags_read(dbenv, recbuf, recsize, argpp)
 	DB_ENV *dbenv;
 	void *recbuf;
+	size_t recsize;
 	__txn_regop_gen_flags_args **argpp;
 {
-	return __txn_regop_gen_flags_read_int (dbenv, recbuf, 1, argpp);
+	return __txn_regop_gen_flags_read_int(dbenv, recbuf, recsize, 1, argpp);
 }
 
 /*

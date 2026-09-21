@@ -747,7 +747,8 @@ __txn_regop_flags_recover(dbenv, dbtp, lsnp, op, info)
 
 	commit_lsn_map = __txn_commit_map_enabled();
 
-	if ((ret = __txn_regop_flags_read(dbenv, dbtp->data, &argp)) != 0)
+	if ((ret = __txn_regop_flags_read(dbenv, dbtp->data, dbtp->size,
+	    &argp)) != 0)
 		return (ret);
 
 	__sc_commit_flags_note(SC_OBS_RECOVERY, argp->commit_flags);
@@ -884,7 +885,8 @@ __txn_regop_gen_flags_recover(dbenv, dbtp, lsnp, op, info)
 	rep = db_rep->region;
 	commit_lsn_map = __txn_commit_map_enabled();
 
-	if ((ret = __txn_regop_gen_flags_read(dbenv, dbtp->data, &argp)) != 0)
+	if ((ret = __txn_regop_gen_flags_read(dbenv, dbtp->data, dbtp->size,
+	    &argp)) != 0)
 		return (ret);
 
 	__sc_commit_flags_note(SC_OBS_RECOVERY, argp->commit_flags);

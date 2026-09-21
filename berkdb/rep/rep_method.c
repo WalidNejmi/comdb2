@@ -1219,7 +1219,7 @@ __retrieve_logged_generation_commitlsn(dbenv, lsn, gen)
 		 * participate in election/generation decisions.
 		 */
 		__txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
-		if ((ret = __txn_regop_gen_flags_read(dbenv, rec.data,
+		if ((ret = __txn_regop_gen_flags_read(dbenv, rec.data, rec.size,
 						&txn_gen_flags_args)) != 0)
 			goto err;
 		MUTEX_LOCK(dbenv, db_rep->rep_mutexp);

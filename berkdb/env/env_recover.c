@@ -2210,7 +2210,7 @@ __scan_logfiles_for_asof_modsnap(dbenv)
 			__txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
 			if ((ret =
 				__txn_regop_gen_flags_read(dbenv, data.data,
-					&txn_gen_flags_args)) != 0) {
+					data.size, &txn_gen_flags_args)) != 0) {
 				GOTOERR;
 			}
 			free_ptr = txn_gen_flags_args;
@@ -2227,7 +2227,7 @@ __scan_logfiles_for_asof_modsnap(dbenv)
 			__txn_regop_flags_args *txn_flags_args = NULL;
 			if ((ret =
 				__txn_regop_flags_read(dbenv, data.data,
-					&txn_flags_args)) != 0) {
+					data.size, &txn_flags_args)) != 0) {
 				GOTOERR;
 			}
 			free_ptr = txn_flags_args;

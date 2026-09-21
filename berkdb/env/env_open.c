@@ -574,7 +574,7 @@ __dbenv_open(dbenv, db_home, flags, mode)
 							break;
 						case (DB___txn_regop_flags):
 							if ((ret = __txn_regop_flags_read(dbenv, data.data,
-											&regopflags))!=0)
+											data.size, &regopflags))!=0)
 								goto err;
 							timestamp = regopflags->timestamp;
 							__os_free(dbenv, regopflags);
@@ -588,7 +588,7 @@ __dbenv_open(dbenv, db_home, flags, mode)
 						case (DB___txn_regop_gen_flags):
 						case (DB___txn_regop_gen_flags_endianize):
 							if ((ret = __txn_regop_gen_flags_read(dbenv, data.data,
-											&regopgenflags))!=0)
+											data.size, &regopgenflags))!=0)
 								goto err;
 							timestamp = regopgenflags->timestamp;
 							__os_free(dbenv, regopgenflags);
