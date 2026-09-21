@@ -2581,6 +2581,7 @@ int bdb_sc_publication_fence_install(bdb_state_type *bdb_state,
 int bdb_sc_publication_fence_reconcile(
     bdb_state_type *bdb_state,
     const struct __sc_publication_fence_record *records, int nrecords);
+void bdb_sc_publication_fence_set_failed(bdb_state_type *bdb_state);
 
 /*
  * Durable publication fences, keyed by physical file id.  Written inside the

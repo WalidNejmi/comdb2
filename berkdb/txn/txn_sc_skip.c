@@ -108,6 +108,7 @@ static u_int64_t sc_unsupported_rowlock = 0;
 static u_int64_t sc_unsupported_distributed = 0;
 static u_int64_t sc_unsupported_unknown_family = 0;
 int gbl_sc_fence_publish_fail_after = INT_MAX;
+int gbl_sc_fence_force_unready = 0;
 
 /*
  * __sc_commit_flags_note --
@@ -485,6 +486,7 @@ __sc_publication_fence_registry_init(dbenv)
 
 	Pthread_mutex_init(&reg->lk, NULL);
 	reg->epoch = 1;
+	reg->readiness = SC_FENCE_UNINITIALIZED;
 	dbenv->sc_publication_fences = reg;
 
 	return (0);
@@ -843,6 +845,7 @@ __sc_publication_fence_reconcile(dbenv, records, nrecords)
 	changed.removed = 1;
 	hash_for(oldfiles, &collect_changed_fence, &changed);
 	reg->files = newfiles;
+	reg->readiness = SC_FENCE_READY;
 	if (changed.n != 0)
 		reg->epoch++;
 	Pthread_mutex_unlock(&reg->lk);
@@ -1122,6 +1125,39 @@ __sc_publication_fence_get(dbenv, fileid, fence_lsn)
 
 	Pthread_mutex_unlock(&reg->lk);
 	return (ret);
+}
+
+/* PUBLIC: int __sc_publication_fence_ready __P((DB_ENV *)); */
+int
+__sc_publication_fence_ready(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	int ready = 0;
+
+	if (reg == NULL)
+		return (0);
+	if (gbl_sc_fence_force_unready)
+		return (0);
+	Pthread_mutex_lock(&reg->lk);
+	ready = reg->readiness == SC_FENCE_READY;
+	Pthread_mutex_unlock(&reg->lk);
+	return (ready);
+}
+
+/* PUBLIC: void __sc_publication_fence_set_failed __P((DB_ENV *)); */
+void
+__sc_publication_fence_set_failed(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+
+	if (reg == NULL)
+		return;
+	Pthread_mutex_lock(&reg->lk);
+	reg->readiness = SC_FENCE_FAILED;
+	reg->epoch++;
+	Pthread_mutex_unlock(&reg->lk);
 }
 
 /* PUBLIC: u_int64_t __sc_publication_fence_epoch __P((DB_ENV *)); */

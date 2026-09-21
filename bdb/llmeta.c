@@ -11883,6 +11883,8 @@ int bdb_load_sc_publication_fences(tran_type *tran, int *nloaded, int *bdberr)
     if (rc == 0)
         rc = bdb_sc_publication_fence_reconcile(llmeta_bdb_state,
                                                 load.records, load.count);
+    if (rc != 0)
+        bdb_sc_publication_fence_set_failed(llmeta_bdb_state);
 
     if (nloaded)
         *nloaded = rc == 0 ? load.count : 0;

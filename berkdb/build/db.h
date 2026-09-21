@@ -3044,6 +3044,7 @@ struct __sc_publication_fence_registry {
 	pthread_mutex_t lk;
 	hash_t *files;
 	u_int64_t epoch;
+	int readiness;
 
 	u_int64_t stops;
 	u_int64_t lookup_hits;
@@ -3058,6 +3059,10 @@ struct __sc_publication_fence_registry {
 	u_int64_t cached_pages_dropped;
 	u_int64_t epoch_retries;
 };
+
+#define SC_FENCE_UNINITIALIZED 0
+#define SC_FENCE_READY 1
+#define SC_FENCE_FAILED 2
 
 struct __mempv_cache_page_key
 {

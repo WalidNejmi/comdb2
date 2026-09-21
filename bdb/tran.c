@@ -111,6 +111,7 @@ int __sc_publication_fence_install(DB_ENV *, const uint8_t *,
                                    const sc_build_id_t *, DB_LSN);
 int __sc_publication_fence_reconcile(DB_ENV *,
                                      const SC_PUBLICATION_FENCE_RECORD *, int);
+void __sc_publication_fence_set_failed(DB_ENV *);
 int __sc_publication_fence_list_build(DB_ENV *, const sc_build_id_t *,
                                       uint8_t *, int, int *);
 
@@ -312,6 +313,17 @@ int bdb_sc_publication_fence_reconcile(
 
     return __sc_publication_fence_reconcile(bdb_state->dbenv, records,
                                              nrecords);
+}
+
+void bdb_sc_publication_fence_set_failed(bdb_state_type *bdb_state)
+{
+    if (bdb_state == NULL)
+        return;
+
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    __sc_publication_fence_set_failed(bdb_state->dbenv);
 }
 
 /*

@@ -26,6 +26,7 @@ extern char *optostr(int op);
 extern int __txn_commit_map_get(DB_ENV *, u_int64_t, DB_LSN *);
 
 extern int __sc_publication_fence_get(DB_ENV *, const u_int8_t *, DB_LSN *);
+extern int __sc_publication_fence_ready(DB_ENV *);
 extern u_int64_t __sc_publication_fence_epoch(DB_ENV *);
 extern void __sc_publication_fence_note_epoch_retry(DB_ENV *);
 extern void __sc_publication_fence_note(DB_ENV *, int);
@@ -253,6 +254,12 @@ int __mempv_fget(mpf, dbp, pgno, target_lsn, highest_checkpoint_lsn, ret_page, f
 
 	dbenv = mpf->dbenv;
 retry:
+	if (!__sc_publication_fence_ready(dbenv)) {
+		logmsg(LOGMSG_ERROR,
+		    "%s: schema-change publication-fence state is unavailable\n",
+		    __func__);
+		return (EINVAL);
+	}
 	ret = found = add_to_cache = 0;
 	logc = NULL;
 	page = page_image = NULL;

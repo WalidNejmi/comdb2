@@ -1223,6 +1223,7 @@ __txn_commit_int(txnp, flags, ltranid, llid, last_commit_lsn, rlocks, inlks,
 	dbenv = txnp->mgrp->dbenv;
 	if (sc_commit_flags_writer && !sc_build_id_is_zero(&txnp->sc_build_id))
 		sc_commit_flags_writer =
+		    __sc_publication_fence_ready(dbenv) &&
 		    bdb_cluster_supports_commit_flags(dbenv->app_private);
 	commit_lsn_map = __txn_commit_map_enabled();
 

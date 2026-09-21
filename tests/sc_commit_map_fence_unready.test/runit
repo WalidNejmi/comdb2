@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+set -o pipefail
+
+dbnm=$1
+N=${SC_FENCE_ROWS:-2000}
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+counter() {
+	cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+		sed -n "s/.*$1: \([0-9][0-9]*\).*/\1/p" | head -1
+}
+
+run "create table t(i int, j int)" >/dev/null
+run "create index ix_j on t(j)" >/dev/null
+run "insert into t select value, value from generate_series(1, $N)" >/dev/null
+run "rebuild t" >/dev/null
+
+run "put tunable 'sc_fence_force_unready' 1" >/dev/null ||
+	fail "could not force fence subsystem unready"
+
+fifo=/tmp/sc_fence_unready_fifo.$$ out=/tmp/sc_fence_unready_out.$$
+mkfifo "$fifo"
+cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" - <"$fifo" >"$out" 2>&1 &
+pid=$!
+exec 9>"$fifo"
+printf '%s\n' "set transaction snapshot isolation" "begin" \
+	"select count(*) from t" >&9
+sleep 2
+run "update t set j = j + 1" >/dev/null
+printf '%s\n' "select count(*) from t" "commit" >&9
+exec 9>&-
+if wait "$pid"; then
+	rm -f "$fifo" "$out"
+	fail "snapshot reconstruction succeeded while fence state was unavailable"
+fi
+grep -q "publication-fence state is unavailable\|failed" "$out" || {
+	cat "$out"
+	rm -f "$fifo" "$out"
+	fail "snapshot failed without reporting unavailable fence state"
+}
+rm -f "$fifo" "$out"
+
+emitted_before=$(counter "SC flags emitted (master)")
+skipped_before=$(counter "SC commit-map entries skipped")
+run "rebuild t" >/dev/null || fail "legacy fallback rebuild failed"
+emitted_after=$(counter "SC flags emitted (master)")
+skipped_after=$(counter "SC commit-map entries skipped")
+(( emitted_after == emitted_before )) || fail "writer emitted flags while unready"
+(( skipped_after == skipped_before )) || fail "master skipped map entries while unready"
+
+run "put tunable 'sc_fence_force_unready' 0" >/dev/null ||
+	fail "could not restore fence readiness"
+[[ "$(run 'select count(*) from t')" == "$N" ]] || fail "table contents changed"
+
+echo "SC_FENCE_UNREADY: emitted_delta=$((emitted_after-emitted_before))" \
+	"skipped_delta=$((skipped_after-skipped_before))"
+echo "Passed test"
