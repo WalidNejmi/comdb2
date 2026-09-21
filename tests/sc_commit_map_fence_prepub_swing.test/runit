@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+source ${TESTSROOTDIR}/sc_commit_map_fence_cluster.test/cluster_commit_map_lib.sh
+set -o pipefail
+
+dbname=$1
+N=${SC_FENCE_ROWS:-5000}
+rebuild_pid=""
+
+require_cluster
+
+node_clminfo_anystate() {
+	cdb2sql --allow-incoherent ${CDB2_OPTIONS} --host "$1" "$dbname" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null
+}
+node_fences() {
+	node_clminfo_anystate "$1" | grep -oP '(?<=SC publication fences: )[0-9]+'
+}
+node_fence_stops() {
+	node_clminfo_anystate "$1" | grep -oP '(?<=SC fence stops: )[0-9]+'
+}
+cleanup() {
+	local node
+	for node in $(getclusternodes 2>/dev/null); do
+		send_node "$node" "sc_pause_at_end 0" || true
+	done
+	cluster_log_delete_on || true
+	[[ -n "$rebuild_pid" ]] && wait "$rebuild_pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+master=$(cluster_master)
+[[ -n "$master" ]] || fail "could not find master"
+cluster_log_delete_off
+
+# Establish the expected physical-file count independently with a completed
+# same-shape rebuild.
+sql_node "$master" "create table control(i int)" >/dev/null
+sql_node "$master" "insert into control select value from generate_series(1, $N)" >/dev/null
+base_fences=$(node_fences "$master")
+sql_node "$master" "rebuild control" >/dev/null
+control_fences=$(node_fences "$master")
+expected=$((control_fences - base_fences))
+(( expected > 0 )) || fail "control rebuild published no fences"
+
+seed_table "$master" "$N"
+before_fences=$(node_fences "$master")
+before_skipped=$(node_skipped "$master")
+send_node "$master" "sc_pause_at_end 1"
+sql_node "$master" "rebuild t" >/dev/null 2>&1 &
+rebuild_pid=$!
+
+at_end=0
+for _ in $(seq 1 1200); do
+	value=$(sql_node "$master" "select value from comdb2_tunables where name='sc_is_at_end'" 2>/dev/null)
+	if [[ "$value" == "ON" || "$value" == "1" ]]; then
+		at_end=1
+		break
+	fi
+	kill -0 "$rebuild_pid" 2>/dev/null || break
+	sleep 0.25
+done
+(( at_end == 1 )) || fail "converter did not reach the pre-publication pause"
+
+paused_skipped=$(node_skipped "$master")
+(( paused_skipped - before_skipped >= N - 10 )) ||
+	fail "paused converter skipped only $((paused_skipped-before_skipped)) entries"
+paused_fences=$(node_fences "$master")
+(( paused_fences - before_fences == expected )) ||
+	fail "paused build registered $((paused_fences-before_fences)) files, expected $expected"
+
+old_master=$master
+downgrade_master || fail "could not force pre-publication master swing"
+wait "$rebuild_pid" 2>/dev/null || true
+rebuild_pid=""
+
+master=$(cluster_master)
+[[ -n "$master" && "$master" != "$old_master" ]] ||
+	fail "master did not change ($old_master -> ${master:-none})"
+
+want=$((before_fences + expected))
+published=0
+for _ in $(seq 1 240); do
+	fences=$(node_fences "$master")
+	if [[ -n "$fences" ]] && (( fences >= want )); then
+		published=1
+		break
+	fi
+	sleep 1
+done
+(( published == 1 )) ||
+	fail "resumed build did not publish exact fence set (got ${fences:-none}, want $want)"
+(( fences - before_fences == expected )) ||
+	fail "resumed build added $((fences-before_fences)) fences, expected $expected"
+
+expected_sum=$(sql_node "$master" "select sum(i) from t")
+stops_before=$(node_fence_stops "$master")
+fifo=/tmp/sc_prepub_fifo.$$
+out=/tmp/sc_prepub_out.$$
+mkfifo "$fifo"
+cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbname" - <"$fifo" >"$out" 2>&1 &
+pid=$!
+exec 9>"$fifo"
+printf '%s\n' "set transaction snapshot isolation" "begin" \
+	"select count(*) from t" "select sum(i) from t" >&9
+sleep 2
+sql_node "$master" "update t set i = i + 1" >/dev/null
+printf '%s\n' "select count(*) from t" "select sum(i) from t" "commit" >&9
+exec 9>&-
+wait "$pid" || fail "snapshot client failed"
+rm -f "$fifo"
+mapfile -t vals < <(grep -vE '^\[' "$out")
+rm -f "$out"
+
+(( ${vals[0]} == N && ${vals[2]} == N )) || fail "snapshot row count changed"
+[[ "${vals[1]}" == "$expected_sum" && "${vals[3]}" == "$expected_sum" ]] ||
+	fail "snapshot changed across post-publication update"
+stops_after=$(node_fence_stops "$master")
+
+# Promotion takes an election checkpoint after the converter writes.  On the
+# promoted master that checkpoint is an earlier stopping proof than the fence,
+# so fence_stops may remain zero here.  The replica and physrep tests exercise
+# load-bearing fence use; this test proves exact resume/publication coverage and
+# historical-read correctness across the pre-publication swing.
+
+echo "SC_FENCE_PREPUB_SWING: old=$old_master new=$master expected_fences=$expected" \
+	"actual_fences=$((fences-before_fences)) skipped=$((paused_skipped-before_skipped))" \
+	"fence_stops_delta=$((stops_after-stops_before))"
+echo "Passed test"
