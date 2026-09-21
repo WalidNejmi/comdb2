@@ -327,6 +327,11 @@ struct seqnum_t {
 };
 
 enum { BDB_SEQNUM_TYPE_LEN = 8 + 2 + 2 + 4 + 12 };
+enum {
+    BDB_CAP_TXN_COMMIT_FLAGS_V1 = 0x00000001,
+    BDB_SEQNUM_CAP_LEN = sizeof(uint32_t),
+    BDB_SEQNUM_WITH_CAP_LEN = BDB_SEQNUM_TYPE_LEN + BDB_SEQNUM_CAP_LEN
+};
 
 BB_COMPILE_TIME_ASSERT(bdb_seqnum_type,
                        sizeof(struct seqnum_t) == BDB_SEQNUM_TYPE_LEN);
@@ -621,6 +626,8 @@ typedef struct table_version_cache
 struct hostinfo
 {
     seqnum_type seqnum;
+    uint32_t capabilities;
+    uint64_t capabilities_time_ms;
     uint64_t last_downgrade_time;
     uint64_t master_lease;
     int coherent_state;

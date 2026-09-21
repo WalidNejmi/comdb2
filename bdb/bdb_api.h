@@ -1349,6 +1349,7 @@ void bdb_losemaster(bdb_state_type *bdb_state);
 void bdb_transfermaster_tonode(bdb_state_type *bdb_state, struct interned_string *tohost);
 struct hostinfo *retrieve_hostinfo(struct interned_string *h);
 struct hostinfo *retrieve_hostinfo_nocreate(struct interned_string *h);
+int bdb_cluster_supports_commit_flags(void *bdb_state);
 
 void bdb_exiting(bdb_state_type *bdb_state);
 

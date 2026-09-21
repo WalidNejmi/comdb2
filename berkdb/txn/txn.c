@@ -92,6 +92,7 @@ void ctrace(char *format, ...);
 
 int __txn_commit_map_add_nolock(DB_ENV *, u_int64_t, DB_LSN);
 int __txn_commit_map_enabled(void);
+int bdb_cluster_supports_commit_flags(void *);
 
 extern int gbl_is_physical_replicant;
 extern int gbl_fullrecovery;
@@ -1220,6 +1221,9 @@ __txn_commit_int(txnp, flags, ltranid, llid, last_commit_lsn, rlocks, inlks,
 	int sc_commit_flags_writer = gbl_sc_commit_flags_writer;
 
 	dbenv = txnp->mgrp->dbenv;
+	if (sc_commit_flags_writer && !sc_build_id_is_zero(&txnp->sc_build_id))
+		sc_commit_flags_writer =
+		    bdb_cluster_supports_commit_flags(dbenv->app_private);
 	commit_lsn_map = __txn_commit_map_enabled();
 
 	PANIC_CHECK(dbenv);

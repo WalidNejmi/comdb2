@@ -1134,6 +1134,10 @@ REGISTER_TUNABLE("sc_fence_publish_fail_after",
                  "TEST ONLY. Fail publication after this many in-memory fence installs.",
                  TUNABLE_INTEGER, &gbl_sc_fence_publish_fail_after,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+REGISTER_TUNABLE("sc_commit_flags_advertise",
+                 "TEST ONLY. Advertise support for schema-change commit flags.",
+                 TUNABLE_BOOLEAN, &gbl_sc_commit_flags_advertise,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 /* 'retrieve_gen_from_ckp' / 'recovery_ckp' disabled under legacy_defaults until db moves */
 REGISTER_TUNABLE("retrieve_gen_from_ckp", "Retrieve generation from ckp records.  (Default: on)", TUNABLE_BOOLEAN,
                  &gbl_retrieve_gen_from_ckp, 0, NULL, NULL, NULL, NULL);

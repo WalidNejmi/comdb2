@@ -29,6 +29,8 @@
 
 #include "bdb_api.h"
 #include "bdb_int.h"
+extern int gbl_sc_commit_flags_advertise;
+
 #include <net.h>
 #include <locks.h>
 #include <sys_wrap.h>
@@ -165,11 +167,15 @@ int do_ack(bdb_state_type *bdb_state, DB_LSN permlsn, uint32_t commit_gen, uint3
     if (permlsn.file == 0 || seqnum.lsn.file == 0)
         abort();
 
-    new_ack_info(info, BDB_SEQNUM_TYPE_LEN, bdb_state->repinfo->myhost);
+    new_ack_info(info, BDB_SEQNUM_WITH_CAP_LEN, bdb_state->repinfo->myhost);
 
     p_buf = ack_info_data(info);
-    p_buf_end = p_buf + BDB_SEQNUM_TYPE_LEN;
-    rep_berkdb_seqnum_type_put(&seqnum, p_buf, p_buf_end);
+    p_buf_end = p_buf + BDB_SEQNUM_WITH_CAP_LEN;
+    p_buf = rep_berkdb_seqnum_type_put(&seqnum, p_buf, p_buf_end);
+    uint32_t capabilities = gbl_sc_commit_flags_advertise
+                                ? BDB_CAP_TXN_COMMIT_FLAGS_V1
+                                : 0;
+    buf_put(&capabilities, sizeof(capabilities), p_buf, p_buf_end);
     master = bdb_state->repinfo->master_host;
 
     if (unlikely(bdb_state->rep_trace)) {
@@ -187,7 +193,8 @@ int do_ack(bdb_state_type *bdb_state, DB_LSN permlsn, uint32_t commit_gen, uint3
         rc = 0;
     } else {
         rc = net_send(bdb_state->repinfo->netinfo, master,
-                      USER_TYPE_BERKDB_NEWSEQ, p_buf, sizeof(seqnum), 1);
+                      USER_TYPE_BERKDB_NEWSEQ, ack_info_data(info),
+                      BDB_SEQNUM_WITH_CAP_LEN, 1);
     }
     return rc;
 }
@@ -725,7 +732,7 @@ int send_myseqnum_to_master_udp(bdb_state_type *bdb_state)
     uint8_t *p_buf;
     int rc = 0;
 
-    new_ack_info(info, BDB_SEQNUM_TYPE_LEN, bdb_state->repinfo->myhost);
+    new_ack_info(info, BDB_SEQNUM_WITH_CAP_LEN, bdb_state->repinfo->myhost);
     p_buf = ack_info_data(info);
 
     if (0 == (rc = get_myseqnum(bdb_state, p_buf))) {

@@ -165,6 +165,7 @@ extern int gbl_sc_commit_flags_writer;
 extern int gbl_sc_commit_flags_force_unsupported;
 extern int gbl_sc_fence_persist_fail_after;
 extern int gbl_sc_fence_publish_fail_after;
+extern int gbl_sc_commit_flags_advertise;
 extern int gbl_recovery_ckp;
 extern int gbl_reproduce_ckp_bug;
 extern int gbl_sample_queries;

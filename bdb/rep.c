@@ -385,6 +385,7 @@ int is_electable(bdb_state_type *bdb_state, int *out_num_up,
 extern int gbl_rep_node_pri;
 extern int gbl_handoff_node;
 extern int gbl_use_node_pri;
+int gbl_sc_commit_flags_advertise = 1;
 
 LISTC_T(struct hostinfo) hostinfo_list;
 static pthread_mutex_t hostinfo_lk = PTHREAD_MUTEX_INITIALIZER;
@@ -1864,6 +1865,10 @@ int net_hostdown_rtn(netinfo_type *netinfo_ptr, struct interned_string *host)
     print(bdb_state, "net_hostdown_rtn: called for %s\n", host->str);
 
     struct hostinfo *h = retrieve_hostinfo(host);
+    Pthread_mutex_lock(&bdb_state->seqnum_info->lock);
+    h->capabilities = 0;
+    h->capabilities_time_ms = 0;
+    Pthread_mutex_unlock(&bdb_state->seqnum_info->lock);
 
     /* if we're the master */
     if (master_host == bdb_state->repinfo->myhost) {
@@ -3700,8 +3705,12 @@ int get_myseqnum(bdb_state_type *bdb_state, uint8_t *p_net_seqnum)
     seqnum.lease_ms = bdb_state->attr->master_lease;
 
     p_buf = p_net_seqnum;
-    p_buf_end = p_net_seqnum + BDB_SEQNUM_TYPE_LEN;
-    rep_berkdb_seqnum_type_put(&seqnum, p_buf, p_buf_end);
+    p_buf_end = p_net_seqnum + BDB_SEQNUM_WITH_CAP_LEN;
+    p_buf = rep_berkdb_seqnum_type_put(&seqnum, p_buf, p_buf_end);
+    uint32_t capabilities = gbl_sc_commit_flags_advertise
+                                ? BDB_CAP_TXN_COMMIT_FLAGS_V1
+                                : 0;
+    buf_put(&capabilities, sizeof(capabilities), p_buf, p_buf_end);
 
     return rc;
 }
@@ -3718,14 +3727,14 @@ int request_copydelay(void *bdb_state_in)
 
 int send_myseqnum_to_master(bdb_state_type *bdb_state, int nodelay)
 {
-    uint8_t p_net_seqnum[BDB_SEQNUM_TYPE_LEN];
+    uint8_t p_net_seqnum[BDB_SEQNUM_WITH_CAP_LEN];
     int rc = 0;
 
     if (0 == (rc = get_myseqnum(bdb_state, p_net_seqnum))) {
         rc = net_send_nodrop(bdb_state->repinfo->netinfo,
                              bdb_state->repinfo->master_host,
                              USER_TYPE_BERKDB_NEWSEQ, &p_net_seqnum,
-                             sizeof(seqnum_type), nodelay);
+                             sizeof(p_net_seqnum), nodelay);
     } else {
         static time_t lastpr = 0;
         time_t now;
@@ -3744,17 +3753,65 @@ int send_myseqnum_to_master(bdb_state_type *bdb_state, int nodelay)
 
 void send_myseqnum_to_all(bdb_state_type *bdb_state, int nodelay)
 {
-    uint8_t seqnum[BDB_SEQNUM_TYPE_LEN];
+    uint8_t seqnum[BDB_SEQNUM_WITH_CAP_LEN];
     if (get_myseqnum(bdb_state, seqnum) != 0)
         return;
     void *data[] = {seqnum};
-    int sz[] = {BDB_SEQNUM_TYPE_LEN};
+    int sz[] = {BDB_SEQNUM_WITH_CAP_LEN};
     int type[] = {USER_TYPE_BERKDB_NEWSEQ};
     int flag[] = {nodelay | NET_SEND_NODROP};
     int rc = net_send_all(bdb_state->repinfo->netinfo, 1, data, sz, type, flag);
     if (rc) {
         logmsg(LOGMSG_ERROR, "0x%p %s:%d net_send rc=%d\n", (void *)pthread_self(), __func__, __LINE__, rc);
     }
+}
+
+int bdb_cluster_supports_commit_flags(void *bdb_state_in)
+{
+    enum { CAPABILITY_MAX_AGE_MS = 10000 };
+    bdb_state_type *bdb_state = bdb_state_in;
+    struct interned_string *sanctioned[REPMAX], *connected[REPMAX];
+    int i, j, nsanctioned, nconnected, found, capable = 1;
+    uint64_t now = gettimeofday_ms();
+
+    if (bdb_state == NULL)
+        return 0;
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+    if (!gbl_sc_commit_flags_advertise)
+        return 0;
+
+    nsanctioned = net_get_sanctioned_node_list_interned(
+        bdb_state->repinfo->netinfo, REPMAX, sanctioned);
+    nconnected = net_get_all_nodes_connected_interned(
+        bdb_state->repinfo->netinfo, connected);
+    if (nsanctioned > REPMAX)
+        return 0;
+
+    Pthread_mutex_lock(&bdb_state->seqnum_info->lock);
+    for (i = 0; capable && i < nsanctioned; i++) {
+        if (sanctioned[i] == bdb_state->repinfo->myhost_interned)
+            continue;
+        found = 0;
+        for (j = 0; j < nconnected; j++)
+            if (connected[j] == sanctioned[i]) {
+                found = 1;
+                break;
+            }
+        if (!found)
+            capable = 0;
+    }
+
+    for (i = 0; capable && i < nconnected; i++) {
+        struct hostinfo *h = retrieve_hostinfo_nocreate(connected[i]);
+        if (h == NULL ||
+            !(h->capabilities & BDB_CAP_TXN_COMMIT_FLAGS_V1) ||
+            h->capabilities_time_ms == 0 ||
+            now - h->capabilities_time_ms > CAPABILITY_MAX_AGE_MS)
+            capable = 0;
+    }
+    Pthread_mutex_unlock(&bdb_state->seqnum_info->lock);
+    return capable;
 }
 
 void bdb_exiting(bdb_state_type *bdb_state)
@@ -5340,6 +5397,14 @@ static int berkdb_receive_rtn_int(void *ack_handle, void *usr_ptr,
         p_buf_end = ((uint8_t *)dta + dtalen);
         p_buf = (uint8_t *)rep_berkdb_seqnum_type_get(&berkdb_seqnum, p_buf,
                                                       p_buf_end);
+
+        uint32_t capabilities = 0;
+        if (p_buf != NULL && p_buf_end - p_buf >= BDB_SEQNUM_CAP_LEN)
+            buf_get(&capabilities, sizeof(capabilities), p_buf, p_buf_end);
+        Pthread_mutex_lock(&bdb_state->seqnum_info->lock);
+        frominfo->capabilities = capabilities;
+        frominfo->capabilities_time_ms = gettimeofday_ms();
+        Pthread_mutex_unlock(&bdb_state->seqnum_info->lock);
 
         got_new_seqnum_from_node(bdb_state, &berkdb_seqnum, from_node, from_interned, is_tcp);
         break;

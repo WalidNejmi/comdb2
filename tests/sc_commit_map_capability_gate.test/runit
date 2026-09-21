@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+set -o pipefail
+
+dbnm=$1
+N=${SC_COMMIT_MAP_ROWS:-2000}
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+nodes=($(getclusternodes))
+(( ${#nodes[@]} > 1 )) || { echo "Skipped test: cluster required"; echo "Passed test"; exit 0; }
+for node in "${nodes[@]}"; do
+	[[ "$node" != "$master" ]] && incapable=$node && break
+done
+[[ -n "$incapable" ]] || { echo "FAIL: could not choose replica"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+counter() {
+	cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+		sed -n "s/.*$1: \([0-9][0-9]*\).*/\1/p" | head -1
+}
+
+run "create table t(i int)" >/dev/null
+run "insert into t select value from generate_series(1, $N)" >/dev/null
+
+cdb2sql --tabs ${CDB2_OPTIONS} --host "$incapable" "$dbnm" \
+	"put tunable 'sc_commit_flags_advertise' 0" >/dev/null ||
+	fail "could not suppress capability on $incapable"
+sleep 3
+
+marked0=$(counter "SC direct-copy txns marked")
+matched0=$(counter "SC direct-copy txns matched")
+emitted0=$(counter "SC flags emitted (master)")
+skipped0=$(counter "SC commit-map entries skipped")
+run "rebuild t" >/dev/null || fail "gated rebuild failed"
+marked1=$(counter "SC direct-copy txns marked")
+matched1=$(counter "SC direct-copy txns matched")
+emitted1=$(counter "SC flags emitted (master)")
+skipped1=$(counter "SC commit-map entries skipped")
+
+(( marked1 - marked0 >= N )) || fail "converter was not marked while gate closed"
+(( matched1 - matched0 >= N )) || fail "private writes were not matched while gate closed"
+(( emitted1 == emitted0 )) || fail "gate emitted flags to incapable peer"
+(( skipped1 == skipped0 )) || fail "master skipped entries while WAL used legacy records"
+
+cdb2sql --tabs ${CDB2_OPTIONS} --host "$incapable" "$dbnm" \
+	"put tunable 'sc_commit_flags_advertise' 1" >/dev/null ||
+	fail "could not restore capability on $incapable"
+sleep 3
+
+run "rebuild t" >/dev/null || fail "capable rebuild failed"
+emitted2=$(counter "SC flags emitted (master)")
+skipped2=$(counter "SC commit-map entries skipped")
+(( emitted2 - emitted1 >= N )) || fail "writer stayed gated after all peers became capable"
+(( skipped2 - skipped1 >= N )) || fail "master did not honor emitted skip flags"
+[[ "$(run 'select count(*) from t')" == "$N" ]] || fail "table contents changed"
+
+echo "SC_CAPABILITY_GATE: incapable=$incapable gated_emitted=$((emitted1-emitted0))" \
+	"enabled_emitted=$((emitted2-emitted1)) enabled_skipped=$((skipped2-skipped1))"
+echo "Passed test"
