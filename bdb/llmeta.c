@@ -23,6 +23,7 @@
 #include "bdb_int.h"
 #include "endian_core.h"
 #include "locks.h"
+#include "sc_publication_fence_codec.h"
 #include "genid.h"
 #include <fsnapf.h>
 #include <cdb2_constants.h>
@@ -11635,13 +11636,6 @@ struct llmeta_sc_publication_fence_key {
     uint8_t fileid[DB_FILE_ID_LEN];
 };
 
-struct llmeta_sc_publication_fence_data_v1 {
-    int version;
-    int lsn_file;
-    int lsn_offset;
-    uint64_t build_id;
-};
-
 struct llmeta_sc_publication_fence_data {
     int version;
     int lsn_file;
@@ -11650,10 +11644,9 @@ struct llmeta_sc_publication_fence_data {
 };
 
 enum {
-    LLMETA_SC_PUBLICATION_FENCE_KEY_LEN = 4 + DB_FILE_ID_LEN,
-    LLMETA_SC_PUBLICATION_FENCE_DATA_V1_LEN = 4 + 4 + 4 + 8,
-    LLMETA_SC_PUBLICATION_FENCE_DATA_LEN = 4 + 4 + 4 + SC_BUILD_ID_LEN,
-    LLMETA_SC_PUBLICATION_FENCE_VERSION = 2
+    LLMETA_SC_PUBLICATION_FENCE_KEY_LEN = SC_PUBLICATION_FENCE_KEY_LEN,
+    LLMETA_SC_PUBLICATION_FENCE_DATA_LEN = SC_PUBLICATION_FENCE_DATA_LEN,
+    LLMETA_SC_PUBLICATION_FENCE_VERSION = SC_PUBLICATION_FENCE_VERSION
 };
 
 static uint8_t *
@@ -11680,22 +11673,6 @@ llmeta_sc_publication_fence_data_put(const struct llmeta_sc_publication_fence_da
     p_buf = buf_put(&(p_data->lsn_file), sizeof(p_data->lsn_file), p_buf, p_buf_end);
     p_buf = buf_put(&(p_data->lsn_offset), sizeof(p_data->lsn_offset), p_buf, p_buf_end);
     p_buf = buf_no_net_put(p_data->build_id.bytes,
-                           sizeof(p_data->build_id.bytes), p_buf, p_buf_end);
-
-    return p_buf;
-}
-
-static const uint8_t *
-llmeta_sc_publication_fence_data_get(struct llmeta_sc_publication_fence_data *p_data, const uint8_t *p_buf,
-                                     const uint8_t *p_buf_end)
-{
-    if (p_buf_end < p_buf || (p_buf_end - p_buf) < LLMETA_SC_PUBLICATION_FENCE_DATA_LEN)
-        return NULL;
-
-    p_buf = buf_get(&(p_data->version), sizeof(p_data->version), p_buf, p_buf_end);
-    p_buf = buf_get(&(p_data->lsn_file), sizeof(p_data->lsn_file), p_buf, p_buf_end);
-    p_buf = buf_get(&(p_data->lsn_offset), sizeof(p_data->lsn_offset), p_buf, p_buf_end);
-    p_buf = buf_no_net_get(p_data->build_id.bytes,
                            sizeof(p_data->build_id.bytes), p_buf, p_buf_end);
 
     return p_buf;
@@ -11783,60 +11760,8 @@ struct sc_publication_fence_load {
 static int load_one_sc_publication_fence(void *k, void *v, int vlen,
                                          void *data)
 {
-    const uint8_t *key = k;
-    struct llmeta_sc_publication_fence_data d;
     struct sc_publication_fence_load *load = data;
     SC_PUBLICATION_FENCE_RECORD *record, *records;
-    int i;
-
-    if (vlen == LLMETA_SC_PUBLICATION_FENCE_DATA_V1_LEN) {
-        struct llmeta_sc_publication_fence_data_v1 old;
-        const uint8_t *p = v, *end = p + vlen;
-
-        p = buf_get(&old.version, sizeof(old.version), p, end);
-        p = buf_get(&old.lsn_file, sizeof(old.lsn_file), p, end);
-        p = buf_get(&old.lsn_offset, sizeof(old.lsn_offset), p, end);
-        p = buf_get(&old.build_id, sizeof(old.build_id), p, end);
-        if (p == NULL || old.version != 1 || old.lsn_file <= 0 ||
-            old.lsn_offset < 0 || old.build_id == 0) {
-            logmsg(LOGMSG_ERROR, "%s: invalid v1 publication-fence record\n",
-                   __func__);
-            return -1;
-        }
-        d.version = old.version;
-        d.lsn_file = old.lsn_file;
-        d.lsn_offset = old.lsn_offset;
-        memset(&d.build_id, 0xff, sizeof(d.build_id));
-        memcpy(d.build_id.bytes, &old.build_id, sizeof(old.build_id));
-    } else if (vlen != LLMETA_SC_PUBLICATION_FENCE_DATA_LEN ||
-               llmeta_sc_publication_fence_data_get(
-                   &d, v, (const uint8_t *)v + vlen) == NULL) {
-        logmsg(LOGMSG_ERROR,
-               "%s: invalid publication-fence value length %d\n", __func__,
-               vlen);
-        return -1;
-    }
-
-    if (d.version != 1 && d.version != LLMETA_SC_PUBLICATION_FENCE_VERSION) {
-        logmsg(LOGMSG_ERROR, "%s: unknown publication-fence version %d\n", __func__, d.version);
-        return -1;
-    }
-
-    if (d.lsn_file <= 0 || d.lsn_offset < 0 ||
-        sc_build_id_is_zero(&d.build_id)) {
-        logmsg(LOGMSG_ERROR, "%s: invalid publication-fence contents\n",
-               __func__);
-        return -1;
-    }
-
-    for (i = 0; i < DB_FILE_ID_LEN; i++)
-        if (key[4 + i] != 0)
-            break;
-    if (i == DB_FILE_ID_LEN) {
-        logmsg(LOGMSG_ERROR, "%s: zero publication-fence file id\n",
-               __func__);
-        return -1;
-    }
 
     if (load->count == load->capacity) {
         int capacity = load->capacity == 0 ? 16 : load->capacity * 2;
@@ -11849,10 +11774,13 @@ static int load_one_sc_publication_fence(void *k, void *v, int vlen,
     }
 
     record = &load->records[load->count++];
-    memcpy(record->fileid, key + 4, DB_FILE_ID_LEN);
-    record->build_id = d.build_id;
-    record->fence_lsn.file = (unsigned int)d.lsn_file;
-    record->fence_lsn.offset = (unsigned int)d.lsn_offset;
+    if (sc_publication_fence_decode(k, SC_PUBLICATION_FENCE_KEY_LEN, v,
+                                    (size_t)vlen, record) != 0) {
+        load->count--;
+        logmsg(LOGMSG_ERROR, "%s: invalid publication-fence record\n",
+               __func__);
+        return -1;
+    }
 
     return 0;
 }

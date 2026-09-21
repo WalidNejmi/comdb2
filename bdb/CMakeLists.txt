@@ -51,6 +51,7 @@ add_library(bdb
   rep_qstat.c
   rowlocks.c
   rowlocks_util.c
+  sc_publication_fence_codec.c
   serializable.c
   signallogfill.c
   summarize.c

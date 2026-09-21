@@ -145,6 +145,20 @@ add_exe(txn_commit_flags_roundtrip
   txn_commit_flags_roundtrip_stubs.c
   ${PROJECT_SOURCE_DIR}/berkdb/txn/txn_auto.c
 )
+
+add_exe(sc_publication_fence_codec_test
+  sc_publication_fence_codec_test.c
+  ${PROJECT_SOURCE_DIR}/bdb/sc_publication_fence_codec.c
+)
+target_include_directories(sc_publication_fence_codec_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/bdb
+  ${PROJECT_SOURCE_DIR}/berkdb
+  ${PROJECT_SOURCE_DIR}/berkdb/build
+  ${PROJECT_BINARY_DIR}/berkdb
+  ${PROJECT_SOURCE_DIR}/dlmalloc
+  ${PROJECT_SOURCE_DIR}/mem
+  ${PROJECT_BINARY_DIR}/mem
+)
 target_include_directories(txn_commit_flags_roundtrip PRIVATE
   ${PROJECT_SOURCE_DIR}/berkdb/build
   ${PROJECT_SOURCE_DIR}/berkdb
