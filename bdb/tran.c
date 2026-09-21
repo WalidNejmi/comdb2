@@ -67,6 +67,7 @@ static unsigned int curtran_counter = 0;
 int gbl_flush_on_prepare = 1;
 int gbl_wait_for_prepare_seqnum = 1;
 int gbl_debug_sleep_before_prepare = 0;
+int gbl_sc_fence_persist_fail_after = INT_MAX;
 extern int gbl_debug_txn_sleep;
 extern int gbl_debug_disttxn_trace;
 extern int __txn_getpriority(DB_TXN *txnp, int *priority);
@@ -96,16 +97,22 @@ void bdb_tran_set_is_sc_rebuild(tran_type *tran, int is_sc_rebuild)
  * Schema-change replacement-file tracking; see berkdb/txn/txn_sc_skip.c.
  * Declared here because bdb/ does not include dbinc/.
  */
-void __txn_set_sc_build(DB_TXN *, uint64_t);
-int __sc_private_file_register(DB_ENV *, const uint8_t *, uint64_t);
-int __sc_private_file_unregister_build(DB_ENV *, uint64_t);
+void __txn_set_sc_build(DB_TXN *, const sc_build_id_t *);
+int __sc_private_file_register(DB_ENV *, const uint8_t *,
+                               const sc_build_id_t *);
+int __sc_private_file_unregister_build(DB_ENV *, const sc_build_id_t *);
 void __sc_private_registry_note_failure(DB_ENV *);
-int __sc_publication_fence_pend(DB_ENV *, const uint8_t *, uint64_t);
-int __sc_publication_fence_publish(DB_ENV *, uint64_t, DB_LSN);
-int __sc_publication_fence_discard_build(DB_ENV *, uint64_t);
-int __sc_publication_fence_install(DB_ENV *, const uint8_t *, uint64_t, DB_LSN);
-int __sc_publication_fence_list_build(DB_ENV *, uint64_t, uint8_t *, int,
-                                      int *);
+int __sc_publication_fence_pend(DB_ENV *, const uint8_t *,
+                                const sc_build_id_t *);
+int __sc_publication_fence_publish(DB_ENV *, const sc_build_id_t *, DB_LSN,
+                                   int);
+int __sc_publication_fence_discard_build(DB_ENV *, const sc_build_id_t *);
+int __sc_publication_fence_install(DB_ENV *, const uint8_t *,
+                                   const sc_build_id_t *, DB_LSN);
+int __sc_publication_fence_reconcile(DB_ENV *,
+                                     const SC_PUBLICATION_FENCE_RECORD *, int);
+int __sc_publication_fence_list_build(DB_ENV *, const sc_build_id_t *,
+                                      uint8_t *, int, int *);
 
 /*
  * Mark a base schema-change converter transaction with its build id.
@@ -114,9 +121,9 @@ int __sc_publication_fence_list_build(DB_ENV *, uint64_t, uint8_t *, int,
  * serves logical redo and other schema-change work, and only the base
  * converter knows why its transaction exists.
  */
-void bdb_tran_set_sc_build(tran_type *tran, uint64_t build_id)
+void bdb_tran_set_sc_build(tran_type *tran, const sc_build_id_t *build_id)
 {
-    if (tran == NULL || tran->tid == NULL || build_id == 0)
+    if (tran == NULL || tran->tid == NULL || sc_build_id_is_zero(build_id))
         return;
 
     __txn_set_sc_build(tran->tid, build_id);
@@ -134,13 +141,18 @@ void bdb_tran_set_sc_build(tran_type *tran, uint64_t build_id)
  * and ix_rebuilt[i] covers dbp_ix[i]; pass NULL for either to mean "all
  * rebuilt".
  */
-int bdb_sc_private_register_files(bdb_state_type *bdb_state, uint64_t build_id,
+int bdb_sc_private_register_files(bdb_state_type *bdb_state,
+                                  const sc_build_id_t *build_id,
                                   int dta_rebuilt, const int *blob_rebuilt,
-                                  int nblobs, const int *ix_rebuilt, int nix)
+                                  int nblobs, const int *ix_rebuilt, int nix,
+                                  int *nregistered)
 {
-    int dtanum, stripe, ixnum, nstripes;
+    int count = 0, dtanum, stripe, ixnum, nstripes;
 
-    if (bdb_state == NULL || build_id == 0)
+    if (nregistered != NULL)
+        *nregistered = 0;
+
+    if (bdb_state == NULL || sc_build_id_is_zero(build_id))
         return -1;
 
     for (dtanum = 0; dtanum < bdb_state->numdtafiles; dtanum++) {
@@ -179,6 +191,7 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state, uint64_t build_id,
             if (__sc_publication_fence_pend(bdb_state->dbenv, dbp->fileid,
                                             build_id) != 0)
                 goto fail;
+            ++count;
         }
     }
 
@@ -199,8 +212,11 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state, uint64_t build_id,
         if (__sc_publication_fence_pend(bdb_state->dbenv, dbp->fileid,
                                         build_id) != 0)
             goto fail;
+        ++count;
     }
 
+    if (nregistered != NULL)
+        *nregistered = count;
     return 0;
 
 fail:
@@ -210,18 +226,18 @@ fail:
      * never a reason to fail a schema change.
      */
     logmsg(LOGMSG_WARN,
-           "%s: could not register replacement files for build 0x%" PRIx64
-           "; commit-map skip disabled for this build\n",
-           __func__, build_id);
+            "%s: could not register replacement files; commit-map skip "
+            "disabled for this build\n",
+            __func__);
     __sc_private_file_unregister_build(bdb_state->dbenv, build_id);
     __sc_private_registry_note_failure(bdb_state->dbenv);
     return -1;
 }
 
 int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
-                                    uint64_t build_id)
+                                    const sc_build_id_t *build_id)
 {
-    if (bdb_state == NULL || build_id == 0)
+    if (bdb_state == NULL || sc_build_id_is_zero(build_id))
         return 0;
 
     return __sc_private_file_unregister_build(bdb_state->dbenv, build_id);
@@ -236,12 +252,14 @@ int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
  * are switched and inside the publication transaction.
  */
 int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
-                                     uint64_t build_id, unsigned int fence_file,
-                                     unsigned int fence_offset)
+                                     const sc_build_id_t *build_id,
+                                     unsigned int fence_file,
+                                     unsigned int fence_offset,
+                                     int expected_count)
 {
     DB_LSN fence;
 
-    if (bdb_state == NULL || build_id == 0 || fence_file == 0)
+    if (bdb_state == NULL || sc_build_id_is_zero(build_id) || fence_file == 0)
         return -1;
 
     if (bdb_state->parent)
@@ -250,7 +268,8 @@ int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
     fence.file = fence_file;
     fence.offset = fence_offset;
 
-    return __sc_publication_fence_publish(bdb_state->dbenv, build_id, fence);
+    return __sc_publication_fence_publish(bdb_state->dbenv, build_id, fence,
+                                          expected_count);
 }
 
 /*
@@ -260,7 +279,8 @@ int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
  * restart, recovery or promotion rather than inheriting anything.
  */
 int bdb_sc_publication_fence_install(bdb_state_type *bdb_state,
-                                     const uint8_t *fileid, uint64_t build_id,
+                                     const uint8_t *fileid,
+                                     const sc_build_id_t *build_id,
                                      unsigned int fence_file,
                                      unsigned int fence_offset)
 {
@@ -277,6 +297,21 @@ int bdb_sc_publication_fence_install(bdb_state_type *bdb_state,
 
     return __sc_publication_fence_install(bdb_state->dbenv, fileid, build_id,
                                           fence);
+}
+
+int bdb_sc_publication_fence_reconcile(
+    bdb_state_type *bdb_state, const SC_PUBLICATION_FENCE_RECORD *records,
+    int nrecords)
+{
+    if (bdb_state == NULL || nrecords < 0 ||
+        (nrecords > 0 && records == NULL))
+        return -1;
+
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    return __sc_publication_fence_reconcile(bdb_state->dbenv, records,
+                                             nrecords);
 }
 
 /*
@@ -319,41 +354,65 @@ int bdb_get_log_end_lsn(bdb_state_type *bdb_state, unsigned int *file,
  * reconstruction has no stopping proof for them.
  */
 int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
-                                     uint64_t build_id, unsigned int fence_file,
-                                     unsigned int fence_offset)
+                                     const sc_build_id_t *build_id,
+                                     unsigned int fence_file,
+                                     unsigned int fence_offset,
+                                     int expected_count)
 {
-    /* A table's data stripes, indexes and blob files; generous. */
-    enum { MAX_BUILD_FILES = 256 };
-    uint8_t fileids[MAX_BUILD_FILES * DB_FILE_ID_LEN];
+    uint8_t *fileids = NULL;
     int nfiles = 0, i, rc, bdberr = 0;
 
-    if (bdb_state == NULL || tran == NULL || build_id == 0 || fence_file == 0)
+    if (bdb_state == NULL || tran == NULL || sc_build_id_is_zero(build_id) ||
+        fence_file == 0 ||
+        expected_count <= 0)
         return -1;
 
     if (bdb_state->parent)
         bdb_state = bdb_state->parent;
 
-    rc = __sc_publication_fence_list_build(bdb_state->dbenv, build_id, fileids,
-                                           MAX_BUILD_FILES, &nfiles);
-    if (rc != 0) {
+    rc = __sc_publication_fence_list_build(bdb_state->dbenv, build_id, NULL, 0,
+                                           &nfiles);
+    if (rc != 0 || nfiles != expected_count) {
         logmsg(LOGMSG_ERROR,
-               "%s: could not list fences for build 0x%" PRIx64 " rc %d\n",
-               __func__, build_id, rc);
+             "%s: incomplete fence set: expected %d, found %d, rc %d\n",
+             __func__, expected_count, nfiles, rc);
+        return -1;
+    }
+
+    fileids = malloc((size_t)nfiles * DB_FILE_ID_LEN);
+    if (fileids == NULL)
+        return -1;
+
+    rc = __sc_publication_fence_list_build(bdb_state->dbenv, build_id, fileids,
+                                           nfiles, &nfiles);
+    if (rc != 0 || nfiles != expected_count) {
+        logmsg(LOGMSG_ERROR,
+             "%s: fence set changed: expected %d, found %d, rc %d\n",
+             __func__, expected_count, nfiles, rc);
+        free(fileids);
         return -1;
     }
 
     for (i = 0; i < nfiles; i++) {
+        if (i == gbl_sc_fence_persist_fail_after) {
+            logmsg(LOGMSG_ERROR,
+                   "%s: injected failure after %d durable fence writes\n",
+                   __func__, i);
+            free(fileids);
+            return -1;
+        }
         rc = bdb_set_sc_publication_fence(tran, fileids + (size_t)i * DB_FILE_ID_LEN, fence_file, fence_offset,
                                           build_id, &bdberr);
         if (rc != 0) {
             logmsg(LOGMSG_ERROR,
-                   "%s: failed to persist fence %d/%d for build 0x%" PRIx64
-                   " rc %d bdberr %d\n",
-                   __func__, i + 1, nfiles, build_id, rc, bdberr);
+                     "%s: failed to persist fence %d/%d rc %d bdberr %d\n",
+                     __func__, i + 1, nfiles, rc, bdberr);
+            free(fileids);
             return -1;
         }
     }
 
+    free(fileids);
     return 0;
 }
 
@@ -361,9 +420,9 @@ int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
  * Drop the pending fences of a build that will not publish.  Idempotent.
  */
 int bdb_sc_publication_fence_discard(bdb_state_type *bdb_state,
-                                     uint64_t build_id)
+                                     const sc_build_id_t *build_id)
 {
-    if (bdb_state == NULL || build_id == 0)
+    if (bdb_state == NULL || sc_build_id_is_zero(build_id))
         return 0;
 
     if (bdb_state->parent)

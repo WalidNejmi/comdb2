@@ -26,6 +26,8 @@ extern char *optostr(int op);
 extern int __txn_commit_map_get(DB_ENV *, u_int64_t, DB_LSN *);
 
 extern int __sc_publication_fence_get(DB_ENV *, const u_int8_t *, DB_LSN *);
+extern u_int64_t __sc_publication_fence_epoch(DB_ENV *);
+extern void __sc_publication_fence_note_epoch_retry(DB_ENV *);
 extern void __sc_publication_fence_note(DB_ENV *, int);
 
 /*
@@ -247,7 +249,10 @@ int __mempv_fget(mpf, dbp, pgno, target_lsn, highest_checkpoint_lsn, ret_page, f
 	DB_ENV *dbenv;
 	BH *bhp;
 	void *data_t;
+	u_int64_t fence_epoch;
 
+	dbenv = mpf->dbenv;
+retry:
 	ret = found = add_to_cache = 0;
 	logc = NULL;
 	page = page_image = NULL;
@@ -256,7 +261,7 @@ int __mempv_fget(mpf, dbp, pgno, target_lsn, highest_checkpoint_lsn, ret_page, f
 	*(void **)ret_page = NULL;
 	DBT dbt = {0};
 	dbt.flags = DB_DBT_REALLOC;
-	dbenv = mpf->dbenv;
+	fence_epoch = __sc_publication_fence_epoch(dbenv);
 	mempv_debug = dbenv->attr.mempv_debug;
 	Pthread_mutex_lock(&dbenv->txmap->txmap_mutexp);
 	smallest_logfile = dbenv->txmap->smallest_logfile;
@@ -398,6 +403,21 @@ found_page:
 	*(void **)ret_page = (void *) page_image;
 
 	if (add_to_cache == 1) {
+	   if (__sc_publication_fence_epoch(dbenv) != fence_epoch) {
+		__sc_publication_fence_note_epoch_retry(dbenv);
+		if (logc != NULL) {
+			__log_c_close(logc);
+			logc = NULL;
+		}
+		if (dbt.data != NULL) {
+			__os_free(dbenv, dbt.data);
+			dbt.data = NULL;
+		}
+		__os_free(dbenv, bhp);
+		bhp = NULL;
+		*(void **)ret_page = NULL;
+		goto retry;
+	   }
 	   __mempv_cache_put(dbp, &dbenv->mempv->cache, mpf->fileid, pgno, bhp, target_lsn);
 	}
 err:

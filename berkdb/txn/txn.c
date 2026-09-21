@@ -1123,6 +1123,10 @@ __txn_sc_commit_flags(txnp)
 	/* Not a direct-copy transaction at all: silent, not a near-miss. */
 	if (!txnp->sc_skip_commit_map)
 		return (0);
+	if (txnp->sc_unsafe_public_write) {
+		__sc_commit_flags_note(SC_OBS_UNSUP_UNKNOWN_FAMILY, 0);
+		return (0);
+	}
 
 	/* Children are never skippable; only the root carries the decision. */
 	if (txnp->parent != NULL)

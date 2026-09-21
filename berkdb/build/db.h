@@ -32,6 +32,7 @@
 #include <mem_berkdb.h>
 #include <sys/time.h>
 #include <comdb2buf.h>
+#include <sc_build_id.h>
 #include <sys_wrap.h>
 
 #ifndef COMDB2AR
@@ -1136,15 +1137,15 @@ struct __db_txn {
 	 * transaction writes a physical file registered to that same build,
 	 * and means: do not add this transaction to the commit-LSN map.
 	 *
-	 * The bit is monotonic.  A later write to anything else -- llmeta,
-	 * schema-change progress, an unregistered file -- deliberately does
-	 * NOT clear it.
+	 * Internal metadata writes are allowed.  A write to any unregistered
+	 * user-table file sets sc_unsafe_public_write and disqualifies the skip.
 	 *
 	 * Zero for both preserves existing behaviour, which is what a freshly
 	 * allocated (zeroed) transaction gets.
 	 */
-	u_int64_t sc_build_id;
+	sc_build_id_t sc_build_id;
 	u_int8_t sc_skip_commit_map;
+	u_int8_t sc_unsafe_public_write;
 };
 
 typedef enum {
@@ -1628,6 +1629,7 @@ struct __db {
 	u_int8_t fileid[DB_FILE_ID_LEN];/* File's unique ID for locking. */
 	u_int8_t close_fileid[DB_FILE_ID_LEN]; /* File's unique ID for closing, if db_refresh is called. */
 	int use_close_fileid; /* 1 if db_close should use close_fileid */
+	u_int8_t sc_is_user_file;
 
 	u_int32_t adj_fileid;		/* File's unique ID for curs. adj. */
 
@@ -2996,7 +2998,7 @@ struct __txn_commit_map {
  */
 struct __sc_private_file {
 	u_int8_t fileid[DB_FILE_ID_LEN];
-	u_int64_t build_id;
+	sc_build_id_t build_id;
 };
 
 struct __sc_private_file_registry {
@@ -3028,12 +3030,20 @@ struct __sc_private_file_registry {
 struct __sc_publication_fence {
 	u_int8_t fileid[DB_FILE_ID_LEN];
 	DB_LSN fence_lsn;
-	u_int64_t build_id;
+	sc_build_id_t build_id;
 };
+
+struct __sc_publication_fence_record {
+	u_int8_t fileid[DB_FILE_ID_LEN];
+	DB_LSN fence_lsn;
+	sc_build_id_t build_id;
+};
+typedef struct __sc_publication_fence_record SC_PUBLICATION_FENCE_RECORD;
 
 struct __sc_publication_fence_registry {
 	pthread_mutex_t lk;
 	hash_t *files;
+	u_int64_t epoch;
 
 	u_int64_t stops;
 	u_int64_t lookup_hits;
@@ -3046,6 +3056,7 @@ struct __sc_publication_fence_registry {
 	 * reconstructed before the fence arrived may have been unwound too far.
 	 */
 	u_int64_t cached_pages_dropped;
+	u_int64_t epoch_retries;
 };
 
 struct __mempv_cache_page_key

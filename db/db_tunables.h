@@ -1126,6 +1126,14 @@ REGISTER_TUNABLE("sc_commit_flags_force_unsupported",
                  "history.  Used to exercise the fail-closed path.  (Default: off)",
                  TUNABLE_BOOLEAN, &gbl_sc_commit_flags_force_unsupported,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+REGISTER_TUNABLE("sc_fence_persist_fail_after",
+                 "TEST ONLY. Fail publication after this many durable fence writes.",
+                 TUNABLE_INTEGER, &gbl_sc_fence_persist_fail_after,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+REGISTER_TUNABLE("sc_fence_publish_fail_after",
+                 "TEST ONLY. Fail publication after this many in-memory fence installs.",
+                 TUNABLE_INTEGER, &gbl_sc_fence_publish_fail_after,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 /* 'retrieve_gen_from_ckp' / 'recovery_ckp' disabled under legacy_defaults until db moves */
 REGISTER_TUNABLE("retrieve_gen_from_ckp", "Retrieve generation from ckp records.  (Default: on)", TUNABLE_BOOLEAN,
                  &gbl_retrieve_gen_from_ckp, 0, NULL, NULL, NULL, NULL);

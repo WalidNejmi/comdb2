@@ -216,6 +216,9 @@ static int kv_del_by_value(tran_type *tran, void *k, size_t klen, void *v, size_
 static int kv_del(tran_type *tran, void *k, int *bdberr);
 typedef int kv_for_each_cb(void *k, void *v, void *data);
 static int kv_for_each_pair(tran_type *t, void *sk, size_t sklen, kv_for_each_cb *cb, void *data);
+typedef int kv_for_each_len_cb(void *k, void *v, int vlen, void *data);
+static int kv_for_each_pair_len(tran_type *t, void *sk, size_t sklen,
+                                kv_for_each_len_cb *cb, void *data);
 
 static uint8_t *
 llmeta_file_type_key_put(const struct llmeta_file_type_key *p_file_type_key,
@@ -10030,6 +10033,32 @@ static int kv_for_each_pair(tran_type *t, void *sk, size_t sklen, kv_for_each_cb
     return rc;
 }
 
+static int kv_for_each_pair_len(tran_type *t, void *sk, size_t sklen,
+                                kv_for_each_len_cb *cb, void *data)
+{
+    int fnd, bdberr, vlen;
+    uint8_t key[LLMETA_IXLEN], next[LLMETA_IXLEN];
+    void *value;
+
+    int rc = bdb_lite_fetch_partial_tran(llmeta_bdb_state, t, sk, sklen, key, &fnd, &bdberr);
+    while (rc == 0 && fnd == 1) {
+        if (memcmp(sk, key, sklen) != 0)
+            break;
+
+        rc = bdb_lite_exact_var_fetch_tran(llmeta_bdb_state, t, key, &value, &vlen, &bdberr);
+        if (rc || bdberr != BDBERR_NOERROR)
+            break;
+        rc = cb(key, value, vlen, data);
+        free(value);
+        if (rc)
+            break;
+        rc = bdb_lite_fetch_keys_fwd_tran(llmeta_bdb_state, t, key, next, 1, &fnd, &bdberr);
+        memcpy(key, next, sizeof(key));
+    }
+
+    return rc;
+}
+
 static int kv_del(tran_type *tran, void *k, int *bdberr)
 {
     return bdb_lite_exact_del(llmeta_bdb_state, tran, k, bdberr);
@@ -11606,17 +11635,25 @@ struct llmeta_sc_publication_fence_key {
     uint8_t fileid[DB_FILE_ID_LEN];
 };
 
-struct llmeta_sc_publication_fence_data {
+struct llmeta_sc_publication_fence_data_v1 {
     int version;
     int lsn_file;
     int lsn_offset;
     uint64_t build_id;
 };
 
+struct llmeta_sc_publication_fence_data {
+    int version;
+    int lsn_file;
+    int lsn_offset;
+    sc_build_id_t build_id;
+};
+
 enum {
     LLMETA_SC_PUBLICATION_FENCE_KEY_LEN = 4 + DB_FILE_ID_LEN,
-    LLMETA_SC_PUBLICATION_FENCE_DATA_LEN = 4 + 4 + 4 + 8,
-    LLMETA_SC_PUBLICATION_FENCE_VERSION = 1
+    LLMETA_SC_PUBLICATION_FENCE_DATA_V1_LEN = 4 + 4 + 4 + 8,
+    LLMETA_SC_PUBLICATION_FENCE_DATA_LEN = 4 + 4 + 4 + SC_BUILD_ID_LEN,
+    LLMETA_SC_PUBLICATION_FENCE_VERSION = 2
 };
 
 static uint8_t *
@@ -11642,7 +11679,8 @@ llmeta_sc_publication_fence_data_put(const struct llmeta_sc_publication_fence_da
     p_buf = buf_put(&(p_data->version), sizeof(p_data->version), p_buf, p_buf_end);
     p_buf = buf_put(&(p_data->lsn_file), sizeof(p_data->lsn_file), p_buf, p_buf_end);
     p_buf = buf_put(&(p_data->lsn_offset), sizeof(p_data->lsn_offset), p_buf, p_buf_end);
-    p_buf = buf_put(&(p_data->build_id), sizeof(p_data->build_id), p_buf, p_buf_end);
+    p_buf = buf_no_net_put(p_data->build_id.bytes,
+                           sizeof(p_data->build_id.bytes), p_buf, p_buf_end);
 
     return p_buf;
 }
@@ -11657,7 +11695,8 @@ llmeta_sc_publication_fence_data_get(struct llmeta_sc_publication_fence_data *p_
     p_buf = buf_get(&(p_data->version), sizeof(p_data->version), p_buf, p_buf_end);
     p_buf = buf_get(&(p_data->lsn_file), sizeof(p_data->lsn_file), p_buf, p_buf_end);
     p_buf = buf_get(&(p_data->lsn_offset), sizeof(p_data->lsn_offset), p_buf, p_buf_end);
-    p_buf = buf_get(&(p_data->build_id), sizeof(p_data->build_id), p_buf, p_buf_end);
+    p_buf = buf_no_net_get(p_data->build_id.bytes,
+                           sizeof(p_data->build_id.bytes), p_buf, p_buf_end);
 
     return p_buf;
 }
@@ -11683,7 +11722,8 @@ static int llmeta_sc_publication_fence_key(const uint8_t *fileid, char *key)
  * commit-map behaviour.
  */
 int bdb_set_sc_publication_fence(tran_type *tran, const uint8_t *fileid, unsigned int lsn_file,
-                                 unsigned int lsn_offset, uint64_t build_id, int *bdberr)
+                                 unsigned int lsn_offset,
+                                 const sc_build_id_t *build_id, int *bdberr)
 {
     char key[LLMETA_IXLEN];
     uint8_t data[LLMETA_SC_PUBLICATION_FENCE_DATA_LEN];
@@ -11691,7 +11731,7 @@ int bdb_set_sc_publication_fence(tran_type *tran, const uint8_t *fileid, unsigne
 
     *bdberr = BDBERR_NOERROR;
 
-    if (fileid == NULL || lsn_file == 0)
+    if (fileid == NULL || lsn_file == 0 || sc_build_id_is_zero(build_id))
         return -1;
 
     if (llmeta_sc_publication_fence_key(fileid, key) != 0) {
@@ -11702,7 +11742,7 @@ int bdb_set_sc_publication_fence(tran_type *tran, const uint8_t *fileid, unsigne
     d.version = LLMETA_SC_PUBLICATION_FENCE_VERSION;
     d.lsn_file = (int)lsn_file;
     d.lsn_offset = (int)lsn_offset;
-    d.build_id = build_id;
+    d.build_id = *build_id;
 
     if (llmeta_sc_publication_fence_data_put(&d, data, data + sizeof(data)) == NULL) {
         *bdberr = BDBERR_BADARGS;
@@ -11734,26 +11774,85 @@ int bdb_del_sc_publication_fence(tran_type *tran, const uint8_t *fileid, int *bd
     return rc;
 }
 
-static int load_one_sc_publication_fence(void *k, void *v, void *data)
+struct sc_publication_fence_load {
+    SC_PUBLICATION_FENCE_RECORD *records;
+    int count;
+    int capacity;
+};
+
+static int load_one_sc_publication_fence(void *k, void *v, int vlen,
+                                         void *data)
 {
     const uint8_t *key = k;
     struct llmeta_sc_publication_fence_data d;
-    int *nloaded = data;
+    struct sc_publication_fence_load *load = data;
+    SC_PUBLICATION_FENCE_RECORD *record, *records;
+    int i;
 
-    if (llmeta_sc_publication_fence_data_get(&d, v, (const uint8_t *)v + LLMETA_SC_PUBLICATION_FENCE_DATA_LEN) ==
-        NULL) {
-        logmsg(LOGMSG_ERROR, "%s: unreadable publication-fence record\n", __func__);
-        return 0; /* skip it; a missing fence fails closed, see __mempv_fget */
+    if (vlen == LLMETA_SC_PUBLICATION_FENCE_DATA_V1_LEN) {
+        struct llmeta_sc_publication_fence_data_v1 old;
+        const uint8_t *p = v, *end = p + vlen;
+
+        p = buf_get(&old.version, sizeof(old.version), p, end);
+        p = buf_get(&old.lsn_file, sizeof(old.lsn_file), p, end);
+        p = buf_get(&old.lsn_offset, sizeof(old.lsn_offset), p, end);
+        p = buf_get(&old.build_id, sizeof(old.build_id), p, end);
+        if (p == NULL || old.version != 1 || old.lsn_file <= 0 ||
+            old.lsn_offset < 0 || old.build_id == 0) {
+            logmsg(LOGMSG_ERROR, "%s: invalid v1 publication-fence record\n",
+                   __func__);
+            return -1;
+        }
+        d.version = old.version;
+        d.lsn_file = old.lsn_file;
+        d.lsn_offset = old.lsn_offset;
+        memset(&d.build_id, 0xff, sizeof(d.build_id));
+        memcpy(d.build_id.bytes, &old.build_id, sizeof(old.build_id));
+    } else if (vlen != LLMETA_SC_PUBLICATION_FENCE_DATA_LEN ||
+               llmeta_sc_publication_fence_data_get(
+                   &d, v, (const uint8_t *)v + vlen) == NULL) {
+        logmsg(LOGMSG_ERROR,
+               "%s: invalid publication-fence value length %d\n", __func__,
+               vlen);
+        return -1;
     }
 
-    if (d.version != LLMETA_SC_PUBLICATION_FENCE_VERSION) {
+    if (d.version != 1 && d.version != LLMETA_SC_PUBLICATION_FENCE_VERSION) {
         logmsg(LOGMSG_ERROR, "%s: unknown publication-fence version %d\n", __func__, d.version);
-        return 0;
+        return -1;
     }
 
-    if (bdb_sc_publication_fence_install(llmeta_bdb_state, key + 4, d.build_id, (unsigned int)d.lsn_file,
-                                         (unsigned int)d.lsn_offset) == 0)
-        ++(*nloaded);
+    if (d.lsn_file <= 0 || d.lsn_offset < 0 ||
+        sc_build_id_is_zero(&d.build_id)) {
+        logmsg(LOGMSG_ERROR, "%s: invalid publication-fence contents\n",
+               __func__);
+        return -1;
+    }
+
+    for (i = 0; i < DB_FILE_ID_LEN; i++)
+        if (key[4 + i] != 0)
+            break;
+    if (i == DB_FILE_ID_LEN) {
+        logmsg(LOGMSG_ERROR, "%s: zero publication-fence file id\n",
+               __func__);
+        return -1;
+    }
+
+    if (load->count == load->capacity) {
+        int capacity = load->capacity == 0 ? 16 : load->capacity * 2;
+        records = realloc(load->records,
+                          (size_t)capacity * sizeof(*records));
+        if (records == NULL)
+            return -1;
+        load->records = records;
+        load->capacity = capacity;
+    }
+
+    record = &load->records[load->count++];
+    memcpy(record->fileid, key + 4, DB_FILE_ID_LEN);
+    record->build_id = d.build_id;
+    record->fence_lsn.file = (unsigned int)d.lsn_file;
+    record->fence_lsn.offset = (unsigned int)d.lsn_offset;
 
     return 0;
 }
@@ -11769,7 +11868,8 @@ int bdb_load_sc_publication_fences(tran_type *tran, int *nloaded, int *bdberr)
 {
     int file_type = LLMETA_SC_PUBLICATION_FENCE;
     uint8_t prefix[sizeof(int)];
-    int n = 0, rc;
+    struct sc_publication_fence_load load = {0};
+    int rc;
 
     *bdberr = BDBERR_NOERROR;
     if (nloaded)
@@ -11778,15 +11878,21 @@ int bdb_load_sc_publication_fences(tran_type *tran, int *nloaded, int *bdberr)
     if (buf_put(&file_type, sizeof(file_type), prefix, prefix + sizeof(prefix)) == NULL)
         return -1;
 
-    rc = kv_for_each_pair(tran, prefix, sizeof(prefix), load_one_sc_publication_fence, &n);
+    rc = kv_for_each_pair_len(tran, prefix, sizeof(prefix),
+                              load_one_sc_publication_fence, &load);
+    if (rc == 0)
+        rc = bdb_sc_publication_fence_reconcile(llmeta_bdb_state,
+                                                load.records, load.count);
 
     if (nloaded)
-        *nloaded = n;
+        *nloaded = rc == 0 ? load.count : 0;
 
     if (rc)
         logmsg(LOGMSG_ERROR, "%s: failed to load publication fences rc %d\n", __func__, rc);
-    else if (n > 0)
-        logmsg(LOGMSG_INFO, "Loaded %d schema-change publication fence(s)\n", n);
+    else if (load.count > 0)
+        logmsg(LOGMSG_INFO, "Loaded %d schema-change publication fence(s)\n", load.count);
+
+    free(load.records);
 
     return rc;
 }

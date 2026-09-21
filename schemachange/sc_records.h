@@ -74,7 +74,7 @@ struct convert_record_data {
      * skip is not active for this schema change.  Copied to every worker
      * thread along with the rest of this struct.
      */
-    uint64_t sc_private_build_id;
+    sc_build_id_t sc_private_build_id;
     int num_retry_errors;
     int *tagmap; // mapping of fields from -> to
     /* all the data objects point to the same single cmembers object */
@@ -114,5 +114,5 @@ void *live_sc_logical_redo_thd(struct convert_record_data *data);
  * not active for this schema change.  Finalization uses it to publish those
  * files' fences.
  */
-uint64_t sc_private_build_id(struct schema_change_type *s);
+int sc_private_build_id(struct schema_change_type *s, sc_build_id_t *build_id);
 #endif

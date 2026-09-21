@@ -352,28 +352,39 @@ int llog_scdone_rename_wrapper(bdb_state_type *bdb_state,
  * Until this runs the build's entries carry a zero fence and are inert, so a
  * schema change that never reaches here changes nothing.
  */
-static void sc_publish_fences(struct schema_change_type *s, tran_type *tran,
-                              unsigned int fence_file,
-                              unsigned int fence_offset)
+static int sc_publish_fences(struct schema_change_type *s, tran_type *tran,
+                             unsigned int fence_file,
+                             unsigned int fence_offset)
 {
-    uint64_t build_id;
+    sc_build_id_t build_id;
 
     if (s == NULL || s->db == NULL || s->db->handle == NULL || fence_file == 0)
-        return;
+        return 0;
 
-    if ((build_id = sc_private_build_id(s)) == 0)
-        return;
+    if (!sc_private_build_id(s, &build_id))
+        return 0;
+
+    if (s->sc_expected_fence_count == 0)
+        return 0;
 
     /*
      * Durable first, in the publication transaction, so the record shares the
      * generation's fate.  Then the in-memory registry this node reads from;
      * other nodes build theirs from the durable record instead.
      */
-    bdb_sc_publication_fence_persist(s->db->handle, tran, build_id, fence_file,
-                                     fence_offset);
+    if (bdb_sc_publication_fence_persist(s->db->handle, tran, &build_id,
+                                         fence_file, fence_offset,
+                                         s->sc_expected_fence_count) != 0)
+        return -1;
 
-    bdb_sc_publication_fence_publish(s->db->handle, build_id, fence_file,
-                                     fence_offset);
+    if (bdb_sc_publication_fence_publish(s->db->handle, &build_id, fence_file,
+                                         fence_offset,
+                                         s->sc_expected_fence_count) != 0) {
+        bdb_sc_publication_fence_discard(s->db->handle, &build_id);
+        return -1;
+    }
+
+    return 0;
 }
 
 /*
@@ -382,15 +393,15 @@ static void sc_publish_fences(struct schema_change_type *s, tran_type *tran,
  */
 static void sc_discard_fences(struct schema_change_type *s)
 {
-    uint64_t build_id;
+    sc_build_id_t build_id;
 
     if (s == NULL || s->db == NULL || s->db->handle == NULL)
         return;
 
-    if ((build_id = sc_private_build_id(s)) == 0)
+    if (!sc_private_build_id(s, &build_id))
         return;
 
-    bdb_sc_publication_fence_discard(s->db->handle, build_id);
+    bdb_sc_publication_fence_discard(s->db->handle, &build_id);
 }
 
 /*
@@ -475,7 +486,11 @@ static int do_finalize(ddl_t func, struct ireq *iq,
             rc = -1;
             goto abort;
         }
-        sc_publish_fences(s, tran, fence_file, fence_offset);
+        if (sc_publish_fences(s, tran, fence_file, fence_offset) != 0) {
+            sc_errf(s, "Failed to publish schema-change fences\n");
+            rc = -1;
+            goto abort;
+        }
 
         rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &bdberr);
         if (rc || bdberr != BDBERR_NOERROR) {
@@ -516,7 +531,10 @@ static int do_finalize(ddl_t func, struct ireq *iq,
             sc_errf(s, "Failed to read log end for the publication fence\n");
             return -1;
         }
-        sc_publish_fences(s, tran, fence_file, fence_offset);
+        if (sc_publish_fences(s, tran, fence_file, fence_offset) != 0) {
+            sc_errf(s, "Failed to publish schema-change fences\n");
+            return -1;
+        }
 
         rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &bdberr);
         if (rc || bdberr != BDBERR_NOERROR) {
@@ -1912,6 +1930,7 @@ int scdone_abort_cleanup(struct ireq *iq)
 {
     int bdberr = 0, rc;
     struct schema_change_type *s = iq->sc;
+    sc_discard_fences(s);
     mark_schemachange_over(s->tablename);
     if (s->set_running)
         sc_set_running(iq, s, s->tablename, 0, gbl_myhostname, time(NULL),

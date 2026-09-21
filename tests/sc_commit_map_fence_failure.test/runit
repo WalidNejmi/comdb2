@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+set -o pipefail
+
+dbnm=$1
+[[ -z "$dbnm" ]] && dbnm=$DBNAME
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+fences() {
+	cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+		grep -oP '(?<=SC publication fences: )[0-9]+'
+}
+
+run "create table t(i int, j int)" >/dev/null
+run "create index ix_j on t(j)" >/dev/null
+run "insert into t select value, value from generate_series(1, 2000)" >/dev/null
+
+base_fences=$(fences)
+base_version=$(run "select table_version('t')")
+
+expect_failed_rebuild() {
+	local tunable=$1 after=$2 before
+	before=$(fences)
+	run "put tunable '$tunable' $after" >/dev/null ||
+		fail "could not set $tunable=$after"
+	if run "rebuild t" >/tmp/sc_fence_failure.$$ 2>&1; then
+		run "put tunable '$tunable' 2147483647" >/dev/null
+		fail "rebuild unexpectedly succeeded with $tunable=$after"
+	fi
+	run "put tunable '$tunable' 2147483647" >/dev/null ||
+		fail "could not reset $tunable"
+	[[ "$(run "select table_version('t')")" == "$base_version" ]] ||
+		fail "failed rebuild changed table version"
+	[[ "$(run 'select count(*) from t')" == "2000" ]] ||
+		fail "failed rebuild changed table contents"
+	[[ "$(fences)" == "$before" ]] ||
+		fail "failed rebuild left RAM publication fences"
+}
+
+expect_failed_rebuild sc_fence_persist_fail_after 0
+expect_failed_rebuild sc_fence_persist_fail_after 1
+
+# A partial durable write must roll back with the publication transaction.
+stop_all_nodes
+sleep 10
+start_all_nodes
+wait_up
+master=$(getmaster)
+[[ -n "$master" ]] || fail "could not find master after restart"
+[[ "$(fences)" == "$base_fences" ]] ||
+	fail "partial durable fence set survived transaction abort"
+
+expect_failed_rebuild sc_fence_publish_fail_after 0
+expect_failed_rebuild sc_fence_publish_fail_after 1
+
+run "rebuild t" >/dev/null || fail "normal rebuild failed after injections"
+(( $(fences) > base_fences )) || fail "normal rebuild published no fences"
+[[ "$(run 'select count(*) from t')" == "2000" ]] ||
+	fail "normal rebuild changed table contents"
+
+echo "SC_FENCE_FAILURE: base_fences=$base_fences final_fences=$(fences)"
+echo "Passed test"

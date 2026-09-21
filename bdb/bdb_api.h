@@ -30,6 +30,7 @@
 
 #include <net.h>
 #include <bb_stdint.h>
+#include <sc_build_id.h>
 
 #include <inttypes.h>
 #include <limits.h>
@@ -38,6 +39,8 @@
 #include "bdb_net.h"
 #include <sqlglue.h>
 #include <bdbglue.h>
+
+struct __sc_publication_fence_record;
 
 #include <assert.h>
 
@@ -2540,19 +2543,21 @@ void bdb_tran_set_is_sc_rebuild(tran_type *tran, int is_sc_rebuild);
  * base converter, immediately after the transaction starts -- never from a
  * generic transaction-start helper.
  */
-void bdb_tran_set_sc_build(tran_type *tran, uint64_t build_id);
+void bdb_tran_set_sc_build(tran_type *tran, const sc_build_id_t *build_id);
 
 /*
  * Register the rebuilt replacement files of a table as belonging to a build.
  * Only rebuilt, not-yet-public files may be registered.
  */
-int bdb_sc_private_register_files(bdb_state_type *bdb_state, uint64_t build_id,
+int bdb_sc_private_register_files(bdb_state_type *bdb_state,
+                                  const sc_build_id_t *build_id,
                                   int dta_rebuilt, const int *blob_rebuilt,
-                                  int nblobs, const int *ix_rebuilt, int nix);
+                                  int nblobs, const int *ix_rebuilt, int nix,
+                                  int *nregistered);
 
 /* Drop every registration for a build.  Idempotent. */
 int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
-                                    uint64_t build_id);
+                                    const sc_build_id_t *build_id);
 
 /*
  * Publication fences for the rebuilt files of a schema-change build.  The
@@ -2561,14 +2566,20 @@ int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
  * commit-map entries safe.  Pended by bdb_sc_private_register_files().
  */
 int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
-                                     uint64_t build_id, unsigned int fence_file,
-                                     unsigned int fence_offset);
+                                     const sc_build_id_t *build_id,
+                                     unsigned int fence_file,
+                                     unsigned int fence_offset,
+                                     int expected_count);
 int bdb_sc_publication_fence_discard(bdb_state_type *bdb_state,
-                                     uint64_t build_id);
+                                     const sc_build_id_t *build_id);
 int bdb_sc_publication_fence_install(bdb_state_type *bdb_state,
-                                     const uint8_t *fileid, uint64_t build_id,
+                                     const uint8_t *fileid,
+                                     const sc_build_id_t *build_id,
                                      unsigned int fence_file,
                                      unsigned int fence_offset);
+int bdb_sc_publication_fence_reconcile(
+    bdb_state_type *bdb_state,
+    const struct __sc_publication_fence_record *records, int nrecords);
 
 /*
  * Durable publication fences, keyed by physical file id.  Written inside the
@@ -2578,13 +2589,15 @@ int bdb_sc_publication_fence_install(bdb_state_type *bdb_state,
  */
 int bdb_set_sc_publication_fence(tran_type *tran, const uint8_t *fileid,
                                  unsigned int lsn_file, unsigned int lsn_offset,
-                                 uint64_t build_id, int *bdberr);
+                                 const sc_build_id_t *build_id, int *bdberr);
 int bdb_del_sc_publication_fence(tran_type *tran, const uint8_t *fileid,
                                  int *bdberr);
 int bdb_load_sc_publication_fences(tran_type *tran, int *nloaded, int *bdberr);
 int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
-                                     uint64_t build_id, unsigned int fence_file,
-                                     unsigned int fence_offset);
+                                     const sc_build_id_t *build_id,
+                                     unsigned int fence_file,
+                                     unsigned int fence_offset,
+                                     int expected_count);
 int bdb_get_log_end_lsn(bdb_state_type *bdb_state, unsigned int *file,
                         unsigned int *offset);
 #endif

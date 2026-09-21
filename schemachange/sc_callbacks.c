@@ -1396,6 +1396,7 @@ int scdone_callback(bdb_state_type *bdb_state, const char table[], void *arg,
                "(bdberr %d); snapshot reconstruction of rebuilt files on this "
                "node may be unable to stop\n",
                __func__, bdberr);
+        rc = -1;
     }
 
     _untran(tran, lid);

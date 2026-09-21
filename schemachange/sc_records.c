@@ -717,8 +717,8 @@ static int convert_record(struct convert_record_data *data)
          * Here and not in trans_start_sc_lowpri(): that helper also serves
          * logical redo and other schema-change work.
          */
-        if (data->sc_private_build_id != 0)
-            bdb_tran_set_sc_build(data->trans, data->sc_private_build_id);
+        if (!sc_build_id_is_zero(&data->sc_private_build_id))
+            bdb_tran_set_sc_build(data->trans, &data->sc_private_build_id);
     }
 
     data->iq.debug = debug_this_request(gbl_debug_until);
@@ -1425,21 +1425,19 @@ int gbl_sc_is_at_end = 0;
  * with the replacement files registered for that active conversion.  It is
  * not durable identity and is not used for anything after the conversion ends.
  */
-uint64_t sc_private_build_id(struct schema_change_type *s)
+int sc_private_build_id(struct schema_change_type *s, sc_build_id_t *build_id)
 {
-    uint64_t id;
+    memset(build_id, 0, sizeof(*build_id));
 
-    if (s == NULL || s->seed == 0)
+    if (s == NULL || comdb2uuid_is_zero(s->uuid))
         return 0;
 
     /* Nothing to skip when the commit map is not maintained. */
     if (!__txn_commit_map_enabled())
         return 0;
 
-    id = s->seed ^ ((uint64_t)crc32c((const uint8_t *)s->tablename,
-                                     strlen(s->tablename)) << 32);
-
-    return id ? id : s->seed;
+    memcpy(build_id->bytes, s->uuid, sizeof(build_id->bytes));
+    return 1;
 }
 
 /*
@@ -1449,20 +1447,22 @@ uint64_t sc_private_build_id(struct schema_change_type *s)
  * file", so rebuilt == (entry < 0).  Reused files are public and must not be
  * registered.
  */
-static int sc_private_register_build(struct dbtable *to, uint64_t build_id)
+static int sc_private_register_build(struct dbtable *to,
+                                     const sc_build_id_t *build_id,
+                                     int *nregistered)
 {
     struct scplan *plan;
     int dta_rebuilt, i;
     int blob_rebuilt[MAXBLOBS], ix_rebuilt[MAXINDEX];
 
-    if (to == NULL || to->handle == NULL || build_id == 0)
+    if (to == NULL || to->handle == NULL || sc_build_id_is_zero(build_id))
         return -1;
 
     plan = to->plan;
     if (plan == NULL || !gbl_use_plan) {
         /* No plan: the whole generation is new. */
         return bdb_sc_private_register_files(to->handle, build_id, 1, NULL, 0,
-                                             NULL, 0);
+                             NULL, 0, nregistered);
     }
 
     dta_rebuilt = is_dta_being_rebuilt(plan);
@@ -1475,7 +1475,7 @@ static int sc_private_register_build(struct dbtable *to, uint64_t build_id)
 
     return bdb_sc_private_register_files(to->handle, build_id, dta_rebuilt,
                                          blob_rebuilt, MAXBLOBS, ix_rebuilt,
-                                         MAXINDEX);
+                                         MAXINDEX, nregistered);
 }
 
 int convert_all_records(struct dbtable *from, struct dbtable *to,
@@ -1669,11 +1669,14 @@ int convert_all_records(struct dbtable *from, struct dbtable *to,
      * still before any converter transaction starts, which is what the write
      * check requires.
      */
-    data.sc_private_build_id = 0;
+    memset(&data.sc_private_build_id, 0, sizeof(data.sc_private_build_id));
+    s->sc_expected_fence_count = 0;
     {
-        uint64_t build_id = sc_private_build_id(s);
+        sc_build_id_t build_id;
 
-        if (build_id != 0 && sc_private_register_build(data.to, build_id) == 0)
+        if (sc_private_build_id(s, &build_id) &&
+            sc_private_register_build(data.to, &build_id,
+                                      &s->sc_expected_fence_count) == 0)
             data.sc_private_build_id = build_id;
     }
 
@@ -1796,10 +1799,10 @@ int convert_all_records(struct dbtable *from, struct dbtable *to,
      * later schema change on the same table.  Reached on success, on
      * conversion failure and on abort alike.
      */
-    if (data.sc_private_build_id != 0 && data.to != NULL &&
+    if (!sc_build_id_is_zero(&data.sc_private_build_id) && data.to != NULL &&
         data.to->handle != NULL)
         bdb_sc_private_unregister_build(data.to->handle,
-                                        data.sc_private_build_id);
+                                        &data.sc_private_build_id);
 
     return outrc;
 }

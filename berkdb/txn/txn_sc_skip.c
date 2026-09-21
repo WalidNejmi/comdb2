@@ -18,10 +18,10 @@
  *
  *   at commit, that transaction is not added to the map
  *
- * The bit records one positive fact: this transaction wrote one of its own
- * build's replacement files.  It is never cleared.  A converter transaction
- * that also writes llmeta progress is still skipped -- that is intended, not
- * an oversight.
+ * The match bit records that this transaction wrote one of its own build's
+ * replacement files.  A separate bit rejects any transaction that also writes
+ * an unregistered user-table file.  Internal metadata such as llmeta progress
+ * is not a user-table file and remains allowed.
  *
  * Everything else is unchanged.  The transaction, its writes and its commit
  * record are all logged normally; only the in-memory map insertion is omitted.
@@ -107,6 +107,7 @@ static u_int64_t sc_unsupported_children = 0;
 static u_int64_t sc_unsupported_rowlock = 0;
 static u_int64_t sc_unsupported_distributed = 0;
 static u_int64_t sc_unsupported_unknown_family = 0;
+int gbl_sc_fence_publish_fail_after = INT_MAX;
 
 /*
  * __sc_commit_flags_note --
@@ -263,19 +264,19 @@ __sc_private_file_registry_destroy(dbenv)
  *	decision.
  *
  * PUBLIC: int __sc_private_file_register __P((DB_ENV *, const u_int8_t *,
- * PUBLIC:	   u_int64_t));
+ * PUBLIC:	   const sc_build_id_t *));
  */
 int
 __sc_private_file_register(dbenv, fileid, build_id)
 	DB_ENV *dbenv;
 	const u_int8_t *fileid;
-	u_int64_t build_id;
+	const sc_build_id_t *build_id;
 {
 	SC_PRIVATE_FILE_REGISTRY *reg = dbenv->sc_private_files;
 	SC_PRIVATE_FILE *f;
 	int ret = 0;
 
-	if (reg == NULL || fileid == NULL || build_id == 0)
+	if (reg == NULL || fileid == NULL || sc_build_id_is_zero(build_id))
 		return (EINVAL);
 
 	Pthread_mutex_lock(&reg->lk);
@@ -287,11 +288,10 @@ __sc_private_file_register(dbenv, fileid, build_id)
 		 * lifecycle is not what we think it is.  Refuse rather than
 		 * silently re-point it.
 		 */
-		if (f->build_id != build_id) {
+		if (!sc_build_id_equal(&f->build_id, build_id)) {
 			logmsg(LOGMSG_ERROR,
-			    "%s: file already registered to build 0x%"PRIx64
-			    ", refusing to re-register to 0x%"PRIx64"\n",
-			    __func__, f->build_id, build_id);
+			    "%s: file already belongs to another schema-change build\n",
+			    __func__);
 			ret = EEXIST;
 		}
 		goto done;
@@ -303,7 +303,7 @@ __sc_private_file_register(dbenv, fileid, build_id)
 	}
 
 	memcpy(f->fileid, fileid, DB_FILE_ID_LEN);
-	f->build_id = build_id;
+	f->build_id = *build_id;
 	hash_add(reg->files, f);
 
 done:
@@ -317,13 +317,13 @@ done:
  *	file, DB_NOTFOUND otherwise.
  *
  * PUBLIC: int __sc_private_file_lookup __P((DB_ENV *, const u_int8_t *,
- * PUBLIC:	   u_int64_t *));
+ * PUBLIC:	   sc_build_id_t *));
  */
 int
 __sc_private_file_lookup(dbenv, fileid, build_id_out)
 	DB_ENV *dbenv;
 	const u_int8_t *fileid;
-	u_int64_t *build_id_out;
+	sc_build_id_t *build_id_out;
 {
 	SC_PRIVATE_FILE_REGISTRY *reg = dbenv->sc_private_files;
 	SC_PRIVATE_FILE *f;
@@ -345,7 +345,7 @@ __sc_private_file_lookup(dbenv, fileid, build_id_out)
 }
 
 struct sc_private_find_arg {
-	u_int64_t build_id;
+	const sc_build_id_t *build_id;
 	SC_PRIVATE_FILE *found;
 };
 
@@ -355,7 +355,7 @@ find_one_build_file(void *obj, void *arg)
 	SC_PRIVATE_FILE *f = obj;
 	struct sc_private_find_arg *a = arg;
 
-	if (f->build_id != a->build_id)
+	if (!sc_build_id_equal(&f->build_id, a->build_id))
 		return (0);
 
 	a->found = f;
@@ -367,17 +367,18 @@ find_one_build_file(void *obj, void *arg)
  *	Drop every file belonging to a build.  Idempotent, so terminal
  *	schema-change paths can call it unconditionally.
  *
- * PUBLIC: int __sc_private_file_unregister_build __P((DB_ENV *, u_int64_t));
+ * PUBLIC: int __sc_private_file_unregister_build __P((DB_ENV *,
+ * PUBLIC:	   const sc_build_id_t *));
  */
 int
 __sc_private_file_unregister_build(dbenv, build_id)
 	DB_ENV *dbenv;
-	u_int64_t build_id;
+	const sc_build_id_t *build_id;
 {
 	SC_PRIVATE_FILE_REGISTRY *reg = dbenv->sc_private_files;
 	struct sc_private_find_arg arg;
 
-	if (reg == NULL || build_id == 0)
+	if (reg == NULL || sc_build_id_is_zero(build_id))
 		return (0);
 
 	Pthread_mutex_lock(&reg->lk);
@@ -483,6 +484,7 @@ __sc_publication_fence_registry_init(dbenv)
 	}
 
 	Pthread_mutex_init(&reg->lk, NULL);
+	reg->epoch = 1;
 	dbenv->sc_publication_fences = reg;
 
 	return (0);
@@ -537,19 +539,19 @@ __sc_publication_fence_registry_destroy(dbenv)
  *	rule, so nothing changes until the build publishes.
  *
  * PUBLIC: int __sc_publication_fence_pend __P((DB_ENV *, const u_int8_t *,
- * PUBLIC:	   u_int64_t));
+ * PUBLIC:	   const sc_build_id_t *));
  */
 int
 __sc_publication_fence_pend(dbenv, fileid, build_id)
 	DB_ENV *dbenv;
 	const u_int8_t *fileid;
-	u_int64_t build_id;
+	const sc_build_id_t *build_id;
 {
 	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
 	SC_PUBLICATION_FENCE *f;
 	int ret = 0;
 
-	if (reg == NULL || fileid == NULL || build_id == 0)
+	if (reg == NULL || fileid == NULL || sc_build_id_is_zero(build_id))
 		return (EINVAL);
 
 	Pthread_mutex_lock(&reg->lk);
@@ -562,7 +564,7 @@ __sc_publication_fence_pend(dbenv, fileid, build_id)
 		 * unpublished so a stale fence cannot outlive its generation.
 		 */
 		ZERO_LSN(f->fence_lsn);
-		f->build_id = build_id;
+		f->build_id = *build_id;
 		goto done;
 	}
 
@@ -571,7 +573,7 @@ __sc_publication_fence_pend(dbenv, fileid, build_id)
 
 	memcpy(f->fileid, fileid, DB_FILE_ID_LEN);
 	ZERO_LSN(f->fence_lsn);
-	f->build_id = build_id;
+	f->build_id = *build_id;
 
 	if (hash_add(reg->files, f) != 0) {
 		__os_free(dbenv, f);
@@ -632,13 +634,13 @@ __sc_publication_fence_drop_cached_pages(dbenv, fileid)
  *	file's fence is known up front and there is no pending phase.
  *
  * PUBLIC: int __sc_publication_fence_install __P((DB_ENV *, const u_int8_t *,
- * PUBLIC:	   u_int64_t, DB_LSN));
+ * PUBLIC:	   const sc_build_id_t *, DB_LSN));
  */
 int
 __sc_publication_fence_install(dbenv, fileid, build_id, fence_lsn)
 	DB_ENV *dbenv;
 	const u_int8_t *fileid;
-	u_int64_t build_id;
+	const sc_build_id_t *build_id;
 	DB_LSN fence_lsn;
 {
 	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
@@ -654,7 +656,9 @@ __sc_publication_fence_install(dbenv, fileid, build_id, fence_lsn)
 	if (f != NULL) {
 		changed = log_compare(&f->fence_lsn, &fence_lsn) != 0;
 		f->fence_lsn = fence_lsn;
-		f->build_id = build_id;
+		f->build_id = *build_id;
+		if (changed)
+			reg->epoch++;
 		goto done;
 	}
 
@@ -663,13 +667,14 @@ __sc_publication_fence_install(dbenv, fileid, build_id, fence_lsn)
 
 	memcpy(f->fileid, fileid, DB_FILE_ID_LEN);
 	f->fence_lsn = fence_lsn;
-	f->build_id = build_id;
+	f->build_id = *build_id;
 
 	if (hash_add(reg->files, f) != 0) {
 		__os_free(dbenv, f);
 		ret = ENOMEM;
 	} else {
 		changed = 1;
+		reg->epoch++;
 	}
 
 done:
@@ -688,11 +693,180 @@ done:
 	return (ret);
 }
 
+struct sc_fence_pending_copy_arg {
+	DB_ENV *dbenv;
+	hash_t *files;
+	int ret;
+};
+
+static int
+copy_pending_fence(void *obj, void *arg)
+{
+	SC_PUBLICATION_FENCE *f = obj, *copy, *existing;
+	struct sc_fence_pending_copy_arg *a = arg;
+
+	if (!IS_ZERO_LSN(f->fence_lsn))
+		return (0);
+
+	existing = hash_find(a->files, f->fileid);
+	if (existing != NULL) {
+		hash_del(a->files, existing);
+		__os_free(a->dbenv, existing);
+	}
+
+	if ((a->ret = __os_malloc(a->dbenv, sizeof(*copy), &copy)) != 0)
+		return (1);
+	*copy = *f;
+	if (hash_add(a->files, copy) != 0) {
+		__os_free(a->dbenv, copy);
+		a->ret = ENOMEM;
+		return (1);
+	}
+	return (0);
+}
+
+struct sc_fence_changed_arg {
+	hash_t *other;
+	u_int8_t *fileids;
+	size_t n;
+	int removed;
+};
+
+static int
+collect_changed_fence(void *obj, void *arg)
+{
+	SC_PUBLICATION_FENCE *f = obj;
+	SC_PUBLICATION_FENCE *other;
+	struct sc_fence_changed_arg *a = arg;
+
+	if (IS_ZERO_LSN(f->fence_lsn))
+		return (0);
+
+	other = hash_find(a->other, f->fileid);
+	if (a->removed ? other == NULL :
+	    (other == NULL || IS_ZERO_LSN(other->fence_lsn) ||
+	     log_compare(&f->fence_lsn, &other->fence_lsn) != 0)) {
+		memcpy(a->fileids + a->n * DB_FILE_ID_LEN, f->fileid,
+		    DB_FILE_ID_LEN);
+		a->n++;
+	}
+	return (0);
+}
+
+static void
+free_fence_hash(dbenv, files)
+	DB_ENV *dbenv;
+	hash_t *files;
+{
+	hash_for(files, &free_sc_publication_fence, dbenv);
+	hash_clear(files);
+	hash_free(files);
+}
+
+/*
+ * __sc_publication_fence_reconcile --
+ *	Atomically replace published fences with a validated durable snapshot.
+ *	Pending zero-LSN entries belong to active builds and are preserved.
+ *
+ * PUBLIC: int __sc_publication_fence_reconcile __P((DB_ENV *,
+ * PUBLIC:     const SC_PUBLICATION_FENCE_RECORD *, int));
+ */
+int
+__sc_publication_fence_reconcile(dbenv, records, nrecords)
+	DB_ENV *dbenv;
+	const SC_PUBLICATION_FENCE_RECORD *records;
+	int nrecords;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	SC_PUBLICATION_FENCE *f;
+	hash_t *newfiles, *oldfiles;
+	struct sc_fence_pending_copy_arg pending;
+	struct sc_fence_changed_arg changed;
+	u_int8_t *changed_fileids = NULL;
+	size_t maxchanged, i;
+	int ret = 0;
+
+	if (reg == NULL || nrecords < 0 || (nrecords > 0 && records == NULL))
+		return (EINVAL);
+
+	newfiles = hash_init_o(offsetof(SC_PUBLICATION_FENCE, fileid),
+	    DB_FILE_ID_LEN);
+	if (newfiles == NULL)
+		return (ENOMEM);
+
+	for (i = 0; i < (size_t)nrecords; i++) {
+		if (IS_ZERO_LSN(records[i].fence_lsn) ||
+		    sc_build_id_is_zero(&records[i].build_id) ||
+		    hash_find(newfiles, records[i].fileid) != NULL ||
+		    (ret = __os_malloc(dbenv, sizeof(*f), &f)) != 0) {
+			ret = ret != 0 ? ret : EINVAL;
+			goto err;
+		}
+		memcpy(f->fileid, records[i].fileid, DB_FILE_ID_LEN);
+		f->fence_lsn = records[i].fence_lsn;
+		f->build_id = records[i].build_id;
+		if (hash_add(newfiles, f) != 0) {
+			__os_free(dbenv, f);
+			ret = ENOMEM;
+			goto err;
+		}
+	}
+
+	Pthread_mutex_lock(&reg->lk);
+	oldfiles = reg->files;
+	pending.dbenv = dbenv;
+	pending.files = newfiles;
+	pending.ret = 0;
+	hash_for(oldfiles, &copy_pending_fence, &pending);
+	if (pending.ret != 0) {
+		Pthread_mutex_unlock(&reg->lk);
+		ret = pending.ret;
+		goto err;
+	}
+
+	maxchanged = hash_get_num_entries(oldfiles) +
+	    hash_get_num_entries(newfiles);
+	if (maxchanged != 0 &&
+	    __os_malloc(dbenv, maxchanged * DB_FILE_ID_LEN,
+	    &changed_fileids) != 0) {
+		Pthread_mutex_unlock(&reg->lk);
+		ret = ENOMEM;
+		goto err;
+	}
+
+	changed.other = oldfiles;
+	changed.fileids = changed_fileids;
+	changed.n = 0;
+	changed.removed = 0;
+	hash_for(newfiles, &collect_changed_fence, &changed);
+	changed.other = newfiles;
+	changed.removed = 1;
+	hash_for(oldfiles, &collect_changed_fence, &changed);
+	reg->files = newfiles;
+	if (changed.n != 0)
+		reg->epoch++;
+	Pthread_mutex_unlock(&reg->lk);
+
+	for (i = 0; i < changed.n; i++)
+		__sc_publication_fence_drop_cached_pages(dbenv,
+		    changed_fileids + i * DB_FILE_ID_LEN);
+	if (changed_fileids != NULL)
+		__os_free(dbenv, changed_fileids);
+	free_fence_hash(dbenv, oldfiles);
+	return (0);
+
+err:
+	free_fence_hash(dbenv, newfiles);
+	return (ret);
+}
+
 struct sc_fence_build_arg {
-	u_int64_t build_id;
+	const sc_build_id_t *build_id;
 	DB_LSN fence_lsn;
 	SC_PUBLICATION_FENCE *found;
 	u_int64_t nstamped;
+	int fail_after;
+	int failed;
 };
 
 static int
@@ -701,8 +875,12 @@ stamp_one_build_fence(void *obj, void *arg)
 	SC_PUBLICATION_FENCE *f = obj;
 	struct sc_fence_build_arg *a = arg;
 
-	if (f->build_id != a->build_id)
+	if (!sc_build_id_equal(&f->build_id, a->build_id))
 		return (0);
+	if (a->nstamped == (u_int64_t)a->fail_after) {
+		a->failed = 1;
+		return (1);
+	}
 
 	f->fence_lsn = a->fence_lsn;
 	a->nstamped++;
@@ -718,50 +896,75 @@ stamp_one_build_fence(void *obj, void *arg)
  *	schema change's own scdone record satisfies both: it is written after
  *	the file versions are switched and inside the publication transaction.
  *
- * PUBLIC: int __sc_publication_fence_publish __P((DB_ENV *, u_int64_t,
- * PUBLIC:	   DB_LSN));
+ * PUBLIC: int __sc_publication_fence_publish __P((DB_ENV *,
+ * PUBLIC:     const sc_build_id_t *,
+ * PUBLIC:     DB_LSN, int));
  */
 int
-__sc_publication_fence_publish(dbenv, build_id, fence_lsn)
+__sc_publication_fence_publish(dbenv, build_id, fence_lsn, expected_count)
 	DB_ENV *dbenv;
-	u_int64_t build_id;
+	const sc_build_id_t *build_id;
 	DB_LSN fence_lsn;
+	int expected_count;
 {
 	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
 	struct sc_fence_build_arg arg;
-	/* A table's data stripes, indexes and blob files; generous. */
-	enum { MAX_BUILD_FILES = 256 };
-	u_int8_t fileids[MAX_BUILD_FILES * DB_FILE_ID_LEN];
+	u_int8_t *fileids = NULL;
 	int nfiles = 0, i;
 
-	if (reg == NULL || build_id == 0 || IS_ZERO_LSN(fence_lsn))
+	if (reg == NULL || sc_build_id_is_zero(build_id) || IS_ZERO_LSN(fence_lsn) ||
+	    expected_count <= 0)
 		return (EINVAL);
+
+	if (__sc_publication_fence_list_build(dbenv, build_id, NULL, 0,
+	    &nfiles) != 0 || nfiles != expected_count)
+		return (EINVAL);
+
+	if (__os_malloc(dbenv, (size_t)nfiles * DB_FILE_ID_LEN,
+	    &fileids) != 0)
+		return (ENOMEM);
+
+	if (__sc_publication_fence_list_build(dbenv, build_id, fileids,
+	    nfiles, &nfiles) != 0 || nfiles != expected_count) {
+		__os_free(dbenv, fileids);
+		return (EINVAL);
+	}
 
 	arg.build_id = build_id;
 	arg.fence_lsn = fence_lsn;
 	arg.nstamped = 0;
+	arg.fail_after = gbl_sc_fence_publish_fail_after;
+	arg.failed = 0;
 
 	Pthread_mutex_lock(&reg->lk);
 	hash_for(reg->files, &stamp_one_build_fence, &arg);
+	if (!arg.failed && arg.nstamped == (u_int64_t)expected_count)
+		reg->epoch++;
 	Pthread_mutex_unlock(&reg->lk);
+	if (arg.failed || arg.nstamped != (u_int64_t)expected_count) {
+		if (arg.failed)
+			logmsg(LOGMSG_ERROR,
+			    "%s: injected failure after %"PRIu64
+			    " in-memory fence installs\n", __func__, arg.nstamped);
+		__os_free(dbenv, fileids);
+		return (EINVAL);
+	}
 
 	/*
 	 * These files have just gained a fence, so anything reconstructed for
 	 * them before now was reconstructed without one.  Collect them and drop
 	 * their cached pages, outside the registry lock.
 	 */
-	if (__sc_publication_fence_list_build(dbenv, build_id, fileids,
-	    MAX_BUILD_FILES, &nfiles) == 0) {
-		for (i = 0; i < nfiles; i++)
-			__sc_publication_fence_drop_cached_pages(dbenv,
-			    fileids + (size_t)i * DB_FILE_ID_LEN);
-	}
+	for (i = 0; i < nfiles; i++)
+		__sc_publication_fence_drop_cached_pages(dbenv,
+		    fileids + (size_t)i * DB_FILE_ID_LEN);
+	__os_free(dbenv, fileids);
 
 	return (0);
 }
 
 struct sc_fence_list_arg {
-	u_int64_t build_id;
+	const sc_build_id_t *build_id;
 	u_int8_t *out;
 	int max;
 	int n;
@@ -773,8 +976,13 @@ collect_one_build_fence(void *obj, void *arg)
 	SC_PUBLICATION_FENCE *f = obj;
 	struct sc_fence_list_arg *a = arg;
 
-	if (f->build_id != a->build_id)
+	if (!sc_build_id_equal(&f->build_id, a->build_id))
 		return (0);
+
+	if (a->out == NULL) {
+		a->n++;
+		return (0);
+	}
 
 	if (a->n >= a->max) {
 		a->n = -1;	/* caller's buffer is too small; say so */
@@ -792,13 +1000,14 @@ collect_one_build_fence(void *obj, void *arg)
  *	Copy out the file ids belonging to a build, so its caller can make them
  *	durable.  Returns -1 if they do not fit in max entries.
  *
- * PUBLIC: int __sc_publication_fence_list_build __P((DB_ENV *, u_int64_t,
+ * PUBLIC: int __sc_publication_fence_list_build __P((DB_ENV *,
+ * PUBLIC:     const sc_build_id_t *,
  * PUBLIC:	   u_int8_t *, int, int *));
  */
 int
 __sc_publication_fence_list_build(dbenv, build_id, out, max, nout)
 	DB_ENV *dbenv;
-	u_int64_t build_id;
+	const sc_build_id_t *build_id;
 	u_int8_t *out;
 	int max;
 	int *nout;
@@ -808,12 +1017,13 @@ __sc_publication_fence_list_build(dbenv, build_id, out, max, nout)
 
 	*nout = 0;
 
-	if (reg == NULL || build_id == 0 || out == NULL || max <= 0)
+	if (reg == NULL || sc_build_id_is_zero(build_id) || max < 0 ||
+	    (out == NULL && max != 0))
 		return (EINVAL);
 
 	arg.build_id = build_id;
 	arg.out = out;
-	arg.max = max;
+	arg.max = out == NULL ? INT_MAX : max;
 	arg.n = 0;
 
 	Pthread_mutex_lock(&reg->lk);
@@ -833,7 +1043,7 @@ find_one_build_fence(void *obj, void *arg)
 	SC_PUBLICATION_FENCE *f = obj;
 	struct sc_fence_build_arg *a = arg;
 
-	if (f->build_id != a->build_id)
+	if (!sc_build_id_equal(&f->build_id, a->build_id))
 		return (0);
 
 	a->found = f;
@@ -845,17 +1055,18 @@ find_one_build_fence(void *obj, void *arg)
  *	Drop every pending file of a build that will not publish.  Idempotent,
  *	so terminal schema-change paths can call it unconditionally.
  *
- * PUBLIC: int __sc_publication_fence_discard_build __P((DB_ENV *, u_int64_t));
+ * PUBLIC: int __sc_publication_fence_discard_build __P((DB_ENV *,
+ * PUBLIC:     const sc_build_id_t *));
  */
 int
 __sc_publication_fence_discard_build(dbenv, build_id)
 	DB_ENV *dbenv;
-	u_int64_t build_id;
+	const sc_build_id_t *build_id;
 {
 	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
 	struct sc_fence_build_arg arg;
 
-	if (reg == NULL || build_id == 0)
+	if (reg == NULL || sc_build_id_is_zero(build_id))
 		return (0);
 
 	Pthread_mutex_lock(&reg->lk);
@@ -911,6 +1122,36 @@ __sc_publication_fence_get(dbenv, fileid, fence_lsn)
 
 	Pthread_mutex_unlock(&reg->lk);
 	return (ret);
+}
+
+/* PUBLIC: u_int64_t __sc_publication_fence_epoch __P((DB_ENV *)); */
+u_int64_t
+__sc_publication_fence_epoch(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	u_int64_t epoch = 0;
+
+	if (reg == NULL)
+		return (0);
+	Pthread_mutex_lock(&reg->lk);
+	epoch = reg->epoch;
+	Pthread_mutex_unlock(&reg->lk);
+	return (epoch);
+}
+
+/* PUBLIC: void __sc_publication_fence_note_epoch_retry __P((DB_ENV *)); */
+void
+__sc_publication_fence_note_epoch_retry(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+
+	if (reg == NULL)
+		return;
+	Pthread_mutex_lock(&reg->lk);
+	reg->epoch_retries++;
+	Pthread_mutex_unlock(&reg->lk);
 }
 
 /*
@@ -981,14 +1222,14 @@ __sc_publication_fence_stats(dbenv, entries, stops, hits, misses, early, dropped
  *	transaction.  Not from trans_start_sc_lowpri(), which also serves
  *	logical redo and other schema-change work.
  *
- * PUBLIC: void __txn_set_sc_build __P((DB_TXN *, u_int64_t));
+ * PUBLIC: void __txn_set_sc_build __P((DB_TXN *, const sc_build_id_t *));
  */
 void
 __txn_set_sc_build(txnp, build_id)
 	DB_TXN *txnp;
-	u_int64_t build_id;
+	const sc_build_id_t *build_id;
 {
-	if (txnp == NULL || build_id == 0)
+	if (txnp == NULL || sc_build_id_is_zero(build_id))
 		return;
 
 	/*
@@ -1010,8 +1251,9 @@ __txn_set_sc_build(txnp, build_id)
 		return;
 	}
 
-	txnp->sc_build_id = build_id;
+	txnp->sc_build_id = *build_id;
 	txnp->sc_skip_commit_map = 0;
+	txnp->sc_unsafe_public_write = 0;
 
 	(void)ATOMIC_ADD64(sc_direct_copy_txns_marked, 1);
 }
@@ -1020,8 +1262,8 @@ __txn_set_sc_build(txnp, build_id)
  * __txn_note_sc_file_write_int --
  *	Slow path of the physical-write check; see __txn_note_sc_file_write().
  *
- *	This is the entire rule.  There is deliberately no else branch: a write
- *	to some other file must not undo an earlier match.
+ *	A private-file match qualifies the transaction; any public user-file write
+ *	disqualifies it.  Internal metadata writes do neither.
  *
  * PUBLIC: void __txn_note_sc_file_write_int __P((DB_TXN *, DB *));
  */
@@ -1030,17 +1272,21 @@ __txn_note_sc_file_write_int(txnp, dbp)
 	DB_TXN *txnp;
 	DB *dbp;
 {
-	u_int64_t file_build_id;
+	sc_build_id_t file_build_id;
 
 	if (__sc_private_file_lookup(txnp->mgrp->dbenv, dbp->fileid,
-	    &file_build_id) != 0)
+	    &file_build_id) != 0) {
+		if (dbp->sc_is_user_file)
+			txnp->sc_unsafe_public_write = 1;
 		return;
+	}
 
-	if (file_build_id == txnp->sc_build_id) {
+	if (sc_build_id_equal(&file_build_id, &txnp->sc_build_id)) {
 		if (!txnp->sc_skip_commit_map)
 			(void)ATOMIC_ADD64(sc_direct_copy_txns_matched, 1);
 		txnp->sc_skip_commit_map = 1;
-	}
+	} else if (dbp->sc_is_user_file)
+		txnp->sc_unsafe_public_write = 1;
 }
 
 /*
