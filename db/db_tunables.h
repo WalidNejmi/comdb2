@@ -1146,6 +1146,18 @@ REGISTER_TUNABLE("sc_commit_flags_advertise",
                  "TEST ONLY. Advertise support for schema-change commit flags.",
                  TUNABLE_BOOLEAN, &gbl_sc_commit_flags_advertise,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+REGISTER_TUNABLE("mempv_test_pause_before_cache_put",
+                 "TEST ONLY. Pause historical-page reconstruction before cache insertion.",
+                 TUNABLE_BOOLEAN, &gbl_mempv_test_pause_before_cache_put,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+REGISTER_TUNABLE("mempv_test_paused",
+                 "TEST ONLY. Historical-page reconstruction is paused before cache insertion.",
+                 TUNABLE_BOOLEAN, &gbl_mempv_test_paused,
+                 READONLY | EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+REGISTER_TUNABLE("mempv_test_bump_fence_epoch",
+                 "TEST ONLY. Bump the fence epoch once before cache insertion.",
+                 TUNABLE_BOOLEAN, &gbl_mempv_test_bump_fence_epoch,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 /* 'retrieve_gen_from_ckp' / 'recovery_ckp' disabled under legacy_defaults until db moves */
 REGISTER_TUNABLE("retrieve_gen_from_ckp", "Retrieve generation from ckp records.  (Default: on)", TUNABLE_BOOLEAN,
                  &gbl_retrieve_gen_from_ckp, 0, NULL, NULL, NULL, NULL);

@@ -189,6 +189,7 @@ int __sc_publication_fence_get __P((DB_ENV *, const u_int8_t *, DB_LSN *));
 int __sc_publication_fence_ready __P((DB_ENV *));
 void __sc_publication_fence_set_failed __P((DB_ENV *));
 u_int64_t __sc_publication_fence_epoch __P((DB_ENV *));
+void __sc_publication_fence_test_bump_epoch __P((DB_ENV *));
 void __sc_publication_fence_note_epoch_retry __P((DB_ENV *));
 void __sc_publication_fence_note __P((DB_ENV *, int));
 void __sc_publication_fence_stats __P((DB_ENV *, u_int64_t *, u_int64_t *,

@@ -1176,6 +1176,20 @@ __sc_publication_fence_epoch(dbenv)
 	return (epoch);
 }
 
+/* PUBLIC: void __sc_publication_fence_test_bump_epoch __P((DB_ENV *)); */
+void
+__sc_publication_fence_test_bump_epoch(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+
+	if (reg == NULL)
+		return;
+	Pthread_mutex_lock(&reg->lk);
+	reg->epoch++;
+	Pthread_mutex_unlock(&reg->lk);
+}
+
 /* PUBLIC: void __sc_publication_fence_note_epoch_retry __P((DB_ENV *)); */
 void
 __sc_publication_fence_note_epoch_retry(dbenv)

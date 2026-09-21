@@ -11,6 +11,7 @@
 #include "dbinc/db_shash.h"
 #include "dbinc/hmac.h"
 #include "dbinc_auto/hmac_ext.h"
+#include "comdb2_atomic.h"
 
 #define PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn, smallest_logfile, target_lsn, pglsn) \
 		(log_compare(&highest_checkpoint_lsn, &pglsn) > 0 || IS_NOT_LOGGED_LSN(pglsn) || (pglsn.file < smallest_logfile))
@@ -28,8 +29,13 @@ extern int __txn_commit_map_get(DB_ENV *, u_int64_t, DB_LSN *);
 extern int __sc_publication_fence_get(DB_ENV *, const u_int8_t *, DB_LSN *);
 extern int __sc_publication_fence_ready(DB_ENV *);
 extern u_int64_t __sc_publication_fence_epoch(DB_ENV *);
+extern void __sc_publication_fence_test_bump_epoch(DB_ENV *);
 extern void __sc_publication_fence_note_epoch_retry(DB_ENV *);
 extern void __sc_publication_fence_note(DB_ENV *, int);
+
+int gbl_mempv_test_pause_before_cache_put = 0;
+int gbl_mempv_test_paused = 0;
+int gbl_mempv_test_bump_fence_epoch = 0;
 
 /*
  * __mempv_sc_fence_guarantees_target --
@@ -410,6 +416,14 @@ found_page:
 	*(void **)ret_page = (void *) page_image;
 
 	if (add_to_cache == 1) {
+	   if (ATOMIC_LOAD32(gbl_mempv_test_pause_before_cache_put)) {
+		XCHANGE32(gbl_mempv_test_paused, 1);
+		while (ATOMIC_LOAD32(gbl_mempv_test_pause_before_cache_put))
+			(void)__os_sleep(dbenv, 0, 10000);
+		XCHANGE32(gbl_mempv_test_paused, 0);
+	   }
+	   if (XCHANGE32(gbl_mempv_test_bump_fence_epoch, 0))
+		__sc_publication_fence_test_bump_epoch(dbenv);
 	   if (__sc_publication_fence_epoch(dbenv) != fence_epoch) {
 		__sc_publication_fence_note_epoch_retry(dbenv);
 		if (logc != NULL) {

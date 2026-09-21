@@ -845,6 +845,14 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 				fearly);
 		logmsg(lvl, "SC fence cached pages dropped: %"PRIu64"\n",
 				fdropped);
+		SC_PUBLICATION_FENCE_REGISTRY *freg = dbenv->sc_publication_fences;
+		u_int64_t retries = 0;
+		if (freg != NULL) {
+			Pthread_mutex_lock(&freg->lk);
+			retries = freg->epoch_retries;
+			Pthread_mutex_unlock(&freg->lk);
+		}
+		logmsg(lvl, "SC fence epoch retries: %"PRIu64"\n", retries);
 	}
 
 	/* Enough to tell whether the mechanism was available at all. */
