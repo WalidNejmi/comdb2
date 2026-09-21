@@ -36,6 +36,36 @@
 #include "dbinc/db_swap.h"
 #include "dbinc/txn.h"
 
+typedef int (*dispatch_fn)(DB_ENV *, DBT *, DB_LSN *, db_recops, void *);
+
+int
+__db_add_recovery(DB_ENV *dbenv, dispatch_fn **dtabp, size_t *dtabsizep,
+                  dispatch_fn func, u_int32_t ndx)
+{
+    dispatch_fn *new_table;
+    size_t old_size = *dtabsizep;
+
+    (void)dbenv;
+    if (ndx >= old_size) {
+        new_table = realloc(*dtabp, (ndx + 1) * sizeof(*new_table));
+        if (new_table == NULL)
+            return ENOMEM;
+        memset(new_table + old_size, 0,
+               (ndx + 1 - old_size) * sizeof(*new_table));
+        *dtabp = new_table;
+        *dtabsizep = ndx + 1;
+    }
+    (*dtabp)[ndx] = func;
+    return 0;
+}
+
+extern int __txn_init_print(DB_ENV *, dispatch_fn **, size_t *);
+#ifdef HAVE_REPLICATION
+extern int __txn_init_getpgnos(DB_ENV *, dispatch_fn **, size_t *);
+extern int __txn_init_getallpgnos(DB_ENV *, dispatch_fn **, size_t *);
+#endif
+extern int __txn_init_recover(DB_ENV *, dispatch_fn **, size_t *);
+
 /*
  * This test links against txn_auto.c alone, so that it exercises the real
  * production decoders without dragging in the entire server.  The decoders
@@ -479,6 +509,40 @@ test_truncated_records(int utxnid_logged)
     free(gen);
 }
 
+static void
+test_dispatch_initializer(const char *name,
+                          int (*initializer)(DB_ENV *, dispatch_fn **,
+                                             size_t *))
+{
+    static const u_int32_t rectypes[] = {
+        DB___txn_regop_flags,
+        DB___txn_regop_gen_flags,
+        DB___txn_regop_gen_flags_endianize,
+    };
+    dispatch_fn *table = NULL;
+    size_t table_size = 0;
+    size_t i;
+    int ret;
+
+    ret = initializer(NULL, &table, &table_size);
+    CHECK(ret == 0, "%s initializer returned %d", name, ret);
+    for (i = 0; i < sizeof(rectypes) / sizeof(rectypes[0]); i++)
+        CHECK(rectypes[i] < table_size && table[rectypes[i]] != NULL,
+              "%s missing rectype %u", name, rectypes[i]);
+    free(table);
+}
+
+static void
+test_dispatch_registrations(void)
+{
+    test_dispatch_initializer("print", __txn_init_print);
+#ifdef HAVE_REPLICATION
+    test_dispatch_initializer("getpgnos", __txn_init_getpgnos);
+    test_dispatch_initializer("getallpgnos", __txn_init_getallpgnos);
+#endif
+    test_dispatch_initializer("recover", __txn_init_recover);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -507,6 +571,7 @@ main(int argc, char *argv[])
         test_parent_prefix_equivalence(utxnid);
         test_truncated_records(utxnid);
     }
+    test_dispatch_registrations();
 
     printf("txn_commit_flags_roundtrip: %d checks, %d failures\n", checks,
            failures);

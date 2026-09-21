@@ -27,7 +27,6 @@
         abort();                                                               \
     }
 
-UNUSED_STUB(__db_add_recovery)
 UNUSED_STUB(__lock_get_list)
 UNUSED_STUB(__log_put)
 UNUSED_STUB(__log_put_commit_context)
@@ -58,6 +57,13 @@ void *comdb2_malloc_static(void *pool, unsigned long size)
 {
     (void)pool;
     return malloc(size ? size : 1);
+}
+
+void *comdb2_realloc_static(void *pool, void *ptr, unsigned long size);
+void *comdb2_realloc_static(void *pool, void *ptr, unsigned long size)
+{
+    (void)pool;
+    return realloc(ptr, size ? size : 1);
 }
 
 /*
