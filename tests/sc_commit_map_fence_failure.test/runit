@@ -48,15 +48,15 @@ rm -f /tmp/sc_fence_outer_abort.$$
 	fail "outer abort left published RAM fences"
 
 expect_failed_rebuild() {
-	local tunable=$1 after=$2 before
+	local tunable=$1 after=$2 reset=${3:-2147483647} before
 	before=$(fences)
 	run "put tunable '$tunable' $after" >/dev/null ||
 		fail "could not set $tunable=$after"
 	if run "rebuild t" >/tmp/sc_fence_failure.$$ 2>&1; then
-		run "put tunable '$tunable' 2147483647" >/dev/null
+		run "put tunable '$tunable' $reset" >/dev/null
 		fail "rebuild unexpectedly succeeded with $tunable=$after"
 	fi
-	run "put tunable '$tunable' 2147483647" >/dev/null ||
+	run "put tunable '$tunable' $reset" >/dev/null ||
 		fail "could not reset $tunable"
 	[[ "$(run "select table_version('t')")" == "$base_version" ]] ||
 		fail "failed rebuild changed table version"
@@ -68,6 +68,7 @@ expect_failed_rebuild() {
 
 expect_failed_rebuild sc_fence_persist_fail_after 0
 expect_failed_rebuild sc_fence_persist_fail_after 1
+expect_failed_rebuild sc_fence_test_drop_pending 1 0
 
 # A partial durable write must roll back with the publication transaction.
 stop_all_nodes

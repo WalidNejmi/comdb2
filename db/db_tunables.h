@@ -2407,6 +2407,11 @@ REGISTER_TUNABLE("sc_pause_after_fence",
                  TUNABLE_INTEGER, &gbl_sc_pause_after_fence,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 
+REGISTER_TUNABLE("sc_fence_test_drop_pending",
+                 "TEST ONLY. Drop pending publication fences before persistence.",
+                 TUNABLE_BOOLEAN, &gbl_sc_fence_test_drop_pending,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+
 REGISTER_TUNABLE("cached_output_buffer_max_bytes",
                  "Maximum size in bytes of the output buffer of an appsock "
                  "thread.  (Default: 8 MiB)",

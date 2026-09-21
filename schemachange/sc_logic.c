@@ -356,6 +356,7 @@ static int sc_publish_fences(struct schema_change_type *s, tran_type *tran,
                              unsigned int fence_file,
                              unsigned int fence_offset)
 {
+    extern int gbl_sc_fence_test_drop_pending;
     sc_build_id_t build_id;
 
     if (s == NULL || s->db == NULL || s->db->handle == NULL || fence_file == 0)
@@ -366,6 +367,9 @@ static int sc_publish_fences(struct schema_change_type *s, tran_type *tran,
 
     if (s->sc_expected_fence_count == 0)
         return 0;
+
+    if (gbl_sc_fence_test_drop_pending)
+        bdb_sc_publication_fence_discard(s->db->handle, &build_id);
 
     /*
      * Durable first, in the publication transaction, so the record shares the
@@ -405,6 +409,7 @@ static void sc_discard_fences(struct schema_change_type *s)
 }
 
 int gbl_sc_pause_after_fence = 0;
+int gbl_sc_fence_test_drop_pending = 0;
 
 static void sc_test_pause_after_fence(void)
 {
