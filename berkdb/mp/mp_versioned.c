@@ -11,6 +11,7 @@
 #include "dbinc/db_shash.h"
 #include "dbinc/hmac.h"
 #include "dbinc_auto/hmac_ext.h"
+#include "comdb2_atomic.h"
 
 #define PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn, smallest_logfile, target_lsn, pglsn) \
 		(log_compare(&highest_checkpoint_lsn, &pglsn) > 0 || IS_NOT_LOGGED_LSN(pglsn) || (pglsn.file < smallest_logfile))
@@ -24,6 +25,50 @@
 extern char *optostr(int op);
 
 extern int __txn_commit_map_get(DB_ENV *, u_int64_t, DB_LSN *);
+
+extern int __sc_publication_fence_get(DB_ENV *, const u_int8_t *, DB_LSN *,
+	u_int64_t *);
+extern int __sc_publication_fence_ready(DB_ENV *);
+extern u_int64_t __sc_publication_fence_epoch(DB_ENV *);
+extern void __sc_publication_fence_test_bump_epoch(DB_ENV *);
+extern void __sc_publication_fence_note_epoch_retry(DB_ENV *);
+extern void __sc_publication_fence_note(DB_ENV *, int);
+
+int gbl_mempv_test_pause_before_cache_put = 0;
+int gbl_mempv_test_paused = 0;
+int gbl_mempv_test_bump_fence_epoch = 0;
+
+static int
+__mempv_sc_fence_guarantees_target(dbenv, fileid, target_lsn, page_lsn)
+	DB_ENV *dbenv;
+	const u_int8_t *fileid;
+	DB_LSN target_lsn;
+	DB_LSN page_lsn;
+{
+	DB_LSN fence, visible_from;
+	u_int64_t publication_utxnid;
+
+	if (__sc_publication_fence_get(dbenv, fileid, &fence,
+	    &publication_utxnid) != 0)
+		return (0);
+
+	/* Legacy v1/v2 records use the fence as their visibility boundary. */
+	visible_from = fence;
+	if (publication_utxnid != 0 &&
+	    __txn_commit_map_get(dbenv, publication_utxnid, &visible_from) != 0)
+		return (-1);
+
+	if (log_compare(&visible_from, &target_lsn) > 0) {
+		__sc_publication_fence_note(dbenv, 0);
+		return (-1);
+	}
+
+	if (log_compare(&page_lsn, &fence) > 0)
+		return (0);
+
+	__sc_publication_fence_note(dbenv, 1);
+	return (1);
+}
 
 extern int __mempv_cache_init(DB_ENV *, MEMPV_CACHE *cache);
 extern int __mempv_cache_get(DB *dbp, MEMPV_CACHE *cache, u_int8_t file_id[DB_FILE_ID_LEN], db_pgno_t pgno, DB_LSN target_lsn, BH *bhp);
@@ -191,7 +236,16 @@ int __mempv_fget(mpf, dbp, pgno, target_lsn, highest_checkpoint_lsn, ret_page, f
 	DB_ENV *dbenv;
 	BH *bhp;
 	void *data_t;
+	u_int64_t fence_epoch;
 
+	dbenv = mpf->dbenv;
+retry:
+	if (!__sc_publication_fence_ready(dbenv)) {
+		logmsg(LOGMSG_ERROR,
+		    "%s: schema-change publication-fence state is unavailable\n",
+		    __func__);
+		return (EINVAL);
+	}
 	ret = found = add_to_cache = 0;
 	logc = NULL;
 	page = page_image = NULL;
@@ -200,7 +254,7 @@ int __mempv_fget(mpf, dbp, pgno, target_lsn, highest_checkpoint_lsn, ret_page, f
 	*(void **)ret_page = NULL;
 	DBT dbt = {0};
 	dbt.flags = DB_DBT_REALLOC;
-	dbenv = mpf->dbenv;
+	fence_epoch = __sc_publication_fence_epoch(dbenv);
 	mempv_debug = dbenv->attr.mempv_debug;
 	Pthread_mutex_lock(&dbenv->txmap->txmap_mutexp);
 	smallest_logfile = dbenv->txmap->smallest_logfile;
@@ -223,7 +277,22 @@ int __mempv_fget(mpf, dbp, pgno, target_lsn, highest_checkpoint_lsn, ret_page, f
 		highest_checkpoint_lsn.offset);
 	}
 
-	if (PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn, smallest_logfile, target_lsn, initial_lsn)) {
+	int fence_result;
+	if (PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn,
+	    smallest_logfile, target_lsn, initial_lsn)) {
+		found = 1;
+		page_image = page;
+		goto found_page;
+	}
+	fence_result = __mempv_sc_fence_guarantees_target(
+	    dbenv, mpf->fileid, target_lsn, initial_lsn);
+	if (fence_result < 0) {
+		__mempv_logmsg(LOGMSG_ERROR, caller_id,
+		    "Snapshot target predates the selected file generation's publication\n");
+		ret = EINVAL;
+		goto err;
+	}
+	if (fence_result > 0) {
 		if (mempv_debug) {
 			__mempv_logmsg(LOGMSG_USER, caller_id,
 				"Page's LSN (%"PRIu32":%"PRIu32") indicates that it is at the right version\n",
@@ -274,7 +343,21 @@ int __mempv_fget(mpf, dbp, pgno, target_lsn, highest_checkpoint_lsn, ret_page, f
 	DB_LSN current_lsn = initial_lsn;
 	while (!found) 
 	{
-		if (PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn, smallest_logfile, target_lsn, current_lsn)) {
+		if (PAGE_VERSION_IS_GUARANTEED_TARGET(highest_checkpoint_lsn,
+		    smallest_logfile, target_lsn, current_lsn)) {
+			add_to_cache = 1;
+			found = 1;
+			break;
+		}
+		fence_result = __mempv_sc_fence_guarantees_target(
+		    dbenv, mpf->fileid, target_lsn, current_lsn);
+		if (fence_result < 0) {
+			__mempv_logmsg(LOGMSG_ERROR, caller_id,
+			    "Snapshot target predates the selected file generation's publication\n");
+			ret = EINVAL;
+			goto err;
+		}
+		if (fence_result > 0) {
 			if (mempv_debug) {
 				__mempv_logmsg(LOGMSG_USER, caller_id,
 					"Page's LSN (%"PRIu32":%"PRIu32") indicates that it is at the right version\n",
@@ -340,6 +423,29 @@ found_page:
 	*(void **)ret_page = (void *) page_image;
 
 	if (add_to_cache == 1) {
+	   if (ATOMIC_LOAD32(gbl_mempv_test_pause_before_cache_put)) {
+		XCHANGE32(gbl_mempv_test_paused, 1);
+		while (ATOMIC_LOAD32(gbl_mempv_test_pause_before_cache_put))
+			(void)__os_sleep(dbenv, 0, 10000);
+		XCHANGE32(gbl_mempv_test_paused, 0);
+	   }
+	   if (XCHANGE32(gbl_mempv_test_bump_fence_epoch, 0))
+		__sc_publication_fence_test_bump_epoch(dbenv);
+	  if (__sc_publication_fence_epoch(dbenv) != fence_epoch) {
+		__sc_publication_fence_note_epoch_retry(dbenv);
+		if (logc != NULL) {
+			__log_c_close(logc);
+			logc = NULL;
+		}
+		if (dbt.data != NULL) {
+			__os_free(dbenv, dbt.data);
+			dbt.data = NULL;
+		}
+		__os_free(dbenv, bhp);
+		bhp = NULL;
+		*(void **)ret_page = NULL;
+		goto retry;
+	   }
 	   __mempv_cache_put(dbp, &dbenv->mempv->cache, mpf->fileid, pgno, bhp, target_lsn);
 	}
 err:

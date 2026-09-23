@@ -132,6 +132,74 @@ static int __mempv_cache_evict_page(dbp, cache, pinned_version_list)
 	return 0;
 }
 
+struct mempv_cache_find_file {
+	u_int8_t fileid[DB_FILE_ID_LEN];
+	MEMPV_CACHE_PAGE_VERSIONS *found;
+};
+
+static int __mempv_cache_find_file(obj, arg)
+	void *obj;
+	void *arg;
+{
+	MEMPV_CACHE_PAGE_VERSIONS *versions = obj;
+	struct mempv_cache_find_file *find = arg;
+
+	if (memcmp(versions->key.ufid, find->fileid, DB_FILE_ID_LEN) != 0)
+		return (0);
+
+	find->found = versions;
+	return (1);
+}
+
+/*
+ * PUBLIC: int __mempv_cache_invalidate_file
+ * PUBLIC:     __P((DB_ENV *, u_int8_t *));
+ */
+int __mempv_cache_invalidate_file(dbenv, fileid)
+	DB_ENV *dbenv;
+	u_int8_t *fileid;
+{
+	MEMPV_CACHE *cache;
+	struct mempv_cache_find_file find;
+	MEMPV_CACHE_PAGE_HEADER *header;
+	int ndropped = 0;
+
+	if (dbenv == NULL || dbenv->mempv == NULL || fileid == NULL)
+		return (0);
+
+	cache = &dbenv->mempv->cache;
+	pthread_mutex_lock(&(cache->lock));
+
+	memcpy(find.fileid, fileid, DB_FILE_ID_LEN);
+	for (;;) {
+		find.found = NULL;
+		hash_for(cache->pages, &__mempv_cache_find_file, &find);
+		if (find.found == NULL)
+			break;
+
+		for (;;) {
+			void *entry = NULL;
+			unsigned int bucket = 0;
+
+			header = hash_first(find.found->versions, &entry, &bucket);
+			if (header == NULL)
+				break;
+			hash_del(find.found->versions, header);
+			listc_rfl(&cache->evict_list, header);
+			__os_free(dbenv, header);
+			cache->num_cached_pages--;
+			ndropped++;
+		}
+
+		hash_del(cache->pages, find.found);
+		hash_free(find.found->versions);
+		__os_free(dbenv, find.found);
+	}
+
+	pthread_mutex_unlock(&(cache->lock));
+	return (ndropped);
+}
+
 /*
  * __mempv_cache_put --
  * Puts *a copy* of the page version given by `bhp` into the cache.

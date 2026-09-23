@@ -3038,7 +3038,14 @@ typedef struct __sc_publication_fence_record SC_PUBLICATION_FENCE_RECORD;
 struct __sc_publication_fence_registry {
 	pthread_mutex_t lk;
 	hash_t *files;
+	u_int64_t epoch;
 	int readiness;
+	u_int64_t stops;
+	u_int64_t lookup_hits;
+	u_int64_t lookup_misses;
+	u_int64_t target_before_publication;
+	u_int64_t cached_pages_dropped;
+	u_int64_t epoch_retries;
 };
 
 struct __mempv_cache_page_key

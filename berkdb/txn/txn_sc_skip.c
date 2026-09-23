@@ -29,6 +29,8 @@ static const char revid[] = "$Id: txn_sc_skip.c,v 1.0 2026/09/15 00:00:00 comdb2
 #include "logmsg.h"
 #include "comdb2_atomic.h"
 
+extern int __mempv_cache_invalidate_file __P((DB_ENV *, u_int8_t *));
+
 static u_int64_t sc_direct_copy_txns_marked = 0;
 static u_int64_t sc_direct_copy_txns_matched = 0;
 static u_int64_t sc_direct_copy_txns_unsafe = 0;
@@ -352,6 +354,23 @@ __sc_publication_fence_registry_destroy(dbenv)
 	return (0);
 }
 
+static void
+__sc_publication_fence_drop_cached_pages(dbenv, fileid)
+	DB_ENV *dbenv;
+	const u_int8_t *fileid;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	int ndropped = __mempv_cache_invalidate_file(dbenv, (u_int8_t *)fileid);
+
+	if (ndropped <= 0)
+		return;
+	if (reg != NULL) {
+		Pthread_mutex_lock(&reg->lk);
+		reg->cached_pages_dropped += (u_int64_t)ndropped;
+		Pthread_mutex_unlock(&reg->lk);
+	}
+}
+
 int
 __sc_publication_fence_pend(dbenv, fileid, build_id)
 	DB_ENV *dbenv;
@@ -422,6 +441,34 @@ copy_pending_fence(void *obj, void *arg)
 	return (0);
 }
 
+struct sc_fence_changed_arg {
+	hash_t *other;
+	u_int8_t *fileids;
+	size_t n;
+	int removed;
+};
+
+static int
+collect_changed_fence(void *obj, void *arg)
+{
+	SC_PUBLICATION_FENCE *f = obj;
+	SC_PUBLICATION_FENCE *other;
+	struct sc_fence_changed_arg *changed = arg;
+
+	if (IS_ZERO_LSN(f->fence_lsn))
+		return (0);
+	other = hash_find(changed->other, f->fileid);
+	if (changed->removed ? other == NULL :
+	    (other == NULL || IS_ZERO_LSN(other->fence_lsn) ||
+	    log_compare(&f->fence_lsn, &other->fence_lsn) != 0 ||
+	    f->publication_utxnid != other->publication_utxnid)) {
+		memcpy(changed->fileids + changed->n * DB_FILE_ID_LEN, f->fileid,
+		    DB_FILE_ID_LEN);
+		changed->n++;
+	}
+	return (0);
+}
+
 static void
 free_fence_hash(dbenv, files)
 	DB_ENV *dbenv;
@@ -442,7 +489,10 @@ __sc_publication_fence_reconcile(dbenv, records, nrecords)
 	SC_PUBLICATION_FENCE *f;
 	hash_t *newfiles, *oldfiles;
 	struct sc_fence_pending_copy_arg pending;
-	int ret = 0, i;
+	struct sc_fence_changed_arg changed;
+	u_int8_t *changed_fileids = NULL;
+	size_t maxchanged, i;
+	int ret = 0;
 
 	if (reg == NULL || nrecords < 0 || (nrecords > 0 && records == NULL))
 		return (EINVAL);
@@ -452,7 +502,7 @@ __sc_publication_fence_reconcile(dbenv, records, nrecords)
 	if (newfiles == NULL)
 		return (ENOMEM);
 
-	for (i = 0; i < nrecords; i++) {
+	for (i = 0; i < (size_t)nrecords; i++) {
 		if (IS_ZERO_LSN(records[i].fence_lsn) ||
 		    sc_build_id_is_zero(&records[i].build_id) ||
 		    hash_find(newfiles, records[i].fileid) != NULL ||
@@ -482,10 +532,33 @@ __sc_publication_fence_reconcile(dbenv, records, nrecords)
 		ret = pending.ret;
 		goto err;
 	}
+	maxchanged = hash_get_num_entries(oldfiles) +
+	    hash_get_num_entries(newfiles);
+	if (maxchanged != 0 && __os_malloc(dbenv,
+	    maxchanged * DB_FILE_ID_LEN, &changed_fileids) != 0) {
+		Pthread_mutex_unlock(&reg->lk);
+		ret = ENOMEM;
+		goto err;
+	}
+	changed.other = oldfiles;
+	changed.fileids = changed_fileids;
+	changed.n = 0;
+	changed.removed = 0;
+	hash_for(newfiles, &collect_changed_fence, &changed);
+	changed.other = newfiles;
+	changed.removed = 1;
+	hash_for(oldfiles, &collect_changed_fence, &changed);
 	reg->files = newfiles;
 	reg->readiness = SC_FENCE_READY;
+	if (changed.n != 0)
+		reg->epoch++;
 	Pthread_mutex_unlock(&reg->lk);
 
+	for (i = 0; i < changed.n; i++)
+		__sc_publication_fence_drop_cached_pages(dbenv,
+		    changed_fileids + i * DB_FILE_ID_LEN);
+	if (changed_fileids != NULL)
+		__os_free(dbenv, changed_fileids);
 	free_fence_hash(dbenv, oldfiles);
 	return (0);
 
@@ -519,6 +592,7 @@ __sc_publication_fence_set_failed(dbenv)
 		return;
 	Pthread_mutex_lock(&reg->lk);
 	reg->readiness = SC_FENCE_FAILED;
+	reg->epoch++;
 	Pthread_mutex_unlock(&reg->lk);
 }
 
@@ -624,7 +698,8 @@ __sc_publication_fence_publish(dbenv, build_id, fence_lsn,
 {
 	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
 	struct sc_fence_build_arg build;
-	int nfiles;
+	u_int8_t *fileids = NULL;
+	int nfiles, i;
 
 	if (reg == NULL || sc_build_id_is_zero(build_id) ||
 	    IS_ZERO_LSN(fence_lsn) || publication_utxnid == 0 ||
@@ -633,6 +708,13 @@ __sc_publication_fence_publish(dbenv, build_id, fence_lsn,
 	if (__sc_publication_fence_list_build(dbenv, build_id, NULL, 0,
 	    &nfiles) != 0 || nfiles != expected_count)
 		return (EINVAL);
+	if (__os_malloc(dbenv, (size_t)nfiles * DB_FILE_ID_LEN, &fileids) != 0)
+		return (ENOMEM);
+	if (__sc_publication_fence_list_build(dbenv, build_id, fileids,
+	    nfiles, &nfiles) != 0 || nfiles != expected_count) {
+		__os_free(dbenv, fileids);
+		return (EINVAL);
+	}
 
 	build.build_id = build_id;
 	build.fence_lsn = fence_lsn;
@@ -642,9 +724,17 @@ __sc_publication_fence_publish(dbenv, build_id, fence_lsn,
 	build.failed = 0;
 	Pthread_mutex_lock(&reg->lk);
 	hash_for(reg->files, &stamp_one_build_fence, &build);
+	if (!build.failed && build.nstamped == (u_int64_t)expected_count)
+		reg->epoch++;
 	Pthread_mutex_unlock(&reg->lk);
-	if (build.failed || build.nstamped != (u_int64_t)expected_count)
+	if (build.failed || build.nstamped != (u_int64_t)expected_count) {
+		__os_free(dbenv, fileids);
 		return (EINVAL);
+	}
+	for (i = 0; i < nfiles; i++)
+		__sc_publication_fence_drop_cached_pages(dbenv,
+		    fileids + (size_t)i * DB_FILE_ID_LEN);
+	__os_free(dbenv, fileids);
 	return (0);
 }
 
@@ -685,19 +775,113 @@ __sc_publication_fence_discard_build(dbenv, build_id)
 	return (0);
 }
 
+int
+__sc_publication_fence_get(dbenv, fileid, fence_lsn, publication_utxnid)
+	DB_ENV *dbenv;
+	const u_int8_t *fileid;
+	DB_LSN *fence_lsn;
+	u_int64_t *publication_utxnid;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	SC_PUBLICATION_FENCE *f;
+	int ret = DB_NOTFOUND;
+
+	if (reg == NULL || fileid == NULL)
+		return (DB_NOTFOUND);
+	Pthread_mutex_lock(&reg->lk);
+	f = hash_find(reg->files, fileid);
+	if (f != NULL && !IS_ZERO_LSN(f->fence_lsn)) {
+		*fence_lsn = f->fence_lsn;
+		*publication_utxnid = f->publication_utxnid;
+		reg->lookup_hits++;
+		ret = 0;
+	} else
+		reg->lookup_misses++;
+	Pthread_mutex_unlock(&reg->lk);
+	return (ret);
+}
+
+u_int64_t
+__sc_publication_fence_epoch(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	u_int64_t epoch = 0;
+
+	if (reg == NULL)
+		return (0);
+	Pthread_mutex_lock(&reg->lk);
+	epoch = reg->epoch;
+	Pthread_mutex_unlock(&reg->lk);
+	return (epoch);
+}
+
 void
-__sc_publication_fence_stats(dbenv, entries)
+__sc_publication_fence_test_bump_epoch(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+
+	if (reg == NULL)
+		return;
+	Pthread_mutex_lock(&reg->lk);
+	reg->epoch++;
+	Pthread_mutex_unlock(&reg->lk);
+}
+
+void
+__sc_publication_fence_note_epoch_retry(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+
+	if (reg == NULL)
+		return;
+	Pthread_mutex_lock(&reg->lk);
+	reg->epoch_retries++;
+	Pthread_mutex_unlock(&reg->lk);
+}
+
+void
+__sc_publication_fence_note(dbenv, stopped)
+	DB_ENV *dbenv;
+	int stopped;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+
+	if (reg == NULL)
+		return;
+	Pthread_mutex_lock(&reg->lk);
+	if (stopped)
+		reg->stops++;
+	else
+		reg->target_before_publication++;
+	Pthread_mutex_unlock(&reg->lk);
+}
+
+void
+__sc_publication_fence_stats(dbenv, entries, stops, hits, misses, early, dropped)
 	DB_ENV *dbenv;
 	u_int64_t *entries;
+	u_int64_t *stops;
+	u_int64_t *hits;
+	u_int64_t *misses;
+	u_int64_t *early;
+	u_int64_t *dropped;
 {
 	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
 
 	if (reg != NULL) {
 		Pthread_mutex_lock(&reg->lk);
 		*entries = (u_int64_t)hash_get_num_entries(reg->files);
+		*stops = reg->stops;
+		*hits = reg->lookup_hits;
+		*misses = reg->lookup_misses;
+		*early = reg->target_before_publication;
+		*dropped = reg->cached_pages_dropped;
 		Pthread_mutex_unlock(&reg->lk);
 	} else
-		*entries = 0;
+		*entries = *stops = *hits = *misses = *early = *dropped = 0;
 }
 
 void

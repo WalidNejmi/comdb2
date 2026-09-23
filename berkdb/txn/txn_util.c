@@ -666,12 +666,25 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 		logmsg(lvl, "SC incapable log streams: %d\n",
 		    bdb_sc_incapable_log_streams(dbenv->app_private));
 	}
-		{
-				u_int64_t entries;
+	{
+		u_int64_t entries, stops, hits, misses, early, dropped, retries = 0;
+		SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
 
-				__sc_publication_fence_stats(dbenv, &entries);
-				logmsg(lvl, "SC publication fences: %"PRIu64"\n", entries);
+		__sc_publication_fence_stats(dbenv, &entries, &stops, &hits,
+		    &misses, &early, &dropped);
+		logmsg(lvl, "SC publication fences: %"PRIu64"\n", entries);
+		logmsg(lvl, "SC fence stops: %"PRIu64"\n", stops);
+		logmsg(lvl, "SC fence lookup hits: %"PRIu64"\n", hits);
+		logmsg(lvl, "SC fence lookup misses: %"PRIu64"\n", misses);
+		logmsg(lvl, "SC fence target before publication: %"PRIu64"\n", early);
+		logmsg(lvl, "SC fence cached pages dropped: %"PRIu64"\n", dropped);
+		if (reg != NULL) {
+			Pthread_mutex_lock(&reg->lk);
+			retries = reg->epoch_retries;
+			Pthread_mutex_unlock(&reg->lk);
 		}
+		logmsg(lvl, "SC fence epoch retries: %"PRIu64"\n", retries);
+	}
 	logmsg(lvl, "SC private registry available: %d\n", available);
 	logmsg(lvl, "SC private registered files: %"PRIu64"\n", registered);
 	logmsg(lvl, "SC private registry failures: %"PRIu64"\n", failures);
