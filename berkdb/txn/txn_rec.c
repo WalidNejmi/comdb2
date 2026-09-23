@@ -702,70 +702,6 @@ quiet_err:
 	return (ret);
 }
 
-/*
- * Flag records are staged as a read-compatible format before any producer or
- * consumer is allowed to act on the flag.  Validate the complete record, then
- * remove the appended commit_flags word and dispatch the byte-identical parent
- * record.  This intentionally gives recovery exactly the parent semantics.
- */
-static int
-__txn_recover_flag_record_as_parent(dbenv, dbtp, lsnp, op, info, is_gen)
-	DB_ENV *dbenv;
-	DBT *dbtp;
-	DB_LSN *lsnp;
-	db_recops op;
-	void *info;
-	int is_gen;
-{
-	DBT parent = {0};
-	u_int32_t rawtype, basetype, parent_type;
-	size_t header_size, prefix_size;
-	u_int8_t *src, *dst;
-	int ret;
-
-	if (dbtp == NULL || dbtp->data == NULL || dbtp->size < sizeof(u_int32_t))
-		return (EINVAL);
-	src = dbtp->data;
-	LOGCOPY_32(&rawtype, src);
-	basetype = rawtype & ~DB_debug_FLAG;
-	header_size = sizeof(u_int32_t) * 2 + sizeof(DB_LSN);
-	if (basetype == DB___txn_regop_flags + 2000 ||
-	    basetype == DB___txn_regop_gen_flags + 2000 ||
-	    basetype == DB___txn_regop_gen_flags_endianize + 2000)
-		header_size += sizeof(u_int64_t);
-	prefix_size = header_size + sizeof(u_int32_t) * 2;
-	if (is_gen)
-		prefix_size += sizeof(u_int64_t) * 2;
-	if (dbtp->size < prefix_size + sizeof(u_int32_t))
-		return (EINVAL);
-
-	if ((ret = __os_malloc(dbenv, dbtp->size - sizeof(u_int32_t),
-	    &parent.data)) != 0)
-		return (ret);
-	parent.size = dbtp->size - sizeof(u_int32_t);
-	dst = parent.data;
-	memcpy(dst, src, prefix_size);
-	memcpy(dst + prefix_size, src + prefix_size + sizeof(u_int32_t),
-	    dbtp->size - prefix_size - sizeof(u_int32_t));
-
-	if (is_gen) {
-		parent_type = (basetype == DB___txn_regop_gen_flags_endianize ||
-		    basetype == DB___txn_regop_gen_flags_endianize + 2000) ?
-		    DB___txn_regop_gen_endianize : DB___txn_regop_gen;
-	} else {
-		parent_type = DB___txn_regop;
-	}
-	if (basetype > 2000)
-		parent_type += 2000;
-	parent_type |= rawtype & DB_debug_FLAG;
-	LOGCOPY_32(dst, &parent_type);
-
-	ret = is_gen ? __txn_regop_gen_recover(dbenv, &parent, lsnp, op, info) :
-	    __txn_regop_recover(dbenv, &parent, lsnp, op, info);
-	__os_free(dbenv, parent.data);
-	return (ret);
-}
-
 int
 __txn_regop_flags_recover(dbenv, dbtp, lsnp, op, info)
 	DB_ENV *dbenv;
@@ -774,12 +710,92 @@ __txn_regop_flags_recover(dbenv, dbtp, lsnp, op, info)
 	db_recops op;
 	void *info;
 {
-	__txn_regop_flags_args *argp = NULL;
-	int ret = __txn_regop_flags_read(dbenv, dbtp->data, dbtp->size, &argp);
-	if (ret != 0)
+	DB_TXNHEAD *headp;
+	__txn_regop_flags_args *argp;
+	unsigned long long context = 0;
+	int ret, commit_lsn_map;
+
+#ifdef DEBUG_RECOVER
+	(void)__txn_regop_flags_print(dbenv, dbtp, lsnp, op, info);
+#endif
+
+	commit_lsn_map = __txn_commit_map_enabled();
+	if ((ret = __txn_regop_flags_read(dbenv, dbtp->data, dbtp->size,
+	    &argp)) != 0)
 		return (ret);
+	__sc_commit_flags_note(SC_OBS_RECOVERY, argp->commit_flags);
+
+	headp = info;
+	if (op == DB_TXN_LOGICAL_BACKWARD_ROLL) {
+		abort();
+	} else if (op == DB_TXN_FORWARD_ROLL) {
+		dbenv->prev_commit_lsn = *lsnp;
+		(void)__db_txnlist_remove(dbenv, info, argp->txnid->txnid);
+	} else if ((dbenv->tx_timestamp != 0 &&
+	    argp->timestamp > (int32_t)dbenv->tx_timestamp) ||
+	    (!IS_ZERO_LSN(headp->trunc_lsn) &&
+	    log_compare(&headp->trunc_lsn, lsnp) < 0)) {
+		if (commit_lsn_map) {
+			ret = __txn_commit_map_remove(dbenv, argp->txnid->utxnid);
+			if (ret == DB_NOTFOUND)
+				ret = 0;
+			else if (ret != 0) {
+				logmsg(LOGMSG_ERROR,
+				    "%s: Failed to remove %"PRIu64" from the commit map\n",
+				    __func__, argp->txnid->utxnid);
+				goto quiet_err;
+			}
+		}
+
+		ret = __db_txnlist_update(dbenv,
+		    info, argp->txnid->txnid, TXN_ABORT, NULL);
+		if (ret == TXN_IGNORE)
+			ret = TXN_OK;
+		else if (ret == TXN_NOTFOUND)
+			ret = __db_txnlist_add(dbenv,
+			    info, argp->txnid->txnid, TXN_IGNORE, NULL);
+		else if (ret != TXN_OK)
+			goto err;
+	} else {
+		assert(op == DB_TXN_BACKWARD_ROLL);
+		if (commit_lsn_map && argp->opcode == TXN_COMMIT &&
+		    __txn_commit_map_should_add(argp->commit_flags) &&
+		    (ret = __txn_commit_map_add(dbenv,
+		    argp->txnid->utxnid, *lsnp))) {
+			logmsg(LOGMSG_ERROR,
+			    "%s: Failed to add %"PRIu64" to the commit map\n",
+			    __func__, argp->txnid->utxnid);
+			goto quiet_err;
+		}
+
+		ret = __db_txnlist_update(dbenv,
+		    info, argp->txnid->txnid, argp->opcode, lsnp);
+		if (ret == TXN_IGNORE)
+			ret = TXN_OK;
+		else if (ret == TXN_NOTFOUND)
+			ret = __db_txnlist_add(dbenv, info, argp->txnid->txnid,
+			    argp->opcode == TXN_ABORT ? TXN_IGNORE : argp->opcode,
+			    lsnp);
+		else if (ret != TXN_OK)
+			goto err;
+	}
+
+	if (ret == 0) {
+		if ((context = __txn_regop_flags_read_context(argp)) != 0)
+			set_commit_context(context, NULL, lsnp, argp,
+			    DB___txn_regop_flags);
+		*lsnp = argp->prev_lsn;
+	}
+
+	if (0) {
+err:		__db_err(dbenv,
+		    "txnid %lx commit record found, already on commit list",
+		    (u_long)argp->txnid->txnid);
+		ret = EINVAL;
+	}
+quiet_err:
 	__os_free(dbenv, argp);
-	return __txn_recover_flag_record_as_parent(dbenv, dbtp, lsnp, op, info, 0);
+	return (ret);
 }
 
 int
@@ -790,12 +806,105 @@ __txn_regop_gen_flags_recover(dbenv, dbtp, lsnp, op, info)
 	db_recops op;
 	void *info;
 {
-	__txn_regop_gen_flags_args *argp = NULL;
-	int ret = __txn_regop_gen_flags_read(dbenv, dbtp->data, dbtp->size, &argp);
-	if (ret != 0)
+	DB_REP *db_rep;
+	REP *rep;
+	DB_TXNHEAD *headp;
+	__txn_regop_gen_flags_args *argp;
+	int ret, commit_lsn_map;
+
+#ifdef DEBUG_RECOVER
+	(void)__txn_regop_gen_flags_print(dbenv, dbtp, lsnp, op, info);
+#endif
+
+	db_rep = dbenv->rep_handle;
+	rep = db_rep->region;
+	commit_lsn_map = __txn_commit_map_enabled();
+	if ((ret = __txn_regop_gen_flags_read(dbenv, dbtp->data, dbtp->size,
+	    &argp)) != 0)
 		return (ret);
+	__sc_commit_flags_note(SC_OBS_RECOVERY, argp->commit_flags);
+
+	headp = info;
+	if (op == DB_TXN_LOGICAL_BACKWARD_ROLL) {
+		abort();
+	} else if (op == DB_TXN_FORWARD_ROLL) {
+		dbenv->prev_commit_lsn = *lsnp;
+		(void)__db_txnlist_remove(dbenv, info, argp->txnid->txnid);
+		MUTEX_LOCK(dbenv, db_rep->rep_mutexp);
+		rep->committed_gen = argp->generation;
+		rep->committed_lsn = *lsnp;
+		if (argp->generation > rep->gen) {
+			__rep_set_gen(dbenv, __func__, __LINE__, argp->generation);
+			__rep_set_log_gen(dbenv, __func__, __LINE__, rep->gen);
+			gbl_recovery_gen = rep->gen;
+		}
+		MUTEX_UNLOCK(dbenv, db_rep->rep_mutexp);
+	} else if ((dbenv->tx_timestamp != 0 &&
+	    argp->timestamp > (int32_t)dbenv->tx_timestamp) ||
+	    (!IS_ZERO_LSN(headp->trunc_lsn) &&
+	    log_compare(&headp->trunc_lsn, lsnp) < 0)) {
+		if (commit_lsn_map) {
+			ret = __txn_commit_map_remove(dbenv, argp->txnid->utxnid);
+			if (ret == DB_NOTFOUND)
+				ret = 0;
+			else if (ret != 0) {
+				logmsg(LOGMSG_ERROR,
+				    "%s: Failed to remove %"PRIu64" from the commit map\n",
+				    __func__, argp->txnid->utxnid);
+				goto quiet_err;
+			}
+		}
+
+		ret = __db_txnlist_update(dbenv,
+		    info, argp->txnid->txnid, TXN_ABORT, NULL);
+		if (ret == TXN_IGNORE)
+			ret = TXN_OK;
+		else if (ret == TXN_NOTFOUND)
+			ret = __db_txnlist_add(dbenv,
+			    info, argp->txnid->txnid, TXN_IGNORE, NULL);
+		else if (ret != TXN_OK)
+			goto err;
+	} else {
+		assert(op == DB_TXN_BACKWARD_ROLL);
+		if (commit_lsn_map && argp->opcode == TXN_COMMIT &&
+		    __txn_commit_map_should_add(argp->commit_flags) &&
+		    (ret = __txn_commit_map_add(dbenv,
+		    argp->txnid->utxnid, *lsnp))) {
+			logmsg(LOGMSG_ERROR,
+			    "%s: Failed to add %"PRIu64" to the commit map\n",
+			    __func__, argp->txnid->utxnid);
+			goto quiet_err;
+		}
+
+		ret = __db_txnlist_update(dbenv,
+		    info, argp->txnid->txnid, argp->opcode, lsnp);
+		if (ret == TXN_IGNORE)
+			ret = TXN_OK;
+		else if (ret == TXN_NOTFOUND)
+			ret = __db_txnlist_add(dbenv, info, argp->txnid->txnid,
+			    argp->opcode == TXN_ABORT ? TXN_IGNORE : argp->opcode,
+			    lsnp);
+		else if (ret != TXN_OK)
+			goto err;
+	}
+
+	normalize_rectype(&argp->type);
+	if (ret == 0) {
+		if (argp->context)
+			set_commit_context(argp->context, &argp->generation,
+			    lsnp, argp, argp->type);
+		*lsnp = argp->prev_lsn;
+	}
+
+	if (0) {
+err:		__db_err(dbenv,
+		    "txnid %lx commit record found, already on commit list",
+		    (u_long)argp->txnid->txnid);
+		ret = EINVAL;
+	}
+quiet_err:
 	__os_free(dbenv, argp);
-	return __txn_recover_flag_record_as_parent(dbenv, dbtp, lsnp, op, info, 1);
+	return (ret);
 }
 
 #include "dbinc/lock.h"

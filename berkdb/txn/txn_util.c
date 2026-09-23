@@ -629,6 +629,43 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 	logmsg(lvl, "SC direct-copy txns marked: %"PRIu64"\n", marked);
 	logmsg(lvl, "SC direct-copy txns matched: %"PRIu64"\n", matched);
 	logmsg(lvl, "SC direct-copy txns unsafe: %"PRIu64"\n", unsafe);
+	{
+		SC_COMMIT_FLAGS_STATS fs;
+
+		__sc_commit_flags_stats(&fs);
+		logmsg(lvl, "SC flags emitted (master): %"PRIu64"\n",
+		    fs.flags_emitted_master);
+		logmsg(lvl, "SC would-skip (master): %"PRIu64"\n",
+		    fs.would_skip_master);
+		logmsg(lvl, "SC flags decoded (serial replica): %"PRIu64"\n",
+		    fs.flags_decoded_serial);
+		logmsg(lvl, "SC would-skip (serial replica): %"PRIu64"\n",
+		    fs.would_skip_serial);
+		logmsg(lvl, "SC flags decoded (concurrent replica): %"PRIu64"\n",
+		    fs.flags_decoded_concurrent);
+		logmsg(lvl, "SC would-skip (concurrent replica): %"PRIu64"\n",
+		    fs.would_skip_concurrent);
+		logmsg(lvl, "SC flags decoded (recovery): %"PRIu64"\n",
+		    fs.flags_decoded_recovery);
+		logmsg(lvl, "SC would-skip (recovery): %"PRIu64"\n",
+		    fs.would_skip_recovery);
+		logmsg(lvl, "SC unsupported candidate children: %"PRIu64"\n",
+		    fs.unsupported_children);
+		logmsg(lvl, "SC unsupported candidate rowlock: %"PRIu64"\n",
+		    fs.unsupported_rowlock);
+		logmsg(lvl, "SC unsupported candidate distributed: %"PRIu64"\n",
+		    fs.unsupported_distributed);
+		logmsg(lvl, "SC unsupported candidate unknown family: %"PRIu64"\n",
+		    fs.unsupported_unknown_family);
+	}
+	{
+		extern int bdb_cluster_supports_commit_flags(void *);
+		extern int bdb_sc_incapable_log_streams(void *);
+		logmsg(lvl, "SC cluster supports commit flags: %d\n",
+		    bdb_cluster_supports_commit_flags(dbenv->app_private));
+		logmsg(lvl, "SC incapable log streams: %d\n",
+		    bdb_sc_incapable_log_streams(dbenv->app_private));
+	}
 	logmsg(lvl, "SC private registry available: %d\n", available);
 	logmsg(lvl, "SC private registered files: %"PRIu64"\n", registered);
 	logmsg(lvl, "SC private registry failures: %"PRIu64"\n", failures);

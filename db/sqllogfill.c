@@ -24,6 +24,7 @@
 #include <assert.h>
 #include <dbinc/rep_types.h>
 #include <build/db_int.h>
+#include "tranlog_flags.h"
 
 /* Flags for comdb2_transaction_logs table-valued function */
 #define TRANLOG_FLAGS_BLOCK 0x01    /* Wait for new log records */
@@ -560,8 +561,10 @@ static int request_logs_from_master(bdb_state_type *bdb_state)
 
         /* Query transaction log with BLOCK and SENTINEL flags */
         rc = snprintf(sql_cmd, SQL_CMD_LEN,
-                      "select lsn, generation, payload from comdb2_transaction_logs('{%u:%u}', NULL, %d, %d)",
-                      last_lsn.file, last_lsn.offset, TRANLOG_FLAGS_BLOCK | TRANLOG_FLAGS_SENTINEL, timeout);
+                      "select lsn, generation, payload from comdb2_transaction_logs('{%u:%u}', NULL, %d, %d, NULL, %d)",
+                      last_lsn.file, last_lsn.offset,
+                      TRANLOG_FLAGS_BLOCK | TRANLOG_FLAGS_SENTINEL, timeout,
+                      TRANLOG_CAP_TXN_COMMIT_FLAGS_V1);
 
         if (rc < 0 || rc >= SQL_CMD_LEN) {
             logmsg(LOGMSG_ERROR, "%s: snprintf failed, rc=%d\n", __func__, rc);

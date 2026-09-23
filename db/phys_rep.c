@@ -29,6 +29,7 @@
 #include <bdb_int.h>
 #include <bdbglue.h>
 #include "phys_rep_lsn.h"
+#include "tranlog_flags.h"
 #include "dbinc/rep_types.h"
 
 #include "comdb2.h"
@@ -1717,8 +1718,11 @@ repl_loop:
 
         prev_info = info;
 
-        rc = snprintf(sql_cmd, sql_cmd_len, "select * from comdb2_transaction_logs('{%u:%u}', NULL%s)", info.file,
-                      info.offset, (gbl_blocking_physrep ? ",9" : ",8"));
+        rc = snprintf(sql_cmd, sql_cmd_len,
+                  "select * from comdb2_transaction_logs('{%u:%u}', NULL%s, NULL, NULL, %d)",
+                  info.file, info.offset,
+                  (gbl_blocking_physrep ? ",9" : ",8"),
+                  TRANLOG_CAP_TXN_COMMIT_FLAGS_V1);
         if (rc < 0 || rc >= sql_cmd_len)
             physrep_logmsg(LOGMSG_ERROR, "%s:%d Command buffer is not long enough!\n", __func__, __LINE__);
         if (gbl_physrep_debug)

@@ -2191,6 +2191,7 @@ __scan_logfiles_for_asof_modsnap(dbenv)
 				GOTOERR;
 			free_ptr = flags_args;
 			if (__txn_commit_map_enabled() && flags_args->opcode == TXN_COMMIT &&
+			    __txn_commit_map_should_add(flags_args->commit_flags) &&
 			    (ret = __txn_commit_map_add(dbenv,
 			    flags_args->txnid->utxnid, lsn))) {
 				logmsg(LOGMSG_ERROR, "%s: Failed to add to commit LSN map\n",
@@ -2219,6 +2220,7 @@ __scan_logfiles_for_asof_modsnap(dbenv)
 				GOTOERR;
 			free_ptr = flags_args;
 			if (__txn_commit_map_enabled() && flags_args->opcode == TXN_COMMIT &&
+			    __txn_commit_map_should_add(flags_args->commit_flags) &&
 			    (ret = __txn_commit_map_add(dbenv,
 			    flags_args->txnid->utxnid, lsn))) {
 				logmsg(LOGMSG_ERROR, "%s: Failed to add to commit LSN map\n",

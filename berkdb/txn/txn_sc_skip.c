@@ -31,6 +31,82 @@ static const char revid[] = "$Id: txn_sc_skip.c,v 1.0 2026/09/15 00:00:00 comdb2
 static u_int64_t sc_direct_copy_txns_marked = 0;
 static u_int64_t sc_direct_copy_txns_matched = 0;
 static u_int64_t sc_direct_copy_txns_unsafe = 0;
+static u_int64_t sc_flags_emitted_master = 0;
+static u_int64_t sc_would_skip_master = 0;
+static u_int64_t sc_flags_decoded_serial = 0;
+static u_int64_t sc_would_skip_serial = 0;
+static u_int64_t sc_flags_decoded_concurrent = 0;
+static u_int64_t sc_would_skip_concurrent = 0;
+static u_int64_t sc_flags_decoded_recovery = 0;
+static u_int64_t sc_would_skip_recovery = 0;
+static u_int64_t sc_unsupported_children = 0;
+static u_int64_t sc_unsupported_rowlock = 0;
+static u_int64_t sc_unsupported_distributed = 0;
+static u_int64_t sc_unsupported_unknown_family = 0;
+
+void
+__sc_commit_flags_note(which, commit_flags)
+	int which;
+	u_int32_t commit_flags;
+{
+	int would_skip = !__txn_commit_map_should_add(commit_flags);
+
+	switch (which) {
+	case SC_OBS_MASTER:
+		(void)ATOMIC_ADD64(sc_flags_emitted_master, 1);
+		if (would_skip)
+			(void)ATOMIC_ADD64(sc_would_skip_master, 1);
+		break;
+	case SC_OBS_SERIAL:
+		(void)ATOMIC_ADD64(sc_flags_decoded_serial, 1);
+		if (would_skip)
+			(void)ATOMIC_ADD64(sc_would_skip_serial, 1);
+		break;
+	case SC_OBS_CONCURRENT:
+		(void)ATOMIC_ADD64(sc_flags_decoded_concurrent, 1);
+		if (would_skip)
+			(void)ATOMIC_ADD64(sc_would_skip_concurrent, 1);
+		break;
+	case SC_OBS_RECOVERY:
+		(void)ATOMIC_ADD64(sc_flags_decoded_recovery, 1);
+		if (would_skip)
+			(void)ATOMIC_ADD64(sc_would_skip_recovery, 1);
+		break;
+	case SC_OBS_UNSUP_CHILDREN:
+		(void)ATOMIC_ADD64(sc_unsupported_children, 1);
+		break;
+	case SC_OBS_UNSUP_ROWLOCK:
+		(void)ATOMIC_ADD64(sc_unsupported_rowlock, 1);
+		break;
+	case SC_OBS_UNSUP_DISTRIBUTED:
+		(void)ATOMIC_ADD64(sc_unsupported_distributed, 1);
+		break;
+	case SC_OBS_UNSUP_UNKNOWN_FAMILY:
+		(void)ATOMIC_ADD64(sc_unsupported_unknown_family, 1);
+		break;
+	default:
+		break;
+	}
+}
+
+void
+__sc_commit_flags_stats(st)
+	SC_COMMIT_FLAGS_STATS *st;
+{
+	st->flags_emitted_master = ATOMIC_LOAD64(sc_flags_emitted_master);
+	st->would_skip_master = ATOMIC_LOAD64(sc_would_skip_master);
+	st->flags_decoded_serial = ATOMIC_LOAD64(sc_flags_decoded_serial);
+	st->would_skip_serial = ATOMIC_LOAD64(sc_would_skip_serial);
+	st->flags_decoded_concurrent = ATOMIC_LOAD64(sc_flags_decoded_concurrent);
+	st->would_skip_concurrent = ATOMIC_LOAD64(sc_would_skip_concurrent);
+	st->flags_decoded_recovery = ATOMIC_LOAD64(sc_flags_decoded_recovery);
+	st->would_skip_recovery = ATOMIC_LOAD64(sc_would_skip_recovery);
+	st->unsupported_children = ATOMIC_LOAD64(sc_unsupported_children);
+	st->unsupported_rowlock = ATOMIC_LOAD64(sc_unsupported_rowlock);
+	st->unsupported_distributed = ATOMIC_LOAD64(sc_unsupported_distributed);
+	st->unsupported_unknown_family =
+	    ATOMIC_LOAD64(sc_unsupported_unknown_family);
+}
 
 int
 __sc_private_file_registry_init(dbenv)

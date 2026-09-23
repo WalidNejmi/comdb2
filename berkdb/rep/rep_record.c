@@ -5015,6 +5015,7 @@ __rep_process_txn_int(dbenv, rctl, rec, ltrans, maxlsn, commit_gen, rep_gen, loc
 	void *pglogs = NULL;
 	u_int32_t keycnt = 0;
 	int endianize = 0;
+	u_int32_t sc_commit_flags = 0;
 
 	logmsg(LOGMSG_DEBUG, "%s processing [%d:%d]\n", __func__, rctl->lsn.file,
 			rctl->lsn.offset);
@@ -5163,6 +5164,9 @@ __rep_process_txn_int(dbenv, rctl, rec, ltrans, maxlsn, commit_gen, rep_gen, loc
 			__os_free(dbenv, txn_flags_args);
 			return (0);
 		}
+		__sc_commit_flags_note(SC_OBS_SERIAL,
+		    txn_flags_args->commit_flags);
+		sc_commit_flags = txn_flags_args->commit_flags;
 		args = txn_flags_args;
 		context = __txn_regop_flags_read_context(txn_flags_args);
 		txnid = txn_flags_args->txnid->txnid;
@@ -5211,6 +5215,9 @@ __rep_process_txn_int(dbenv, rctl, rec, ltrans, maxlsn, commit_gen, rep_gen, loc
 			__os_free(dbenv, txn_gen_flags_args);
 			return (0);
 		}
+		__sc_commit_flags_note(SC_OBS_SERIAL,
+		    txn_gen_flags_args->commit_flags);
+		sc_commit_flags = txn_gen_flags_args->commit_flags;
 		args = txn_gen_flags_args;
 		context = txn_gen_flags_args->context;
 		txnid = txn_gen_flags_args->txnid->txnid;
@@ -5404,7 +5411,8 @@ __rep_process_txn_int(dbenv, rctl, rec, ltrans, maxlsn, commit_gen, rep_gen, loc
 			p->rep_lock_time_us += d;
 		}
 
-		if (__txn_commit_map_enabled()) {
+		if (__txn_commit_map_enabled() &&
+		    __txn_commit_map_should_add(sc_commit_flags)) {
 			if ((ret = __txn_commit_map_add(dbenv,
 					utxnid, rctl->lsn)), ret != 0) {
 				line = __LINE__;
@@ -5937,6 +5945,7 @@ __rep_process_txn_concurrent_int(dbenv, rctl, rec, ltrans, ctrllsn, maxlsn,
 	int get_schema_lk = 0, got_schema_lk = 0;
 	int dontlock = 0;
 	int endianize = 0;
+	u_int32_t sc_commit_flags = 0;
 
 	Pthread_mutex_lock(&dbenv->recover_lk);
 	rp = listc_rtl(&dbenv->inactive_transactions);
@@ -6133,6 +6142,9 @@ bad_resize:	;
 			__os_free(dbenv, txn_flags_args);
 			return (0);
 		}
+		__sc_commit_flags_note(SC_OBS_CONCURRENT,
+		    txn_flags_args->commit_flags);
+		sc_commit_flags = txn_flags_args->commit_flags;
 		args = txn_flags_args;
 		rp->context = __txn_regop_flags_read_context(txn_flags_args);
 		(*commit_gen) = 0;
@@ -6185,6 +6197,9 @@ bad_resize:	;
 			__os_free(dbenv, txn_gen_flags_args);
 			return (0);
 		}
+		__sc_commit_flags_note(SC_OBS_CONCURRENT,
+		    txn_gen_flags_args->commit_flags);
+		sc_commit_flags = txn_gen_flags_args->commit_flags;
 		args = txn_gen_flags_args;
 		rp->context = txn_gen_flags_args->context;
 		txnid = txn_gen_flags_args->txnid->txnid;
@@ -6370,7 +6385,8 @@ bad_resize:	;
 		goto err;
 	}
 
-	if (__txn_commit_map_enabled()) {
+	if (__txn_commit_map_enabled() &&
+	    __txn_commit_map_should_add(sc_commit_flags)) {
 		if ((ret = __txn_commit_map_add(dbenv,
 				utxnid, ctrllsn)), ret != 0) {
 			logmsg(LOGMSG_ERROR, "%s failed at line %d\n", __func__, __LINE__);

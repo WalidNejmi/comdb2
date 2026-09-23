@@ -35,20 +35,21 @@
 #define TRANLOG_COLUMN_FLAGS        2
 #define TRANLOG_COLUMN_TIMEOUT      3
 #define TRANLOG_COLUMN_BLOCKLSN     4
-#define TRANLOG_COLUMN_LSN          5
-#define TRANLOG_COLUMN_RECTYPE      6
-#define TRANLOG_COLUMN_GENERATION   7
-#define TRANLOG_COLUMN_TIMESTAMP    8
-#define TRANLOG_COLUMN_LOG          9
-#define TRANLOG_COLUMN_TXNID        10
-#define TRANLOG_COLUMN_UTXNID       11
-#define TRANLOG_COLUMN_LOGCGEN      12
-#define TRANLOG_COLUMN_PREVCKSUM    13
-#define TRANLOG_COLUMN_CKSUM        14
-#define TRANLOG_COLUMN_MAXUTXNID    15
-#define TRANLOG_COLUMN_CHILDUTXNID  16
-#define TRANLOG_COLUMN_LSN_FILE     17 /* Useful for sorting records by LSN */
-#define TRANLOG_COLUMN_LSN_OFFSET   18
+#define TRANLOG_COLUMN_CAPABILITIES 5
+#define TRANLOG_COLUMN_LSN          6
+#define TRANLOG_COLUMN_RECTYPE      7
+#define TRANLOG_COLUMN_GENERATION   8
+#define TRANLOG_COLUMN_TIMESTAMP    9
+#define TRANLOG_COLUMN_LOG          10
+#define TRANLOG_COLUMN_TXNID        11
+#define TRANLOG_COLUMN_UTXNID       12
+#define TRANLOG_COLUMN_LOGCGEN      13
+#define TRANLOG_COLUMN_PREVCKSUM    14
+#define TRANLOG_COLUMN_CKSUM        15
+#define TRANLOG_COLUMN_MAXUTXNID    16
+#define TRANLOG_COLUMN_CHILDUTXNID  17
+#define TRANLOG_COLUMN_LSN_FILE     18 /* Useful for sorting records by LSN */
+#define TRANLOG_COLUMN_LSN_OFFSET   19
 
 extern int gbl_apprec_gen;
 int gbl_tranlog_default_timeout = 30;
@@ -75,6 +76,8 @@ struct tranlog_cursor {
   int starttime;
   int timeout;
   int invalidRecord;
+    int requiredReader;
+    int commitFlagsCapable;
   DB_LOGC *logc;             /* Log Cursor */
   DBT data;
 };
@@ -89,8 +92,8 @@ static int tranlogConnect(
   sqlite3_vtab *pNew;
   int rc;
 
-  rc = sqlite3_declare_vtab(db,
-     "CREATE TABLE x(minlsn hidden,maxlsn hidden,flags hidden,timeout hidden,blocklsn hidden,lsn,rectype integer,generation integer,timestamp integer,payload,txnid integer,utxnid integer,logcgen integer,prevcksum integer,cksum integer, maxutxnid hidden, childutxnid hidden, lsnfile hidden, lsnoffset hidden)");
+    rc = sqlite3_declare_vtab(db,
+        "CREATE TABLE x(minlsn hidden,maxlsn hidden,flags hidden,timeout hidden,blocklsn hidden,capabilities hidden,lsn,rectype integer,generation integer,timestamp integer,payload,txnid integer,utxnid integer,logcgen integer,prevcksum integer,cksum integer,maxutxnid hidden,childutxnid hidden,lsnfile hidden,lsnoffset hidden)");
   if( rc==SQLITE_OK ){
     pNew = *ppVtab = sqlite3_malloc( sizeof(*pNew) );
     if( pNew==0 ) return SQLITE_NOMEM;
@@ -119,6 +122,8 @@ static int tranlogOpen(sqlite3_vtab *p, sqlite3_vtab_cursor **ppCursor){
 
 static int tranlogClose(sqlite3_vtab_cursor *cur){
   tranlog_cursor *pCur = (tranlog_cursor*)cur;
+    if (pCur->requiredReader)
+            bdb_sc_log_stream_close(thedb->bdb_env, pCur->commitFlagsCapable);
   if (pCur->openCursor) {
       assert(pCur->logc);
       pCur->logc->close(pCur->logc, 0);
@@ -352,6 +357,21 @@ static int tranlogNext(sqlite3_vtab_cursor *cur)
           } while ((rc = pCur->logc->get(pCur->logc, &pCur->curLsn, &pCur->data, DB_NEXT)));
       } else {
           pCur->hitLast = 1;
+      }
+  }
+
+  if (pCur->requiredReader && pCur->data.data) {
+      u_int32_t rectype;
+      LOGCOPY_32(&rectype, pCur->data.data);
+      normalize_rectype(&rectype);
+      int record_has_commit_flags = rectype == DB___txn_regop_flags ||
+          rectype == DB___txn_regop_gen_flags ||
+          rectype == DB___txn_regop_gen_flags_endianize;
+      if (!tranlog_reader_accepts_commit_flags(pCur->commitFlagsCapable,
+                                               record_has_commit_flags)) {
+          pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
+              "transaction-log reader lacks commit-flag capability");
+          return SQLITE_ERROR;
       }
   }
 
@@ -613,6 +633,10 @@ static int tranlogColumn(
     case TRANLOG_COLUMN_LSN_OFFSET:
         sqlite3_result_int(ctx, pCur->curLsn.offset);
         break;
+    case TRANLOG_COLUMN_CAPABILITIES:
+        sqlite3_result_int(ctx, pCur->commitFlagsCapable ?
+                                TRANLOG_CAP_TXN_COMMIT_FLAGS_V1 : 0);
+        break;
   }
   return SQLITE_OK;
 }
@@ -656,6 +680,11 @@ static int tranlogFilter(
   tranlog_cursor *pCur = (tranlog_cursor *)pVtabCursor;
   int i = 0;
 
+    if (pCur->requiredReader) {
+        bdb_sc_log_stream_close(thedb->bdb_env, pCur->commitFlagsCapable);
+        pCur->requiredReader = 0;
+    }
+
   bzero(&pCur->minLsn, sizeof(pCur->minLsn));
   if( idxNum & 1 ){
     const unsigned char *minLsn = sqlite3_value_text(argv[i++]);
@@ -691,6 +720,15 @@ static int tranlogFilter(
         return SQLITE_CONV_ERROR;
     }
   }
+    pCur->commitFlagsCapable = 0;
+    if( idxNum & 32 ){
+        int64_t capabilities = sqlite3_value_int64(argv[i++]);
+        pCur->commitFlagsCapable = tranlog_has_commit_flags_v1(capabilities);
+    }
+    if (pCur->flags & TRANLOG_FLAGS_SENTINEL) {
+        pCur->requiredReader = 1;
+        bdb_sc_log_stream_open(thedb->bdb_env, pCur->commitFlagsCapable);
+    }
   pCur->iRowid = 1;
   return SQLITE_OK;
 }
@@ -706,6 +744,7 @@ static int tranlogBestIndex(
   int flagsIdx = -1;     /* Index of the block= constraint, block waiting if set */
   int timeoutIdx = -1;
   int blockLsnIdx = -1;
+    int capabilitiesIdx = -1;
   int nArg = 0;          /* Number of arguments that seriesFilter() expects */
 
   const struct sqlite3_index_constraint *pConstraint;
@@ -734,6 +773,10 @@ static int tranlogBestIndex(
         blockLsnIdx = i;
         idxNum |= 16;
         break;
+            case TRANLOG_COLUMN_CAPABILITIES:
+                capabilitiesIdx = i;
+                idxNum |= 32;
+                break;
     }
   }
   if( startIdx>=0 ){
@@ -756,6 +799,10 @@ static int tranlogBestIndex(
     pIdxInfo->aConstraintUsage[blockLsnIdx].argvIndex = ++nArg;
     pIdxInfo->aConstraintUsage[blockLsnIdx].omit = 1;
   }
+    if( capabilitiesIdx>=0 ){
+        pIdxInfo->aConstraintUsage[capabilitiesIdx].argvIndex = ++nArg;
+        pIdxInfo->aConstraintUsage[capabilitiesIdx].omit = 1;
+    }
   if( (idxNum & 3)==3 ){
     /* Both start= and stop= boundaries are available.  This is the 
     ** the preferred case */
