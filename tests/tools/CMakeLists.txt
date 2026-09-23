@@ -160,6 +160,20 @@ target_compile_definitions(txn_commit_flags_roundtrip PRIVATE
   lint
 )
 
+add_exe(sc_publication_fence_codec_test
+  sc_publication_fence_codec_test.c
+  ${PROJECT_SOURCE_DIR}/bdb/sc_publication_fence_codec.c
+)
+target_include_directories(sc_publication_fence_codec_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/bdb
+  ${PROJECT_SOURCE_DIR}/berkdb
+  ${PROJECT_SOURCE_DIR}/berkdb/build
+  ${PROJECT_BINARY_DIR}/berkdb
+  ${PROJECT_SOURCE_DIR}/dlmalloc
+  ${PROJECT_SOURCE_DIR}/mem
+  ${PROJECT_BINARY_DIR}/mem
+)
+
 if (COMDB2_EXTRA_TESTS)
   include(${COMDB2_EXTRA_TESTS}/CMakeLists.txt)
 endif()

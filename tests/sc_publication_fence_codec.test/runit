@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+echo "running publication-fence codec executable: ${TESTSBUILDDIR}/sc_publication_fence_codec_test"
+${TESTSBUILDDIR}/sc_publication_fence_codec_test || exit 1
+echo "Passed test"

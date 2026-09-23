@@ -1,0 +1,4 @@
+utxnid_log on
+enable_snapshot_isolation
+early 0
+setattr SYNCTRANSACTIONS 1

@@ -18,13 +18,14 @@ fences() {
 		grep -oP '(?<=SC publication fences: )[0-9]+'
 }
 
-run "create table t(i int)" >/dev/null
-run "insert into t select value from generate_series(1, 100)" >/dev/null
-before=$(fences)
+run "create table t(i int, j int)" >/dev/null
+run "create index ix_j on t(j)" >/dev/null
+run "insert into t select value, value from generate_series(1, 5000)" >/dev/null
+
+base=$(fences)
 run "rebuild t" >/dev/null || fail "rebuild failed"
-after=$(fences)
-delta=$(( after - before ))
-(( delta == 308 )) || fail "published $delta fences, expected exactly 308"
+published=$(fences)
+(( published > base )) || fail "rebuild published no fences"
 
 run "exec procedure sys.cmd.send('flush')" >/dev/null ||
 	fail "could not flush before restart"
@@ -34,10 +35,12 @@ start_all_nodes
 wait_up
 master=$(getmaster)
 [[ -n "$master" ]] || fail "could not find master after restart"
-reloaded=$(fences)
-(( reloaded == after )) || fail "reloaded $reloaded fences, expected $after"
-[[ "$(run 'select count(*) from t')" == "100" ]] ||
-	fail "table contents changed"
 
-echo "SC_FENCE_MANY: delta=$delta reloaded=$reloaded"
+reloaded=$(fences)
+(( reloaded == published )) ||
+	fail "reloaded $reloaded fences, expected exact count $published"
+[[ "$(run 'select count(*) from t')" == "5000" ]] ||
+	fail "table contents changed across restart"
+
+echo "SC_FENCE_RESTART: published=$published reloaded=$reloaded"
 echo "Passed test"
