@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+set -e
+
+echo "running rectype round-trip executable: ${TESTSBUILDDIR}/txn_commit_flags_roundtrip"
+${TESTSBUILDDIR}/txn_commit_flags_roundtrip
