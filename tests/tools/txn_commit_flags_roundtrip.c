@@ -8,6 +8,7 @@
 #include "db_int.h"
 #include "dbinc/db_swap.h"
 #include "dbinc/txn.h"
+#include "tranlog_flags.h"
 
 typedef int (*dispatch_fn)(DB_ENV *, DBT *, DB_LSN *, db_recops, void *);
 
@@ -194,6 +195,22 @@ static void check_common(u_int32_t type, u_int32_t want_type, DB_TXN *txnid,
           "%s prev_lsn [%u][%u]", label, prev_lsn.file, prev_lsn.offset);
 }
 
+static void check_reader_semantics(const char *record_family,
+                                   u_int32_t commit_flags)
+{
+    static const char *roles[] = {
+        "serial", "concurrent", "recovery", "recovery-asof"
+    };
+    int expected_add =
+        (commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP) == 0;
+    size_t role;
+
+    for (role = 0; role < sizeof(roles) / sizeof(roles[0]); role++)
+        CHECK(__txn_commit_map_should_add(commit_flags) == expected_add,
+              "%s %s map decision for flags %#x", roles[role],
+              record_family, commit_flags);
+}
+
 static void test_regop_flags(int utxnid_logged, u_int32_t commit_flags)
 {
     u_int8_t buf[512] = {0};
@@ -210,6 +227,7 @@ static void test_regop_flags(int utxnid_logged, u_int32_t commit_flags)
     CHECK(argp->opcode == T_OPCODE, "opcode %u", argp->opcode);
     CHECK(argp->timestamp == T_TS32, "timestamp %ld", (long)argp->timestamp);
     CHECK(argp->commit_flags == commit_flags, "flags %#x", argp->commit_flags);
+    check_reader_semantics("regop_flags", argp->commit_flags);
     CHECK(argp->locks.size == T_LOCKS_SZ, "locks size %u", argp->locks.size);
     CHECK(memcmp(argp->locks.data, T_LOCKS, T_LOCKS_SZ) == 0, "locks payload");
     free(argp);
@@ -234,6 +252,7 @@ static void test_gen_flags(u_int32_t rectype, int utxnid_logged,
     CHECK(argp->context == T_CONTEXT, "context %" PRIx64, argp->context);
     CHECK(argp->timestamp == T_TS64, "timestamp %" PRIu64, argp->timestamp);
     CHECK(argp->commit_flags == commit_flags, "flags %#x", argp->commit_flags);
+    check_reader_semantics("regop_gen_flags", argp->commit_flags);
     CHECK(argp->locks.size == T_LOCKS_SZ, "locks size %u", argp->locks.size);
     CHECK(memcmp(argp->locks.data, T_LOCKS, T_LOCKS_SZ) == 0, "locks payload");
     free(argp);
@@ -358,6 +377,24 @@ static void test_dispatch(const char *name,
     free(table);
 }
 
+static void test_transaction_log_capabilities(void)
+{
+    CHECK(!tranlog_has_commit_flags_v1(0),
+        "missing transaction-log capability was treated as capable");
+    CHECK(tranlog_has_commit_flags_v1(TRANLOG_CAP_TXN_COMMIT_FLAGS_V1),
+        "V1 transaction-log capability was not recognized");
+    CHECK(tranlog_has_commit_flags_v1(
+          TRANLOG_CAP_TXN_COMMIT_FLAGS_V1 | 0x80000000u),
+        "V1 capability was lost when an unknown bit was present");
+
+    CHECK(tranlog_reader_accepts_commit_flags(0, 0),
+        "old reader rejected legacy WAL");
+    CHECK(!tranlog_reader_accepts_commit_flags(0, 1),
+        "old reader accepted flag-bearing WAL");
+    CHECK(tranlog_reader_accepts_commit_flags(1, 1),
+        "V1 reader rejected flag-bearing WAL");
+}
+
 int main(void)
 {
     int utxnid;
@@ -384,6 +421,7 @@ int main(void)
     test_dispatch("getallpgnos", __txn_init_getallpgnos);
 #endif
     test_dispatch("recover", __txn_init_recover);
+    test_transaction_log_capabilities();
 
     printf("txn_commit_flags_roundtrip: %d checks, %d failures\n", checks,
            failures);

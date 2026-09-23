@@ -58,5 +58,7 @@
 (name='allow_negative_column_size')
 (value='1000')
 (value='2000')
+(name='sc_commit_flags_advertise', value='ON')
+(name='sc_commit_flags_advertise', value='OFF')
 (name='sc_test_converter_public_write', value='OFF')
 (name='sc_test_converter_public_write', value='ON')

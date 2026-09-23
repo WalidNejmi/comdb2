@@ -78,6 +78,10 @@ put tunable 'max_query_fingerprints' 2000;
 select value from comdb2_tunables where name = 'max_query_fingerprints'
 
 PUT TUNABLE mask_internal_tunables 0;
+SELECT name, value FROM comdb2_tunables WHERE name = 'sc_commit_flags_advertise';
+PUT TUNABLE sc_commit_flags_advertise 0;
+SELECT name, value FROM comdb2_tunables WHERE name = 'sc_commit_flags_advertise';
+PUT TUNABLE sc_commit_flags_advertise 1;
 SELECT name, value FROM comdb2_tunables WHERE name = 'sc_test_converter_public_write';
 PUT TUNABLE sc_test_converter_public_write 1;
 SELECT name, value FROM comdb2_tunables WHERE name = 'sc_test_converter_public_write';
