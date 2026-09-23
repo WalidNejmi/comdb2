@@ -382,6 +382,21 @@ static void sc_discard_fences(struct schema_change_type *s)
     bdb_sc_publication_fence_discard(s->db->handle, &build_id);
 }
 
+int gbl_sc_pause_after_fence = 0;
+
+static void sc_test_pause_after_fence(void)
+{
+    int seconds = gbl_sc_pause_after_fence;
+
+    if (seconds <= 0)
+        return;
+    logmsg(LOGMSG_USER,
+           "TEST: pausing %d second(s) after publication fence and before scdone\n",
+           seconds);
+    while (seconds-- > 0)
+        sleep(1);
+}
+
 /*
 ** Start transaction if not passed in (comdb2sc.tsk)
 ** If started transaction, then
@@ -448,6 +463,8 @@ static int do_finalize(ddl_t func, struct ireq *iq,
             goto abort;
         }
 
+        sc_test_pause_after_fence();
+
         rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &bdberr);
         if (rc || bdberr != BDBERR_NOERROR) {
             sc_errf(s, "Failed to send scdone rc=%d bdberr=%d\n", rc, bdberr);
@@ -488,6 +505,7 @@ static int do_finalize(ddl_t func, struct ireq *iq,
             sc_errf(s, "Failed to publish schema-change fences\n");
             return -1;
         }
+        sc_test_pause_after_fence();
         rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &bdberr);
         if (rc || bdberr != BDBERR_NOERROR) {
             sc_errf(s, "Failed to send scdone rc=%d bdberr=%d\n", rc, bdberr);

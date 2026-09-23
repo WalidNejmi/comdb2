@@ -78,6 +78,20 @@ put tunable 'max_query_fingerprints' 2000;
 select value from comdb2_tunables where name = 'max_query_fingerprints'
 
 PUT TUNABLE mask_internal_tunables 0;
+SELECT name, value FROM comdb2_tunables WHERE name = 'mempv_test_bump_fence_epoch';
+SELECT name, value FROM comdb2_tunables WHERE name = 'mempv_test_pause_before_cache_put';
+SELECT name, value FROM comdb2_tunables WHERE name = 'mempv_test_paused';
+SELECT name, value FROM comdb2_tunables WHERE name = 'sc_pause_after_fence';
+PUT TUNABLE mempv_test_bump_fence_epoch 1;
+PUT TUNABLE mempv_test_pause_before_cache_put 1;
+PUT TUNABLE sc_pause_after_fence 1;
+SELECT name, value FROM comdb2_tunables WHERE name = 'mempv_test_bump_fence_epoch';
+SELECT name, value FROM comdb2_tunables WHERE name = 'mempv_test_pause_before_cache_put';
+SELECT name, value FROM comdb2_tunables WHERE name = 'mempv_test_paused';
+SELECT name, value FROM comdb2_tunables WHERE name = 'sc_pause_after_fence';
+PUT TUNABLE mempv_test_bump_fence_epoch 0;
+PUT TUNABLE mempv_test_pause_before_cache_put 0;
+PUT TUNABLE sc_pause_after_fence 0;
 SELECT name, value FROM comdb2_tunables WHERE name = 'sc_commit_flags_advertise';
 PUT TUNABLE sc_commit_flags_advertise 0;
 SELECT name, value FROM comdb2_tunables WHERE name = 'sc_commit_flags_advertise';

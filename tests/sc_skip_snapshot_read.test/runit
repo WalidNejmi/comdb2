@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+set -o pipefail
+
+dbnm=$1
+N=${SC_SKIP_ROWS:-5000}
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+clminfo() {
+	cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null
+}
+counter() {
+	clminfo | sed -n "s/.*$1: \([0-9][0-9]*\).*/\1/p" | head -1
+}
+
+run "create table t(i int, j int)" >/dev/null
+run "create index ix_j on t(j)" >/dev/null
+run "insert into t select value, value from generate_series(1, $N)" >/dev/null
+expected_sum=$(run "select sum(j) from t")
+run "rebuild t" >/dev/null
+
+stops_before=$(counter "SC fence stops")
+[[ "$stops_before" =~ ^[0-9]+$ ]] || fail "SC fence stops counter is unavailable"
+fifo=/tmp/sc_skip_fifo.$$
+out=/tmp/sc_skip_out.$$
+mkfifo "$fifo"
+cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" - <"$fifo" >"$out" 2>&1 &
+pid=$!
+exec 9>"$fifo"
+
+printf '%s\n' "set transaction snapshot isolation" "begin" \
+	"select count(*) from t" "select sum(j) from t" >&9
+sleep 2
+run "update t set j = j + 1000 where i <= $((N / 2))" >/dev/null
+printf '%s\n' "select count(*) from t" "select sum(j) from t" "commit" >&9
+exec 9>&-
+wait "$pid" || fail "snapshot client failed"
+rm -f "$fifo"
+
+mapfile -t vals < <(grep -vE '^\[' "$out")
+rm -f "$out"
+(( ${vals[0]} == N && ${vals[2]} == N )) ||
+	fail "snapshot row count changed across post-target DML"
+[[ "${vals[1]}" == "$expected_sum" && "${vals[3]}" == "$expected_sum" ]] ||
+	fail "snapshot sum changed across post-target DML"
+
+stops_after=$(counter "SC fence stops")
+fences=$(counter "SC publication fences")
+[[ "$stops_after" =~ ^[0-9]+$ && "$fences" =~ ^[0-9]+$ ]] ||
+	fail "publication-fence counters are unavailable"
+(( fences > 0 )) || fail "rebuild published no fences"
+(( stops_after > stops_before )) ||
+	fail "historical reconstruction did not consume a publication fence"
+
+do_verify t
+echo "SC_SKIP_SNAPSHOT: rows=$N converter_entries=retained fence_stops_delta=$((stops_after-stops_before))"
+echo "Passed test"

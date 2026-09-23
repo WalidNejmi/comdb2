@@ -1117,6 +1117,18 @@ REGISTER_TUNABLE("sc_fence_test_extra_files",
                  "TEST ONLY. Add synthetic files to a schema-change fence set.",
                  TUNABLE_INTEGER, &gbl_sc_fence_test_extra_files,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+REGISTER_TUNABLE("mempv_test_pause_before_cache_put",
+                 "TEST ONLY. Pause historical-page reconstruction before cache insertion.",
+                 TUNABLE_BOOLEAN, &gbl_mempv_test_pause_before_cache_put,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+REGISTER_TUNABLE("mempv_test_paused",
+                 "TEST ONLY. Historical-page reconstruction is paused before cache insertion.",
+                 TUNABLE_BOOLEAN, &gbl_mempv_test_paused,
+                 READONLY | EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+REGISTER_TUNABLE("mempv_test_bump_fence_epoch",
+                 "TEST ONLY. Bump the fence epoch once before cache insertion.",
+                 TUNABLE_BOOLEAN, &gbl_mempv_test_bump_fence_epoch,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 /* 'retrieve_gen_from_ckp' / 'recovery_ckp' disabled under legacy_defaults until db moves */
 REGISTER_TUNABLE("retrieve_gen_from_ckp", "Retrieve generation from ckp records.  (Default: on)", TUNABLE_BOOLEAN,
                  &gbl_retrieve_gen_from_ckp, 0, NULL, NULL, NULL, NULL);
@@ -2396,6 +2408,11 @@ REGISTER_TUNABLE("sc_is_at_end",
 REGISTER_TUNABLE("sc_test_converter_public_write",
                  "TEST ONLY. Classify converter transactions as touching a public user file.",
                  TUNABLE_BOOLEAN, &gbl_sc_test_converter_public_write,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+
+REGISTER_TUNABLE("sc_pause_after_fence",
+                 "TEST ONLY. Seconds to pause schema-change after fence establishment and before scdone.",
+                 TUNABLE_INTEGER, &gbl_sc_pause_after_fence,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 
 REGISTER_TUNABLE("cached_output_buffer_max_bytes",

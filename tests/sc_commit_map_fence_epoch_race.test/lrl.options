@@ -1,0 +1,3 @@
+utxnid_log on
+enable_snapshot_isolation
+setattr CHECKPOINTTIME 9999999
