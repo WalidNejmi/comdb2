@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+source "$(dirname "$0")/cluster_commit_map_lib.sh"
+set -o pipefail
+
+dbname=$1
+[[ -z "$dbname" ]] && dbname=$DBNAME
+rows=${SC_FENCE_ROWS:-5000}
+
+require_cluster
+trap 'cluster_log_delete_on || true' EXIT
+cluster_log_delete_off
+
+master=$(cluster_master)
+[[ -n "$master" ]] || fail "could not find master"
+base_fences=$(node_fences "$master")
+
+seed_table "$master" "$rows"
+sql_node "$master" "rebuild t" >/dev/null || fail "rebuild failed"
+
+master=$(cluster_master)
+master_fences=$(node_fences "$master")
+(( master_fences > base_fences )) || fail "master published no fences"
+
+for node in $(cluster_replicas); do
+	if ! replica_fences=$(wait_for_exact_fences "$node" "$master_fences"); then
+		fail "replica $node has ${replica_fences:-no} fences; master has $master_fences"
+	fi
+	echo "SC_FENCE_CLUSTER_REPLICA: node=$node fences=$replica_fences"
+done
+
+old_master=$master
+downgrade_master || fail "could not force post-publication promotion"
+new_master=$(cluster_master)
+[[ -n "$new_master" && "$new_master" != "$old_master" ]] || \
+	fail "master did not change ($old_master -> ${new_master:-none})"
+
+if ! promoted_fences=$(wait_for_exact_fences "$new_master" "$master_fences" 60); then
+	fail "promoted master $new_master has ${promoted_fences:-no} fences; expected $master_fences"
+fi
+
+echo "SC_FENCE_CLUSTER: old_master=$old_master new_master=$new_master fences=$promoted_fences"
+echo "Passed test"

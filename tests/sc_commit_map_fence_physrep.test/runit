@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+source ${TESTSROOTDIR}/sc_commit_map_fence_cluster.test/cluster_commit_map_lib.sh
+set -o pipefail
+
+dbname=$1
+[[ -z "$dbname" ]] && dbname=$DBNAME
+rows=${SC_FENCE_ROWS:-200}
+
+require_cluster
+
+export COPYCOMDB2_EXE=${COPYCOMDB2_EXE:-${BUILDDIR}/db/copycomdb2}
+if [[ ! -x "$COPYCOMDB2_EXE" ]]; then
+	echo "copycomdb2 not available ($COPYCOMDB2_EXE); skipping"
+	exit 0
+fi
+
+destdb=${TESTCASE}dest${TESTID}
+copy_dbdir=${DBDIR}/$destdb
+dest_dbdir=${copy_dbdir}/$dbname
+destpid=0
+
+physrep_fences() {
+	cdb2sql --allow-incoherent ${CDB2_OPTIONS} --host localhost "$destdb" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null | \
+		grep -oP '(?<=SC publication fences: )[0-9]+'
+}
+
+override_physrep_sp() {
+	local master
+	master=$(cluster_master)
+	${CDB2SQL_EXE} $CDB2_OPTIONS "$dbname" --host "$master" \
+		"create procedure 'sys.physrep.register_replicant' version '1' { $(cat "$(dirname "$0")/register_replicant.lua") }" \
+		>/dev/null 2>&1
+}
+
+setup_replicant() {
+	local cluster_arg remote out="" retries=0
+	mkdir -p "$dest_dbdir"
+	cluster_arg="-y @$(tr ' ' ',' <<<"$CLUSTER")"
+	if [[ "$CLUSTER" =~ .*$myhost.* ]]; then
+		remote=""
+	else
+		local nodes=($CLUSTER)
+		remote="${nodes[0]}:"
+	fi
+
+	${COPYCOMDB2_EXE} -x ${COMDB2_EXE} -H "$destdb" $cluster_arg \
+		${remote}${DBDIR}/${DBNAME}.lrl "$dest_dbdir" "$dest_dbdir" || return 1
+	{
+		echo "utxnid_log on"
+		echo "enable_snapshot_isolation"
+		echo "verbose_fills on"
+	} >>"$dest_dbdir/${destdb}.lrl"
+	df "$DBDIR" | awk '{print $1}' | grep -q "tmpfs\|nfs" && \
+		echo "setattr directio 0" >>"$dest_dbdir/${destdb}.lrl"
+	if [[ -n "$PMUXPORT" ]]; then
+		echo "portmux_port $PMUXPORT" >>"$dest_dbdir/${destdb}.lrl"
+		echo "portmux_bind_path $pmux_socket" >>"$dest_dbdir/${destdb}.lrl"
+	fi
+
+	local replog=$TESTDIR/logs/$destdb.db
+	(cd "$DBDIR"; timeout --kill-after=5s ${TEST_TIMEOUT:-15m} \
+		$COMDB2_EXE "$destdb" --lrl "$dest_dbdir/${destdb}.lrl" \
+		--pidfile "$dest_dbdir/${destdb}.pid" >"$replog" 2>&1) &
+	while [[ "$out" != "1" ]]; do
+		out=$(${CDB2SQL_EXE} --tabs "$destdb" --host localhost \
+			'select 1' 2>/dev/null)
+		sleep 1
+		((retries++))
+		(( retries == 60 )) && return 1
+	done
+	[[ -f "$dest_dbdir/${destdb}.pid" ]] && \
+		destpid=$(cat "$dest_dbdir/${destdb}.pid")
+}
+
+cleanup() {
+	cluster_log_delete_on || true
+	[[ "$destpid" != 0 ]] && kill -9 "$destpid" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+master=$(cluster_master)
+[[ -n "$master" ]] || fail "could not find source master"
+cluster_log_delete_off
+override_physrep_sp
+if ! setup_replicant; then
+	echo "physrep $destdb failed to come up; skipping"
+	exit 0
+fi
+
+source_before=$(node_fences "$master")
+physrep_before=$(physrep_fences)
+[[ -n "$physrep_before" ]] || fail "physrep reported no initial fence count"
+
+seed_table "$master" "$rows"
+master=$(cluster_master)
+sql_node "$master" "rebuild t" >/dev/null || fail "rebuild failed"
+source_after=$(node_fences "$master")
+(( source_after > source_before )) || fail "source published no fences"
+
+physrep_after=""
+for ((i = 0; i < 150; i++)); do
+	physrep_after=$(physrep_fences)
+	[[ -n "$physrep_after" && "$physrep_after" == "$source_after" ]] && break
+	sleep 2
+done
+
+[[ "$physrep_after" == "$source_after" ]] || \
+	fail "physrep has ${physrep_after:-no} fences; source has $source_after"
+(( physrep_after - physrep_before == source_after - source_before )) || \
+	fail "physrep and source fence deltas differ"
+
+echo "SC_FENCE_PHYSREP: source=$source_after physrep=$physrep_after added=$((source_after-source_before))"
+echo "Passed test"

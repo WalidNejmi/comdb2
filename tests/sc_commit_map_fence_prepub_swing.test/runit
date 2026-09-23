@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+source ${TESTSROOTDIR}/sc_commit_map_fence_cluster.test/cluster_commit_map_lib.sh
+set -o pipefail
+
+dbname=$1
+[[ -z "$dbname" ]] && dbname=$DBNAME
+rows=${SC_FENCE_ROWS:-5000}
+rebuild_pid=""
+
+require_cluster
+
+cleanup() {
+	local node
+	for node in $(getclusternodes 2>/dev/null); do
+		send_node "$node" "sc_pause_at_end 0" || true
+	done
+	cluster_log_delete_on || true
+	[[ -n "$rebuild_pid" ]] && wait "$rebuild_pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+master=$(cluster_master)
+[[ -n "$master" ]] || fail "could not find master"
+cluster_log_delete_off
+
+sql_node "$master" "create table control(i int)" >/dev/null
+sql_node "$master" \
+	"insert into control select value from generate_series(1, $rows)" >/dev/null
+base_fences=$(node_fences "$master")
+sql_node "$master" "rebuild control" >/dev/null
+control_fences=$(node_fences "$master")
+expected=$((control_fences - base_fences))
+(( expected > 0 )) || fail "control rebuild published no fences"
+
+seed_table "$master" "$rows"
+before_fences=$(node_fences "$master")
+send_node "$master" "sc_pause_at_end 1"
+sql_node "$master" "rebuild t" >/dev/null 2>&1 &
+rebuild_pid=$!
+
+at_end=0
+for _ in $(seq 1 1200); do
+	value=$(sql_node "$master" \
+		"select value from comdb2_tunables where name='sc_is_at_end'" 2>/dev/null)
+	if [[ "$value" == "ON" || "$value" == "1" ]]; then
+		at_end=1
+		break
+	fi
+	kill -0 "$rebuild_pid" 2>/dev/null || break
+	sleep 0.25
+done
+(( at_end == 1 )) || fail "converter did not reach the pre-publication pause"
+
+paused_fences=$(node_fences "$master")
+(( paused_fences - before_fences == expected )) || \
+	fail "paused build registered $((paused_fences-before_fences)) files; expected $expected"
+
+old_master=$master
+downgrade_master || fail "could not force pre-publication master swing"
+wait "$rebuild_pid" 2>/dev/null || true
+rebuild_pid=""
+
+master=$(cluster_master)
+[[ -n "$master" && "$master" != "$old_master" ]] || \
+	fail "master did not change ($old_master -> ${master:-none})"
+
+want=$((before_fences + expected))
+if ! fences=$(wait_for_exact_fences "$master" "$want" 240); then
+	fail "resumed master has ${fences:-no} fences; expected exact count $want"
+fi
+[[ "$(sql_node "$master" 'select count(*) from t')" == "$rows" ]] || \
+	fail "resumed table row count changed"
+
+expected_sum=$(sql_node "$master" "select sum(i) from t")
+fifo=/tmp/sc_prepub_fifo.$$
+out=/tmp/sc_prepub_out.$$
+mkfifo "$fifo"
+cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbname" - \
+	<"$fifo" >"$out" 2>&1 &
+snapshot_pid=$!
+exec 9>"$fifo"
+printf '%s\n' "set transaction snapshot isolation" "begin" \
+	"select count(*) from t" "select sum(i) from t" >&9
+sleep 2
+sql_node "$master" "update t set i = i + 1" >/dev/null
+printf '%s\n' "select count(*) from t" "select sum(i) from t" "commit" >&9
+exec 9>&-
+wait "$snapshot_pid" || fail "snapshot client failed"
+rm -f "$fifo"
+mapfile -t values < <(grep -vE '^\[' "$out")
+rm -f "$out"
+
+(( ${values[0]} == rows && ${values[2]} == rows )) || \
+	fail "snapshot row count changed"
+[[ "${values[1]}" == "$expected_sum" && "${values[3]}" == "$expected_sum" ]] || \
+	fail "snapshot changed across post-publication update"
+
+echo "SC_FENCE_PREPUB_SWING: old=$old_master new=$master expected=$expected actual=$((fences-before_fences))"
+echo "Passed test"
