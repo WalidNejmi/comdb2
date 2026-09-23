@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+set -o pipefail
+
+dbnm=$1
+[[ -z "$dbnm" ]] && dbnm=$DBNAME
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+counter() {
+        local label=$1
+        cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+                "exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+                grep -oP "(?<=${label}: )[0-9]+"
+}
+
+run "create table t(i int, j int, k int)" >/dev/null
+run "create index ix_j on t(j)" >/dev/null
+run "insert into t select value, value, value from generate_series(1, 1000)" >/dev/null
+
+before=$(counter "SC publication fences")
+run "rebuild t" >/dev/null || fail "full rebuild failed"
+after=$(counter "SC publication fences")
+full=$(( after - before ))
+(( full > 0 )) || fail "full rebuild published $full fences"
+
+before=$(counter "SC publication fences")
+run "create index ix_k on t(k)" >/dev/null || fail "index build failed"
+after=$(counter "SC publication fences")
+delta=$(( after - before ))
+(( delta == 1 )) ||
+        fail "adding one index published $delta fences, expected exactly 1"
+
+echo "SC_FENCE_REUSED_PR4: full_rebuild_delta=$full add_index_delta=$delta"
+do_verify t
+echo "Passed test"

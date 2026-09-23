@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+set -o pipefail
+
+dbnm=$1
+[[ -z "$dbnm" ]] && dbnm=$DBNAME
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+counter() {
+        local label=$1
+        cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+                "exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+                grep -oP "(?<=${label}: )[0-9]+"
+}
+
+run "create table t(i int)" >/dev/null
+run "insert into t select value from generate_series(1, 100)" >/dev/null
+before=$(counter "SC publication fences")
+run "rebuild t" >/dev/null || fail "rebuild failed"
+after=$(counter "SC publication fences")
+delta=$(( after - before ))
+(( delta > 256 )) || fail "published only $delta fences, expected more than 256"
+[[ "$(run 'select count(*) from t')" == "100" ]] ||
+        fail "large build changed table contents"
+
+echo "SC_FENCE_MANY_PR4: delta=$delta"
+echo "Passed test"

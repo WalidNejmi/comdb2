@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+set -o pipefail
+
+dbnm=$1
+[[ -z "$dbnm" ]] && dbnm=$DBNAME
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+counter() {
+        local label=$1
+        cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+                "exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+                grep -oP "(?<=${label}: )[0-9]+"
+}
+expect_failed_rebuild() {
+        local tunable=$1 value=$2 reset=$3 before
+        before=$(counter "SC publication fences")
+        run "put tunable '$tunable' $value" >/dev/null ||
+                fail "could not set $tunable=$value"
+        if run "rebuild t" >/tmp/sc_fence_failure.$$ 2>&1; then
+                run "put tunable '$tunable' $reset" >/dev/null
+                rm -f /tmp/sc_fence_failure.$$
+                fail "rebuild unexpectedly succeeded with $tunable=$value"
+        fi
+        rm -f /tmp/sc_fence_failure.$$
+        run "put tunable '$tunable' $reset" >/dev/null ||
+                fail "could not reset $tunable"
+        [[ "$(counter "SC publication fences")" == "$before" ]] ||
+                fail "failed rebuild left publication-fence entries"
+}
+
+run "create table t(i int, j int)" >/dev/null
+run "create index ix_j on t(j)" >/dev/null
+run "insert into t select value, value from generate_series(1, 1000)" >/dev/null
+
+expect_failed_rebuild sc_fence_test_drop_pending 1 0
+expect_failed_rebuild sc_fence_publish_fail_after 1 2147483647
+
+run "rebuild t" >/dev/null || fail "normal rebuild failed after injections"
+[[ "$(run 'select count(*) from t')" == "1000" ]] ||
+        fail "failed publication changed table contents"
+
+echo "SC_FENCE_FAILURE_PR4: entries=$(counter "SC publication fences")"
+echo "Passed test"
