@@ -150,6 +150,9 @@ static inline int is_commit_record(int rectype) {
 		case (DB___txn_dist_commit):
 		case (DB___txn_regop_rowlocks):
 		case (DB___txn_regop_rowlocks_endianize):
+		case (DB___txn_regop_flags):
+		case (DB___txn_regop_gen_flags):
+		case (DB___txn_regop_gen_flags_endianize):
 			return 1;
 			break;
 		default:
@@ -750,7 +753,10 @@ __log_put_next(dbenv, lsn, context, dbt, udbt, hdr, old_lsnp, off_context, key, 
 				rectype == DB___txn_regop_rowlocks ||
 				rectype == DB___txn_dist_commit ||
 				rectype == DB___txn_regop_gen_endianize ||
-				rectype == DB___txn_regop_rowlocks_endianize);
+				rectype == DB___txn_regop_rowlocks_endianize ||
+				rectype == DB___txn_regop_flags ||
+				rectype == DB___txn_regop_gen_flags ||
+				rectype == DB___txn_regop_gen_flags_endianize);
 
 		if (rectype == DB___txn_regop_rowlocks ||
 			rectype == DB___txn_regop_rowlocks_endianize)
@@ -762,7 +768,9 @@ __log_put_next(dbenv, lsn, context, dbt, udbt, hdr, old_lsnp, off_context, key, 
 		}
 
 		if (rectype == DB___txn_regop_gen ||
-			rectype == DB___txn_regop_gen_endianize)
+			rectype == DB___txn_regop_gen_endianize ||
+			rectype == DB___txn_regop_gen_flags ||
+			rectype == DB___txn_regop_gen_flags_endianize)
 		{
 			/* <prefix>+opcode(4)+GENERATION(4) */
 			LOGCOPY_32( &generation, &pp[prefix + 4] );

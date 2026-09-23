@@ -3157,6 +3157,11 @@ __txn_force_abort(dbenv, buffer, new_chksump)
 	 * __txn_xa_regop records in txn.src.  We are passed the beginning
 	 * of the commit record in the log buffer and overwrite the
 	 * commit with an abort and recalculate the checksum.
+	 *
+	 * This routine is not gated on rectype.  The flag-carrying variants
+	 * remain safe because opcode is still the first field after the common
+	 * header and commit_flags is appended after the other fixed fields.
+	 * Forcing TXN_ABORT also prevents any future commit-only flag behavior.
 	 */
 	hdrsize = CRYPTO_ON(dbenv) ? HDR_CRYPTO_SZ : HDR_NORMAL_SZ;
 

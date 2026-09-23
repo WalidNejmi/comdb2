@@ -47,6 +47,7 @@ static const char revid[] = "$Id: txn_rec.c,v 11.54 2003/10/31 23:26:11 ubell Ex
 
 #include "db_int.h"
 #include "dbinc/db_page.h"
+#include "dbinc/db_swap.h"
 #include "dbinc/txn.h"
 #include "dbinc/db_am.h"
 
@@ -701,7 +702,102 @@ quiet_err:
 	return (ret);
 }
 
-#include "dbinc/db_swap.h"
+/*
+ * Flag records are staged as a read-compatible format before any producer or
+ * consumer is allowed to act on the flag.  Validate the complete record, then
+ * remove the appended commit_flags word and dispatch the byte-identical parent
+ * record.  This intentionally gives recovery exactly the parent semantics.
+ */
+static int
+__txn_recover_flag_record_as_parent(dbenv, dbtp, lsnp, op, info, is_gen)
+	DB_ENV *dbenv;
+	DBT *dbtp;
+	DB_LSN *lsnp;
+	db_recops op;
+	void *info;
+	int is_gen;
+{
+	DBT parent = {0};
+	u_int32_t rawtype, basetype, parent_type;
+	size_t header_size, prefix_size;
+	u_int8_t *src, *dst;
+	int ret;
+
+	if (dbtp == NULL || dbtp->data == NULL || dbtp->size < sizeof(u_int32_t))
+		return (EINVAL);
+	src = dbtp->data;
+	LOGCOPY_32(&rawtype, src);
+	basetype = rawtype & ~DB_debug_FLAG;
+	header_size = sizeof(u_int32_t) * 2 + sizeof(DB_LSN);
+	if (basetype == DB___txn_regop_flags + 2000 ||
+	    basetype == DB___txn_regop_gen_flags + 2000 ||
+	    basetype == DB___txn_regop_gen_flags_endianize + 2000)
+		header_size += sizeof(u_int64_t);
+	prefix_size = header_size + sizeof(u_int32_t) * 2;
+	if (is_gen)
+		prefix_size += sizeof(u_int64_t) * 2;
+	if (dbtp->size < prefix_size + sizeof(u_int32_t))
+		return (EINVAL);
+
+	if ((ret = __os_malloc(dbenv, dbtp->size - sizeof(u_int32_t),
+	    &parent.data)) != 0)
+		return (ret);
+	parent.size = dbtp->size - sizeof(u_int32_t);
+	dst = parent.data;
+	memcpy(dst, src, prefix_size);
+	memcpy(dst + prefix_size, src + prefix_size + sizeof(u_int32_t),
+	    dbtp->size - prefix_size - sizeof(u_int32_t));
+
+	if (is_gen) {
+		parent_type = (basetype == DB___txn_regop_gen_flags_endianize ||
+		    basetype == DB___txn_regop_gen_flags_endianize + 2000) ?
+		    DB___txn_regop_gen_endianize : DB___txn_regop_gen;
+	} else {
+		parent_type = DB___txn_regop;
+	}
+	if (basetype > 2000)
+		parent_type += 2000;
+	parent_type |= rawtype & DB_debug_FLAG;
+	LOGCOPY_32(dst, &parent_type);
+
+	ret = is_gen ? __txn_regop_gen_recover(dbenv, &parent, lsnp, op, info) :
+	    __txn_regop_recover(dbenv, &parent, lsnp, op, info);
+	__os_free(dbenv, parent.data);
+	return (ret);
+}
+
+int
+__txn_regop_flags_recover(dbenv, dbtp, lsnp, op, info)
+	DB_ENV *dbenv;
+	DBT *dbtp;
+	DB_LSN *lsnp;
+	db_recops op;
+	void *info;
+{
+	__txn_regop_flags_args *argp = NULL;
+	int ret = __txn_regop_flags_read(dbenv, dbtp->data, dbtp->size, &argp);
+	if (ret != 0)
+		return (ret);
+	__os_free(dbenv, argp);
+	return __txn_recover_flag_record_as_parent(dbenv, dbtp, lsnp, op, info, 0);
+}
+
+int
+__txn_regop_gen_flags_recover(dbenv, dbtp, lsnp, op, info)
+	DB_ENV *dbenv;
+	DBT *dbtp;
+	DB_LSN *lsnp;
+	db_recops op;
+	void *info;
+{
+	__txn_regop_gen_flags_args *argp = NULL;
+	int ret = __txn_regop_gen_flags_read(dbenv, dbtp->data, dbtp->size, &argp);
+	if (ret != 0)
+		return (ret);
+	__os_free(dbenv, argp);
+	return __txn_recover_flag_record_as_parent(dbenv, dbtp, lsnp, op, info, 1);
+}
+
 #include "dbinc/lock.h"
 #include "dbinc/log.h"
 

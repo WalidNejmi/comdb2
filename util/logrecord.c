@@ -167,7 +167,10 @@ uint64_t logrecord_timestamp_matchable(char *data)
     /* Dispatch on the base type; the accessors handle the tags themselves. */
     (void)__rectype_tags(rectype, &base);
 
-    if (base == DB___txn_regop_gen || base == DB___txn_regop_gen_endianize) {
+    if (base == DB___txn_regop_gen ||
+        base == DB___txn_regop_gen_endianize ||
+        base == DB___txn_regop_gen_flags ||
+        base == DB___txn_regop_gen_flags_endianize) {
         return logrecord_timestamp_regop_gen(data);
     }
 

@@ -468,6 +468,11 @@ static int tranlogColumn(
             generation = logrecord_generation_regop_gen(pCur->data.data);
         }
 
+        if (rectype == DB___txn_regop_gen_flags ||
+            rectype == DB___txn_regop_gen_flags_endianize){
+            generation = logrecord_generation_regop_gen(pCur->data.data);
+        }
+
         if (rectype == DB___txn_dist_commit){
             generation = logrecord_generation_dist_commit(pCur->data.data);
         }
@@ -542,7 +547,10 @@ static int tranlogColumn(
         /* Dispatch on the base type; the accessors handle the tags. */
         (void)__rectype_tags(rectype, &rectype);
 
-        if (rectype == DB___txn_regop_gen || rectype == DB___txn_regop_gen_endianize) {
+        if (rectype == DB___txn_regop_gen ||
+            rectype == DB___txn_regop_gen_endianize ||
+            rectype == DB___txn_regop_gen_flags ||
+            rectype == DB___txn_regop_gen_flags_endianize) {
             timestamp = logrecord_timestamp_regop_gen(pCur->data.data);
         }
 

@@ -860,6 +860,9 @@ full_recovery_check(DB_ENV *dbenv, DB_LSN *max_lsn)
 			first = lsn;
 		if (type == DB___txn_regop || type == DB___txn_regop_gen ||
 			type == DB___txn_regop_gen_endianize ||
+			type == DB___txn_regop_flags ||
+			type == DB___txn_regop_gen_flags ||
+			type == DB___txn_regop_gen_flags_endianize ||
 			type == DB___txn_dist_commit || type == DB___txn_regop_rowlocks ||
 			type == DB___txn_regop_rowlocks_endianize) {
 			cpy = lsn;
@@ -2180,6 +2183,22 @@ __scan_logfiles_for_asof_modsnap(dbenv)
 				GOTOERR;
 			}
 			break;
+		case DB___txn_regop_gen_flags_endianize:
+		case DB___txn_regop_gen_flags: {
+			__txn_regop_gen_flags_args *flags_args = NULL;
+			if ((ret = __txn_regop_gen_flags_read(dbenv, data.data,
+			    data.size, &flags_args)) != 0)
+				GOTOERR;
+			free_ptr = flags_args;
+			if (__txn_commit_map_enabled() && flags_args->opcode == TXN_COMMIT &&
+			    (ret = __txn_commit_map_add(dbenv,
+			    flags_args->txnid->utxnid, lsn))) {
+				logmsg(LOGMSG_ERROR, "%s: Failed to add to commit LSN map\n",
+				    __func__);
+				GOTOERR;
+			}
+			break;
+		}
 		case DB___txn_regop:
 			if ((ret =
 				__txn_regop_read(dbenv, data.data,
@@ -2193,6 +2212,21 @@ __scan_logfiles_for_asof_modsnap(dbenv)
 				GOTOERR;
 			}
 			break;
+		case DB___txn_regop_flags: {
+			__txn_regop_flags_args *flags_args = NULL;
+			if ((ret = __txn_regop_flags_read(dbenv, data.data, data.size,
+			    &flags_args)) != 0)
+				GOTOERR;
+			free_ptr = flags_args;
+			if (__txn_commit_map_enabled() && flags_args->opcode == TXN_COMMIT &&
+			    (ret = __txn_commit_map_add(dbenv,
+			    flags_args->txnid->utxnid, lsn))) {
+				logmsg(LOGMSG_ERROR, "%s: Failed to add to commit LSN map\n",
+				    __func__);
+				GOTOERR;
+			}
+			break;
+		}
 		case DB___txn_regop_rowlocks:
 		case DB___txn_regop_rowlocks_endianize:
 			if ((ret =

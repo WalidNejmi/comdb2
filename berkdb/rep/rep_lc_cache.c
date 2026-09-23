@@ -288,6 +288,9 @@ __lc_cache_feed(DB_ENV *dbenv, DB_LSN lsn, DBT dbt)
 	if (type == DB___txn_regop || type == DB___txn_regop_gen ||
 		type == DB___txn_regop_gen_endianize ||
 		type == DB___txn_regop_rowlocks_endianize ||
+		type == DB___txn_regop_flags ||
+		type == DB___txn_regop_gen_flags ||
+		type == DB___txn_regop_gen_flags_endianize ||
 		type == DB___txn_dist_commit || type == DB___txn_regop_rowlocks) {
 		/* Transaction processing starts at the log record preceding the commit.
 		 * That's the record that __rep_apply_txn will call __lc_cache_find with.

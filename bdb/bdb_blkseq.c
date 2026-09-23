@@ -739,7 +739,9 @@ int bdb_recover_blkseq(bdb_state_type *bdb_state)
                 }
             } else if (rectype == DB___txn_regop || rectype == DB___txn_regop_gen ||
                        rectype == DB___txn_regop_rowlocks || rectype == DB___txn_dist_commit ||
-                       rectype == DB___txn_regop_rowlocks_endianize || rectype == DB___txn_regop_gen_endianize) {
+                      rectype == DB___txn_regop_rowlocks_endianize || rectype == DB___txn_regop_gen_endianize ||
+                      rectype == DB___txn_regop_flags || rectype == DB___txn_regop_gen_flags ||
+                      rectype == DB___txn_regop_gen_flags_endianize) {
                 /* Skip past rectype & txnid */
                 bp = (((char*)logdta.data) + sizeof(u_int32_t) + sizeof(u_int32_t));
                 LOGCOPY_TOLSN(&bslsn, bp);
