@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# The master's commit-map omission must follow the FINAL commit-time decision,
+# not the converter's earlier classification.
+#
+# Every other test in this family exercises transactions where the two agree:
+#
+#   sc_skip_commit_map = 1   and   final commit flags = SKIP_MAP
+#
+# Those cannot tell the two implementations apart, because reading either one
+# produces the same answer. This test builds the case where they DISAGREE.
+#
+# The near miss
+# -------------
+# sc_commit_flags_force_unsupported makes the commit-time safety check reject
+# every direct-copy candidate, as though it had landed on a commit family with
+# no flag-carrying twin:
+#
+#   txnp->sc_skip_commit_map = 1      classified as a candidate
+#   final commit flags       = 0      rejected at commit time
+#
+# Fail-closed means the master must RETAIN these entries. A master that instead
+# consults the classifier bit drops them, while the WAL -- which carries no
+# SKIP_MAP -- tells every other node to keep them. That is the divergence this
+# whole project exists to prevent, and it is invisible to every other test.
+#
+# Why injection rather than a natural near miss
+# ---------------------------------------------
+# The natural rejections cannot be produced on demand. Rowlocks is a
+# whole-database mode, not a per-transaction one, and was tried first: it does
+# produce the near miss, but `rebuild` under `init_with_rowlocks` leaves the
+# table reading as empty on this branch, independently of this change (it
+# reproduces identically with the fix reverted), so the test could never get
+# past its own row-count check. Distributed transactions and converter
+# transactions with committed children are likewise not something a schema
+# change generates by itself.
+#
+# The injection changes only the DECISION. The transactions still write the
+# same data with the same locking, durability and commit family, so what is
+# measured is a genuinely rejected candidate rather than a simulated one.
+#
+# Expected results
+# ----------------
+#   before the fix   master skips ~N entries      <- FAILS here
+#   after the fix    master skips 0, retains ~N   <- passes
+#
+# The rejection counter is asserted FIRST and independently. Without it, a
+# silent change -- the injection not taking effect, or the classifier no longer
+# firing for converters -- would make this test pass for the wrong reason, by
+# never producing a near miss at all.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+
+set -o pipefail
+
+dbnm=$1
+
+# Smaller than the growth test: the signal here is "did the master skip at
+# all", which does not need a large sample.
+N=${SC_COMMIT_MAP_ROWS:-2000}
+
+master=$(getmaster)
+if [[ -z "$master" ]]; then
+	echo "FAIL: could not find master"
+	exit 1
+fi
+readonly master N
+
+run_on_master() {
+	cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm "$1"
+}
+
+# Schema-change completion is not perfectly synchronous with the statement
+# returning, and a query issued in the window where the table is being swapped
+# can fail outright. Retry a read a few times rather than treating a transient
+# error as a row count of zero, which would report a data-loss failure for what
+# is really a timing artefact.
+read_count_with_retry() {
+	local -r query=$1
+	local out rc
+
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		out=$(cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm \
+			"$query" 2>&1)
+		rc=$?
+		if (( rc == 0 )) && [[ "$out" =~ ^[0-9]+$ ]]; then
+			echo "$out"
+			return 0
+		fi
+		sleep 1
+	done
+
+	echo "FAIL: '$query' did not return a row count after 10 attempts;" \
+		"last rc=$rc output: $out" >&2
+	return 1
+}
+
+send_to_master() {
+	cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm \
+		"exec procedure sys.cmd.send(\"$1\")"
+}
+
+get_clminfo() {
+	cdb2sql ${CDB2_OPTIONS} --host $master $dbnm \
+		"exec procedure sys.cmd.send('bdb clminfo')"
+}
+
+extract_current_entries_from_clminfo() {
+	grep -oP '(?<=Current entries: )[0-9]+' <<<"$1"
+}
+
+extract_skipped_from_clminfo() {
+	grep -oP '(?<=SC commit-map entries skipped: )[0-9]+' <<<"$1"
+}
+
+extract_unsup_family_from_clminfo() {
+	grep -oP '(?<=SC unsupported candidate unknown family: )[0-9]+' <<<"$1"
+}
+
+extract_would_skip_master_from_clminfo() {
+	grep -oP '(?<=SC would-skip \(master\): )[0-9]+' <<<"$1"
+}
+
+restore_log_deletion() {
+	send_to_master "sync log-delete on" > /dev/null 2>&1
+}
+
+# Hold log deletion so retained entries are not pruned underneath the
+# measurement; the trap restores it on the failing path too.
+trap restore_log_deletion EXIT
+send_to_master "sync log-delete off 10"
+
+# Populate in one statement so setup does not pollute the map with the same
+# order of growth being attributed to the rebuild.
+run_on_master "create table t(i int)"
+run_on_master "insert into t select value from generate_series(1, $N)"
+
+rowcount=$(read_count_with_retry 'select COUNT(*) from t') || exit 1
+if (( rowcount != N )); then
+	echo "FAIL: expected $N rows before rebuild, got $rowcount"
+	exit 1
+fi
+
+clminfo=$(get_clminfo)
+before_current=$(extract_current_entries_from_clminfo "$clminfo")
+before_skipped=$(extract_skipped_from_clminfo "$clminfo")
+before_unsup_family=$(extract_unsup_family_from_clminfo "$clminfo")
+before_would_skip=$(extract_would_skip_master_from_clminfo "$clminfo")
+if [[ -z "$before_current" || -z "$before_skipped" || -z "$before_unsup_family" ]]; then
+	echo "FAIL: could not parse commit-map stats from clminfo:"
+	echo "$clminfo"
+	exit 1
+fi
+readonly before_current before_skipped before_unsup_family before_would_skip
+
+# The measurement. Check the rebuild's own status too: a rebuild that silently
+# failed would convert nothing, produce no near miss, and leave the assertions
+# below measuring nothing.
+if ! run_on_master "rebuild t"; then
+	echo "FAIL: 'rebuild t' returned a non-zero status"
+	exit 1
+fi
+
+rowcount=$(read_count_with_retry 'select COUNT(*) from t') || exit 1
+if (( rowcount != N )); then
+	echo "FAIL: expected $N rows after rebuild, got $rowcount"
+	exit 1
+fi
+
+clminfo=$(get_clminfo)
+after_current=$(extract_current_entries_from_clminfo "$clminfo")
+after_skipped=$(extract_skipped_from_clminfo "$clminfo")
+after_unsup_family=$(extract_unsup_family_from_clminfo "$clminfo")
+after_would_skip=$(extract_would_skip_master_from_clminfo "$clminfo")
+readonly after_current after_skipped after_unsup_family after_would_skip
+
+map_delta=$(( after_current - before_current ))
+skipped_delta=$(( after_skipped - before_skipped ))
+unsup_family_delta=$(( after_unsup_family - before_unsup_family ))
+readonly map_delta skipped_delta unsup_family_delta
+
+echo "SC_COMMIT_MAP_NEARMISS: rows=$N map_delta=$map_delta" \
+	"skipped_delta=$skipped_delta" \
+	"unsup_family_delta=$unsup_family_delta"
+
+# ---------------------------------------------------------------------------
+# 1. The near miss must actually have happened.
+#
+# Checked first and on its own: if the injection stopped taking effect, or the
+# classifier stopped firing for converter transactions, there would be no near
+# miss to test and the remaining assertions would pass vacuously.
+# ---------------------------------------------------------------------------
+if (( unsup_family_delta < N )); then
+	echo "FAIL: only $unsup_family_delta near-miss rejections were" \
+		"counted while rebuilding $N rows; expected at least one per" \
+		"converted row. The test did not produce the condition it exists" \
+		"to check -- confirm sc_commit_flags_force_unsupported is set and" \
+		"that converter transactions are still classified as candidates."
+	exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 2. The actual assertion: a rejected candidate must be RETAINED.
+#
+# This is what fails against a master that consults txnp->sc_skip_commit_map
+# instead of the final commit-time flags.
+# ---------------------------------------------------------------------------
+if (( skipped_delta != 0 )); then
+	echo "FAIL: the master skipped $skipped_delta commit-map entries for" \
+		"transactions the commit-time check REJECTED ($unsup_family_delta" \
+		"rejections). No SKIP_MAP was written for these, so every" \
+		"other node retains them. The master must not be making its own" \
+		"decision from txnp->sc_skip_commit_map -- it must use the same" \
+		"final flags value that was selected for the WAL."
+	exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Retained means retained: the entries are really in the map.
+#
+# Guards against the skip counter being bypassed while the entries are lost
+# some other way.
+# ---------------------------------------------------------------------------
+if (( map_delta < N )); then
+	echo "FAIL: rebuilding $N rows grew the commit map by only $map_delta" \
+		"entries. Rejected candidates keep ordinary history, so the map" \
+		"should grow by about one entry per converted row."
+	exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Nothing was reported as a would-skip either.
+#
+# would-skip is only recorded when a flag-carrying record is emitted, so with
+# the writer off this is 0 regardless. It is asserted anyway: if the writer is
+# ever enabled for this configuration, a rejected candidate must still never
+# appear as a would-skip.
+# ---------------------------------------------------------------------------
+if [[ -n "$before_would_skip" && -n "$after_would_skip" ]]; then
+	would_skip_delta=$(( after_would_skip - before_would_skip ))
+	if (( would_skip_delta != 0 )); then
+		echo "FAIL: $would_skip_delta transactions were reported as" \
+			"would-skip on the master, but every candidate in this" \
+			"configuration was rejected as unsupported."
+		exit 1
+	fi
+fi
+
+do_verify t
+
+echo "Passed test"

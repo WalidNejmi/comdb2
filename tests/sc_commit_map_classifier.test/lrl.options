@@ -1,2 +1,7 @@
 utxnid_log on
 enable_snapshot_isolation
+sc_commit_flags_writer 1
+
+# Make each converter transaction touch its source table in the classifier
+# after it has written the private replacement files.
+sc_test_converter_public_write 1

@@ -1,0 +1,9 @@
+# The commit-LSN map only exists when utxnids are logged and snapshot
+# isolation is enabled.
+utxnid_log on
+enable_snapshot_isolation
+
+# Turn the flag-carrying commit-record WRITER on.  Reader support is
+# unconditional and already deployed; this is the observation stage, where the
+# durable decision is recorded but no consumer acts on it.
+sc_commit_flags_writer 1

@@ -1,0 +1,21 @@
+# The commit-LSN map only exists when utxnids are logged and snapshot
+# isolation is enabled; both are on by default, but this test measures the
+# map itself, so state the requirement explicitly rather than inheriting it.
+utxnid_log on
+enable_snapshot_isolation
+
+# Emit the durable flag, so the WAL decision and the master's decision are both
+# live and can be compared.
+sc_commit_flags_writer 1
+
+# The point of this test.  Force the commit-time safety check to reject every
+# direct-copy candidate, producing the one case that tells the two
+# implementations apart:
+#
+#   txnp->sc_skip_commit_map = 1   (the converter classified it as a candidate)
+#   final commit flags       = 0   (the commit-time check rejected it)
+#
+# This changes only the DECISION -- the transactions still write the same data
+# with the same locking, durability and commit family -- so what it produces is
+# a genuinely rejected candidate, not a simulated one.
+sc_commit_flags_force_unsupported 1

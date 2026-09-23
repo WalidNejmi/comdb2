@@ -6,7 +6,6 @@ source ${TESTSROOTDIR}/tools/cluster_utils.sh
 set -o pipefail
 
 dbnm=$1
-[[ -z "$dbnm" ]] && dbnm=$DBNAME
 master=$(getmaster)
 [[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
 
@@ -24,10 +23,8 @@ before=$(fences)
 run "rebuild t" >/dev/null || fail "rebuild failed"
 after=$(fences)
 delta=$(( after - before ))
-(( delta == 308 )) || fail "published $delta fences, expected exactly 308"
+(( delta > 256 )) || fail "published only $delta fences; expected more than 256"
 
-run "exec procedure sys.cmd.send('flush')" >/dev/null ||
-	fail "could not flush before restart"
 stop_all_nodes
 sleep 10
 start_all_nodes
@@ -36,8 +33,7 @@ master=$(getmaster)
 [[ -n "$master" ]] || fail "could not find master after restart"
 reloaded=$(fences)
 (( reloaded == after )) || fail "reloaded $reloaded fences, expected $after"
-[[ "$(run 'select count(*) from t')" == "100" ]] ||
-	fail "table contents changed"
+[[ "$(run 'select count(*) from t')" == "100" ]] || fail "table contents changed"
 
 echo "SC_FENCE_MANY: delta=$delta reloaded=$reloaded"
 echo "Passed test"

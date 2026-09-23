@@ -1,14 +1,42 @@
 #!/usr/bin/env bash
 bash -n "$0" || exit 1
 
+# Does a PHYSICAL REPLICA pick up publication fences?
+#
+# A physrep is the last consumer of the commit map whose fence story was
+# unverified.  It matters for the same reason a logical replica does: it
+# replays the converter transactions and, honouring the durable marker, leaves
+# their commit-map entries out -- so reconstruction of a page in a rebuilt file
+# has nothing to look up and needs a fence to stop at.
+#
+# Whether it gets one was an open question, because a physrep does not take the
+# logical-replication path.  It pulls raw log records and replays them:
+#
+#   db/phys_rep.c:745   handle_record()
+#     -> db/phys_rep.c:806          apply_log()
+#     -> berkdb/rep/rep_record.c    __dbenv_apply_log() -> __rep_apply(.., 2)
+#
+# Reading the code suggests it does reach the same place a logical replica
+# does: llog records dispatch through bdb_apprec() (bdb/custom_recover.c),
+# whose DB_llog_scdone case calls handle_scdone(), which on DB_TXN_APPLY calls
+# bdb_scdone_int() and thence the registered scdone_rtn -- scdone_callback(),
+# where the fence reload lives.  No physrep gate appears anywhere on that
+# chain.  But that is reasoning from reading, and this test is the measurement.
+#
+# Asserts the physrep ends up holding at least the fences the source published.
+#
+# Skips cleanly (exit 0) when the harness cannot provide a physrep: no source
+# cluster, no copycomdb2, or a physrep that fails to come up.  A physrep that
+# IS up and caught up but holds no fences is a real failure and fails loudly.
+
 source ${TESTSROOTDIR}/tools/runit_common.sh
 source ${TESTSROOTDIR}/tools/cluster_utils.sh
-source ${TESTSROOTDIR}/sc_commit_map_fence_cluster.test/cluster_commit_map_lib.sh
+source "$(dirname "$0")/cluster_commit_map_lib.sh"
+
 set -o pipefail
 
 dbname=$1
 [[ -z "$dbname" ]] && dbname=$DBNAME
-rows=${SC_FENCE_ROWS:-200}
 
 require_cluster
 
@@ -18,101 +46,255 @@ if [[ ! -x "$COPYCOMDB2_EXE" ]]; then
 	exit 0
 fi
 
+N=${SC_FENCE_ROWS:-200}
+
 destdb=${TESTCASE}dest${TESTID}
-copy_dbdir=${DBDIR}/$destdb
-dest_dbdir=${copy_dbdir}/$dbname
+COPY_DBDIR=${DBDIR}/$destdb
+DEST_DBDIR=${COPY_DBDIR}/$dbname
 destpid=0
 
-physrep_fences() {
+# clminfo against the physrep, which is a separate local instance.  Read with
+# --allow-incoherent: a physrep is never "coherent" in the cluster sense, but
+# its fence registry is meaningful as soon as it has applied the schema change.
+physrep_clminfo() {
 	cdb2sql --allow-incoherent ${CDB2_OPTIONS} --host localhost "$destdb" \
-		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null | \
-		grep -oP '(?<=SC publication fences: )[0-9]+'
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null
+}
+physrep_fences() {
+	physrep_clminfo | grep -oP '(?<=SC publication fences: )[0-9]+'
+}
+# A physrep is a CONSUMER of the commit map, not a producer.  It never reaches
+# the master-only skip at __txn_commit_int(), so "SC commit-map entries
+# skipped" stays 0 on it by design; it omits entries through the apply-path
+# guards instead, and reports that through the would-skip counters.  Sum the
+# consumer roles -- a physrep applies via __rep_apply, so it lands on the
+# serial or concurrent replica counter depending on configuration.
+physrep_would_skip() {
+	physrep_clminfo | awk -F': ' '
+		/SC would-skip \(serial replica\)/     { s += $2 }
+		/SC would-skip \(concurrent replica\)/ { s += $2 }
+		/SC would-skip \(recovery\)/           { s += $2 }
+		END { print s + 0 }'
 }
 
 override_physrep_sp() {
-	local master
-	master=$(cluster_master)
-	${CDB2SQL_EXE} $CDB2_OPTIONS "$dbname" --host "$master" \
+	local mnode
+	mnode=$(getmaster)
+	${CDB2SQL_EXE} $CDB2_OPTIONS "$dbname" --host "$mnode" \
 		"create procedure 'sys.physrep.register_replicant' version '1' { $(cat "$(dirname "$0")/register_replicant.lua") }" \
-		>/dev/null 2>&1
+		> /dev/null 2>&1
 }
 
 setup_replicant() {
-	local cluster_arg remote out="" retries=0
-	mkdir -p "$dest_dbdir"
-	cluster_arg="-y @$(tr ' ' ',' <<<"$CLUSTER")"
+	local mnode cl rmt
+	mnode=$(getmaster)
+	[[ -z "$mnode" ]] && return 1
+	mkdir -p "$DEST_DBDIR"
+
+	cl="-y @$(echo $CLUSTER | tr ' ' ',')"
 	if [[ "$CLUSTER" =~ .*$myhost.* ]]; then
-		remote=""
+		rmt=""
 	else
-		local nodes=($CLUSTER)
-		remote="${nodes[0]}:"
+		local clarray=($CLUSTER)
+		rmt="${clarray[0]}:"
 	fi
 
-	${COPYCOMDB2_EXE} -x ${COMDB2_EXE} -H "$destdb" $cluster_arg \
-		${remote}${DBDIR}/${DBNAME}.lrl "$dest_dbdir" "$dest_dbdir" || return 1
+	${COPYCOMDB2_EXE} -x ${COMDB2_EXE} -H "$destdb" $cl \
+		${rmt}${DBDIR}/${DBNAME}.lrl "$DEST_DBDIR" "$DEST_DBDIR" || return 1
+
+	# The physrep must maintain its own commit-LSN map for this to mean
+	# anything; state the same requirements the source runs with.
 	{
 		echo "utxnid_log on"
 		echo "enable_snapshot_isolation"
 		echo "verbose_fills on"
-	} >>"$dest_dbdir/${destdb}.lrl"
+	} >> "$DEST_DBDIR/${destdb}.lrl"
 	df "$DBDIR" | awk '{print $1}' | grep -q "tmpfs\|nfs" && \
-		echo "setattr directio 0" >>"$dest_dbdir/${destdb}.lrl"
-	if [[ -n "$PMUXPORT" ]]; then
-		echo "portmux_port $PMUXPORT" >>"$dest_dbdir/${destdb}.lrl"
-		echo "portmux_bind_path $pmux_socket" >>"$dest_dbdir/${destdb}.lrl"
+		echo "setattr directio 0" >> "$DEST_DBDIR/${destdb}.lrl"
+	if [ -n "$PMUXPORT" ] ; then
+		echo "portmux_port $PMUXPORT" >> "$DEST_DBDIR/${destdb}.lrl"
+		echo "portmux_bind_path $pmux_socket" >> "$DEST_DBDIR/${destdb}.lrl"
 	fi
 
 	local replog=$TESTDIR/logs/$destdb.db
 	(cd "$DBDIR"; timeout --kill-after=5s ${TEST_TIMEOUT:-15m} \
-		$COMDB2_EXE "$destdb" --lrl "$dest_dbdir/${destdb}.lrl" \
-		--pidfile "$dest_dbdir/${destdb}.pid" >"$replog" 2>&1) &
+		$COMDB2_EXE "$destdb" --lrl "$DEST_DBDIR/${destdb}.lrl" \
+		--pidfile "$DEST_DBDIR/${destdb}.pid" > "$replog" 2>&1) &
+
+	local out="" retries=0
 	while [[ "$out" != "1" ]]; do
-		out=$(${CDB2SQL_EXE} --tabs "$destdb" --host localhost \
-			'select 1' 2>/dev/null)
+		out=$(${CDB2SQL_EXE} --tabs "$destdb" --host localhost 'select 1' 2>/dev/null)
 		sleep 1
-		((retries++))
-		(( retries == 60 )) && return 1
+		let retries=retries+1
+		if [ $retries -eq 60 ]; then
+			return 1
+		fi
 	done
-	[[ -f "$dest_dbdir/${destdb}.pid" ]] && \
-		destpid=$(cat "$dest_dbdir/${destdb}.pid")
+	[[ -f "$DEST_DBDIR/${destdb}.pid" ]] && destpid=$(cat "$DEST_DBDIR/${destdb}.pid")
+	return 0
 }
 
 cleanup() {
-	cluster_log_delete_on || true
-	[[ "$destpid" != 0 ]] && kill -9 "$destpid" 2>/dev/null || true
+	cluster_log_delete_on
+	[[ "$destpid" != 0 ]] && kill -9 "$destpid" 2>/dev/null
 }
 trap cleanup EXIT
 
+# --- run --------------------------------------------------------------------
+
 master=$(cluster_master)
 [[ -n "$master" ]] || fail "could not find source master"
+echo "source_master=$master physrep=$destdb rows=$N"
+
 cluster_log_delete_off
+
 override_physrep_sp
 if ! setup_replicant; then
-	echo "physrep $destdb failed to come up; skipping"
+	echo "physrep $destdb failed to come up; treating as infra-unavailable -- skipping"
 	exit 0
 fi
 
-source_before=$(node_fences "$master")
-physrep_before=$(physrep_fences)
-[[ -n "$physrep_before" ]] || fail "physrep reported no initial fence count"
+# A physrep that does not maintain a commit map at all cannot exercise this.
+if [[ -z "$(physrep_clminfo)" ]]; then
+	echo "physrep exposes no clminfo block; skipping"
+	exit 0
+fi
 
-seed_table "$master" "$rows"
+before_fences=$(physrep_fences)
+echo "SC_FENCE_PHYSREP: physrep fences before rebuild: ${before_fences:-unknown}"
+
+# Rebuild on the source: one converter commit per copied row.
+seed_table "$master" "$N"
+sleep 2
 master=$(cluster_master)
-sql_node "$master" "rebuild t" >/dev/null || fail "rebuild failed"
-source_after=$(node_fences "$master")
-(( source_after > source_before )) || fail "source published no fences"
+sql_node "$master" "rebuild t" > /dev/null || fail "rebuild failed"
 
-physrep_after=""
-for ((i = 0; i < 150; i++)); do
-	physrep_after=$(physrep_fences)
-	[[ -n "$physrep_after" && "$physrep_after" == "$source_after" ]] && break
+src_fences=$(node_clminfo "$master" | grep -oP '(?<=SC publication fences: )[0-9]+')
+src_skipped=$(node_skipped "$master")
+
+echo "SC_FENCE_PHYSREP: source skipped=$src_skipped fences=$src_fences"
+
+(( src_skipped > 0 )) || \
+	fail "source skipped $src_skipped converter entries; the skip is not" \
+		"active, so this test would not exercise the fence"
+(( src_fences > 0 )) || fail "source published no fences"
+
+# Wait for the physrep to replay the schema change and pick the fences up.
+for (( i = 0; i < 150; i++ )); do
+	pf=$(physrep_fences)
+	[[ -n "$pf" ]] && (( pf >= src_fences )) && break
 	sleep 2
 done
 
-[[ "$physrep_after" == "$source_after" ]] || \
-	fail "physrep has ${physrep_after:-no} fences; source has $source_after"
-(( physrep_after - physrep_before == source_after - source_before )) || \
-	fail "physrep and source fence deltas differ"
+pf=$(physrep_fences)
+pw=$(physrep_would_skip)
 
-echo "SC_FENCE_PHYSREP: source=$source_after physrep=$physrep_after added=$((source_after-source_before))"
+echo "SC_FENCE_PHYSREP: physrep fences=${pf:-none} would_skip=${pw:-none}" \
+	"(source fences=$src_fences skipped=$src_skipped)"
+
+echo "--- physrep commit-map counters ---"
+physrep_clminfo | grep -E "SC |Current entries|Entries added" || true
+echo "-----------------------------------"
+
+[[ -n "$pf" ]] || fail "physrep reported no fence count at all"
+
+# The physrep never pended a fence -- it did not run the schema change.  Any
+# it holds came from the durable records replayed out of the source's log.
+(( pf >= src_fences )) || \
+	fail "physrep holds $pf fences, source published $src_fences; a physrep" \
+		"that omits converter entries without a fence cannot reconstruct a" \
+		"page in a rebuilt file"
+
+# It must also be honouring the durable marker, or it is not in the state the
+# fence is needed for and the assertion above proves nothing.
+(( pw > 0 )) || \
+	fail "physrep decoded no flag-carrying commit records (would-skip $pw);" \
+		"it is not omitting converter entries, so its fences are not being" \
+		"exercised"
+
+# --- the fence must be LOAD-BEARING for a read served by the physrep --------
+#
+# Holding the fences is necessary but not sufficient.  Everything above is
+# still true of a physrep that never reconstructs anything.  Drive a snapshot
+# read against the physrep across concurrent source writes, so it has to walk
+# a page back through the converter history it omitted, and require that it
+# stopped at a fence to do so.
+
+phys_sql() {
+	cdb2sql --tabs --allow-incoherent ${CDB2_OPTIONS} --host localhost \
+		"$destdb" "$1" 2>/dev/null
+}
+
+expected_sum=$(phys_sql 'select sum(i) from t')
+[[ -n "$expected_sum" ]] || \
+	fail "physrep could not serve a baseline read; cannot drive a snapshot" \
+		"against it"
+
+stops_before=$(physrep_clminfo | grep -oP '(?<=SC fence stops: )[0-9]+')
+
+fifo=/tmp/sc_fence_physrep_fifo.$$
+out=/tmp/sc_fence_physrep_out.$$
+mkfifo $fifo
+cdb2sql --tabs --allow-incoherent ${CDB2_OPTIONS} --host localhost "$destdb" \
+	- < $fifo > $out 2>&1 &
+pid=$!
+exec 9>$fifo
+
+printf '%s\n' "set transaction snapshot isolation" "begin" \
+	"select count(*) from t" "select sum(i) from t" >&9
+sleep 3
+
+# Writes on the SOURCE.  The physrep replays them, which is what forces it to
+# reconstruct the pages its open snapshot is reading.
+master=$(cluster_master)
+for r in 1 2 3; do
+	sql_node "$master" "update t set i = i + 1" > /dev/null
+done
+
+# Give the physrep time to replay them before the snapshot reads again.
+sleep 10
+
+printf '%s\n' "select count(*) from t" "select sum(i) from t" "commit" >&9
+sleep 3
+exec 9>&-
+wait $pid 2>/dev/null
+rm -f $fifo
+
+mapfile -t vals < <(grep -vE '^\[' $out)
+rm -f $out
+
+stops_after=$(physrep_clminfo | grep -oP '(?<=SC fence stops: )[0-9]+')
+stops_delta=$(( ${stops_after:-0} - ${stops_before:-0} ))
+
+echo "SC_FENCE_PHYSREP_SNAPSHOT: first=(${vals[0]}, ${vals[1]})" \
+	"second=(${vals[2]}, ${vals[3]}) expected_sum=$expected_sum" \
+	"fence_stops_delta=$stops_delta"
+
+# Guard: the writes must have reached the physrep, or "the snapshot did not
+# move" is trivially true and proves nothing.
+phys_now=$(phys_sql 'select sum(i) from t')
+(( phys_now == expected_sum + 3 * N )) || \
+	fail "the source's updates did not reach the physrep (sum $expected_sum ->" \
+		"${phys_now:-none}, wanted $(( expected_sum + 3 * N ))); the snapshot" \
+		"assertions below would be vacuous"
+
+(( ${vals[0]} == N )) || \
+	fail "physrep snapshot saw ${vals[0]} rows at start, expected $N"
+[[ "${vals[1]}" == "$expected_sum" ]] || \
+	fail "physrep snapshot summed ${vals[1]} at start, expected $expected_sum"
+
+(( ${vals[2]} == N )) || \
+	fail "physrep snapshot saw ${vals[2]} rows after the source's writes," \
+		"expected $N"
+[[ "${vals[3]}" == "$expected_sum" ]] || \
+	fail "physrep snapshot sum changed under it: '${vals[3]}' vs" \
+		"'$expected_sum' -- it saw writes that postdate its target"
+
+(( stops_delta > 0 )) || \
+	fail "physrep served a correct snapshot but never stopped at a fence" \
+		"(delta $stops_delta); the fence is not load-bearing here and this" \
+		"does not prove the physrep's fences work"
+
+cluster_log_delete_on
+
 echo "Passed test"

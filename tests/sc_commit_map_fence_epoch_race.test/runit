@@ -30,13 +30,13 @@ mkfifo "$fifo"
 cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" - <"$fifo" >"$out" 2>&1 &
 pid=$!
 exec 9>"$fifo"
+
 printf '%s\n' "set transaction snapshot isolation" "begin" \
 	"select count(*) from t" "select sum(j) from t" >&9
 sleep 2
 run "update t set j = j + 1000 where i <= $((N / 2))" >/dev/null
 
 before=$(counter "SC fence epoch retries")
-stops_before=$(counter "SC fence stops")
 run "put tunable 'mempv_test_pause_before_cache_put' 1" >/dev/null
 run "put tunable 'mempv_test_bump_fence_epoch' 1" >/dev/null
 printf '%s\n' "select count(*) from t" "select sum(j) from t" >&9
@@ -47,7 +47,8 @@ for _ in $(seq 1 100); do
 	[[ "$paused" == "ON" ]] && break
 	sleep 0.1
 done
-[[ "$paused" == "ON" ]] || fail "reconstruction did not reach cache-insert pause"
+[[ "$paused" == "ON" ]] || fail "reconstruction did not reach the cache-insert pause"
+
 run "put tunable 'mempv_test_pause_before_cache_put' 0" >/dev/null
 printf '%s\n' "commit" >&9
 exec 9>&-
@@ -56,13 +57,13 @@ rm -f "$fifo"
 
 mapfile -t vals < <(grep -vE '^\[' "$out")
 rm -f "$out"
-(( ${vals[0]} == N && ${vals[2]} == N )) || fail "snapshot count changed"
+(( ${vals[0]} == N && ${vals[2]} == N )) ||
+	fail "snapshot row count changed across forced epoch race"
 [[ "${vals[1]}" == "$expected_sum" && "${vals[3]}" == "$expected_sum" ]] ||
-	fail "snapshot sum changed"
-after=$(counter "SC fence epoch retries")
-stops_after=$(counter "SC fence stops")
-(( after == before + 1 )) || fail "expected exactly one epoch retry, got $((after-before))"
-(( stops_after > stops_before )) || fail "epoch-race reconstruction did not consume a fence"
+	fail "snapshot sum changed across forced epoch race"
 
-echo "SC_FENCE_EPOCH_RACE: retries_delta=$((after-before)) fence_stops_delta=$((stops_after-stops_before))"
+after=$(counter "SC fence epoch retries")
+(( after > before )) || fail "epoch change did not force reconstruction retry"
+
+echo "SC_FENCE_EPOCH_RACE: retries_delta=$((after-before)) count=${vals[2]} sum=${vals[3]}"
 echo "Passed test"

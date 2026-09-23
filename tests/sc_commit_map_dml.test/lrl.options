@@ -1,0 +1,10 @@
+# The commit-LSN map must be enabled for any of this to mean anything.
+utxnid_log on
+enable_snapshot_isolation
+
+# The master omits a converter transaction from the map only when the durable
+# marker is in the WAL, which is gated on this writer.  With it off the master
+# ADDS every entry (converge-by-add), so the skip path this test characterizes
+# is inert.  Turn the writer on so the converter's skip actually fires and the
+# "converter skips, application DML does not" contrast is live.
+sc_commit_flags_writer 1

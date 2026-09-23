@@ -1,0 +1,5 @@
+# Drive the replicas down the SERIAL replication-apply path so the observation
+# gate covers __rep_process_txn_int() as well as the concurrent one.  Zeroing
+# the processors (not the workers -- env_open.c:695-698 PANICs on that
+# combination) makes the serial/concurrent conjunction false.
+setattr REP_PROCESSORS 0

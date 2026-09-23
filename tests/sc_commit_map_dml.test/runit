@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Application DML during a live schema change must stay in the commit-LSN map.
+#
+# The optimization omits a transaction from the map only when BOTH halves hold:
+#
+#   (1) the transaction was marked by the base converter as a direct schema-
+#       change copy transaction (txn sc_build_id != 0), and
+#   (2) it physically writes a replacement file owned by that same build
+#       (registry: fileid -> build_id).
+#
+# The two halves come from different places and are independent:
+#
+#   registry:  fileid -> build_id   "which build owns this physical file"
+#   txn:       sc_build_id          "which build this transaction came from"
+#
+# Only convert_record() (the base converter) ever sets sc_build_id.  Ordinary
+# application INSERT/UPDATE/DELETE issued while the schema change is live also
+# write those same replacement files, but they keep sc_build_id == 0, so half
+# (2) on its own must never be enough.  If it were, real application history
+# would be silently dropped from the map.  This test drives real application
+# DML into exactly that danger zone and proves it is retained.
+#
+# WHAT IS PROVEN, AND HOW
+#
+# Primary proof (deterministic): while the schema change is paused with the
+# converter quiescent, the three classification counters
+#     marked / matched / skipped
+# do not move across an application statement.  marked can only be bumped by the
+# converter; matched and skipped can only be bumped by an already-marked
+# transaction.  An application statement that was wrongly treated as a copy
+# transaction would move at least one of the three.  Because the converter is
+# idle in this window (see SYNCHRONISATION), these are exact equalities.
+#
+# Supporting evidence (corroboration, NOT attribution): the commit map gains
+# entries and at least one entry newer than the pre-DML maximum utxnid appears.
+# Autocommit utxnids are never surfaced to the client, so the test cannot prove
+# a specific map entry belongs to a specific client statement.  This only
+# corroborates that recording happened; the equality of the counter trio is
+# what actually rules out a wrong skip.
+#
+# End-to-end proof: after the schema change commits, the surviving table IS the
+# NEW generation, and it reflects every application change.  Because sc_is_at_end
+# guarantees every row was already copied before the DML ran, a dropped write
+# would leave the pre-DML value behind.  It does not.
+#
+# LIVE-SC MODES
+#
+# Ordinary live SC: the application's own DB_TXN writes the NEW generation
+# directly (add_record -> live_sc_post_add(iq, trans, ...); upd/del likewise).
+# Logical live SC (logicalredo variant, tunable logical_live_sc): the
+# application transaction does not touch NEW; a separate redo thread reads the
+# logical log and applies the change to NEW later, under its own transaction.
+# That redo transaction is started plain (trans_start_sc_lowpri +
+# set_tran_verify_updateid) and is never marked with a build id, so it too stays
+# in the commit map -- the skip applies only to the immediate converter's
+# marked transactions.  In logical mode the immediate hook is disabled, so
+# correct post-SC values additionally prove the redo thread actually ran.
+#
+# SYNCHRONISATION
+#
+# sc_pause_at_end stalls a schema change after every converter thread has joined
+# but before it finalises; sc_is_at_end is a readable tunable that says when it
+# has reached that point.  In that window:
+#   - every row is copied to NEW, so "this row was already copied" is a fact;
+#   - the replacement files are still registered (unregister happens later, past
+#     the pause loop), so the registry is armed and a wrongly-marked transaction
+#     WOULD be skipped;
+#   - no converter transaction is running, so the counters are quiescent and the
+#     assertions can use equality rather than ranges.
+# No fixed sleeps: every wait polls a real condition.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+
+set -o pipefail
+
+dbnm=$1
+N=${SC_DML_ROWS:-3000}
+
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+readonly master N
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm "$1"; }
+send() { cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm \
+	"exec procedure sys.cmd.send('$1')"; }
+
+get_clminfo() {
+	cdb2sql ${CDB2_OPTIONS} --host $master $dbnm \
+		"exec procedure sys.cmd.send('bdb clminfo')"
+}
+
+stat_of() { grep -oP "(?<=$2: )[0-9]+" <<<"$1"; }
+
+fail() { echo "FAIL: $*"; exit 1; }
+
+# Set before any schema change is backgrounded so the EXIT trap can reference
+# it unconditionally; cleared once a rebuild has been reaped.
+rebuild_pid=""
+
+# Failure-safe cleanup.  A failed assertion in the paused window would otherwise
+# leave the background schema change stalled at sc_pause_at_end forever.  This
+# releases the pause and lets the converter drain.  It is safe in every case:
+# releasing an unpaused or already-finished schema change is a no-op, and
+# waiting an unset or already-reaped pid is ignored.  The bash EXIT trap
+# preserves the triggering exit status (verified: cleanup commands that fail do
+# not change it), so this never masks the original failure.
+cleanup() {
+	send "sc_pause_at_end 0" > /dev/null 2>&1 || true
+	if [[ -n "$rebuild_pid" ]]; then
+		wait "$rebuild_pid" 2>/dev/null || true
+	fi
+}
+trap cleanup EXIT
+
+# Reap the backgrounded schema-change command and require it to have succeeded.
+# Clears rebuild_pid so the EXIT trap does not wait on it again.
+wait_rebuild_ok() {
+	local rc
+	wait "$rebuild_pid"; rc=$?
+	rebuild_pid=""
+	(( rc == 0 )) || fail \
+		"schema change command exited $rc; the schema change did not succeed"
+}
+
+# Require the persisted terminal state for a table to be COMMITTED.  The command
+# can return a moment before finalize persists the terminal state, so poll a
+# real condition; hard-fail immediately on a terminal non-committed state.
+assert_sc_committed() {
+	local table=$1 st
+	for (( attempt=0; attempt<240; attempt++ )); do
+		st=$(run "select status from comdb2_sc_status where name='$table' order by start desc limit 1")
+		case "$st" in
+		COMMITTED) return 0 ;;
+		ABORTED|UNKNOWN) fail \
+			"schema change for '$table' ended in state '$st', expected COMMITTED" ;;
+		*) : ;;  # RUNNING / COMMIT PENDING / PAUSED / empty: still settling
+		esac
+		sleep 0.25
+	done
+	fail "schema change for '$table' never reached COMMITTED (last state '$st')"
+}
+
+# Fills in the caller's added/skipped/marked/matched/regfiles/maxutxnid globals.
+# maxutxnid is the current maximum utxnid in the map; it is a fence for the
+# corroborating "a newer entry appeared" check, not an identity for any client
+# statement.
+sample() {
+	local c
+	c=$(get_clminfo)
+	added=$(stat_of "$c" "Entries added")
+	skipped=$(stat_of "$c" "SC commit-map entries skipped")
+	marked=$(stat_of "$c" "SC direct-copy txns marked")
+	matched=$(stat_of "$c" "SC direct-copy txns matched")
+	regfiles=$(stat_of "$c" "SC private registered files")
+
+	if [[ -z "$added" || -z "$skipped" || -z "$marked" || -z "$matched" ]]; then
+		echo "FAIL: could not parse clminfo:"; echo "$c"; exit 1
+	fi
+
+	maxutxnid=$(run 'select coalesce(max(utxnid), 0) from comdb2_transaction_commit')
+}
+
+# Asserts that one application statement was retained and was never treated as a
+# copy transaction.  The converter is paused, so the marked/matched/skipped
+# trio is quiescent and compared for exact equality -- that equality is the
+# proof.  The "a newer utxnid appeared" line only corroborates that recording
+# happened; it does not attribute a specific map entry to this statement.
+#   $1 = label
+check_application_txn_retained() {
+	local label=$1
+	local new_entries
+
+	sample
+
+	(( marked == before_marked )) || fail \
+		"$label: direct-copy marked went $before_marked -> $marked; an application transaction was marked as a copy transaction"
+	(( matched == before_matched )) || fail \
+		"$label: direct-copy matched went $before_matched -> $matched; an application transaction reached the UFID comparison"
+	(( skipped == before_skipped )) || fail \
+		"$label: skipped went $before_skipped -> $skipped; an application transaction was omitted from the commit map"
+
+	(( added > before_added )) || fail \
+		"$label: commit map gained no entries ($before_added -> $added); the application transaction was not recorded"
+
+	# Corroboration only: at least one map entry newer than the pre-DML max
+	# exists, consistent with the statement having been recorded.  Not an
+	# identity check -- see the function comment.
+	new_entries=$(run "select count(*) from comdb2_transaction_commit where utxnid > $before_maxutxnid")
+	(( new_entries >= 1 )) || fail \
+		"$label: no utxnid above $before_maxutxnid present in comdb2_transaction_commit"
+
+	echo "  $label: retained ($((added - before_added)) added, $new_entries entr(y/ies) newer than the pre-DML max), marked/matched/skipped unchanged at $marked/$matched/$skipped"
+}
+
+# ---------------------------------------------------------------- setup
+run "create table t(id int, value int)" > /dev/null
+run "create index ix_v on t(value)" > /dev/null
+# One statement, so setup does not pollute the map with N transactions.
+run "insert into t select value, value from generate_series(1, $N)" > /dev/null
+
+rowcount=$(run 'select count(*) from t')
+(( rowcount == N )) || fail "setup: expected $N rows, got $rowcount"
+
+# ------------------------------------------------- Variant: mid-conversion
+#
+# The main flow below waits until every row is copied.  This variant covers the
+# other side: application DML issued while the converter is genuinely still
+# running (aggregate converted count strictly between 0 and N).
+#
+# With parallel/striped conversion the aggregate count does not tell us which
+# individual rows are already in NEW, so this variant does NOT claim the
+# transaction spans copied and uncopied rows.  What it proves is narrower and
+# honest: an application transaction executed while the conversion was actively
+# incomplete is still recorded in the map, and its effects survive into NEW.
+# Counters cannot be compared for equality here (the converter is changing them
+# concurrently), so the check is the corroborating one: a map entry newer than
+# the pre-DML max appears.
+
+if [[ "$TESTCASE" == "sc_commit_map_dml_midconv_generated" ]]; then
+	run "rebuild t" > /dev/null 2>&1 &
+	rebuild_pid=$!
+
+	# Poll a real condition: conversion started but has not finished.
+	started=0
+	for (( attempt=0; attempt<600; attempt++ )); do
+		conv=$(send "stat sc" | grep -oP '(?<=Conversion phase running )[0-9]+' | head -1)
+		if [[ -n "$conv" ]] && (( conv > 0 && conv < N )); then
+			started=1
+			break
+		fi
+		kill -0 $rebuild_pid 2>/dev/null || break
+		sleep 0.2
+	done
+
+	(( started == 1 )) || fail \
+		"never caught the converter mid-conversion; this variant proves nothing"
+
+	before_maxutxnid=$(run 'select coalesce(max(utxnid), 0) from comdb2_transaction_commit')
+
+	# One multi-row application transaction, run while conversion is
+	# incomplete.  id=5 and id=$((N-5)) are just two distinct rows; no claim
+	# is made about which the converter has already reached.
+	cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm - > /dev/null 2>&1 <<SQL
+begin
+update t set value = value + 10 where id = 5
+update t set value = value + 20 where id = $(( N - 5 ))
+commit
+SQL
+
+	new_entries=$(run "select count(*) from comdb2_transaction_commit where utxnid > $before_maxutxnid")
+	(( new_entries >= 1 )) || fail \
+		"mid-conversion application transaction left no utxnid above $before_maxutxnid in the commit map"
+
+	echo "Mid-conversion (caught at $conv/$N converted): application transaction retained ($new_entries newer entr(y/ies))"
+
+	wait_rebuild_ok
+	assert_sc_committed t
+
+	v5=$(run 'select value from t where id = 5')
+	(( v5 == 15 )) || fail "id=5 has value $v5 after SC, expected 15"
+	vn=$(run "select value from t where id = $(( N - 5 ))")
+	(( vn == N - 5 + 20 )) || fail "id=$((N-5)) has value $vn, expected $((N - 5 + 20))"
+
+	do_verify t
+	echo "Passed test"
+	exit 0
+fi
+
+# ------------------------------------------------- stall the schema change
+send "sc_pause_at_end 1" > /dev/null
+
+# Variants: an index-only rebuild reuses the data file, so only the new index is
+# a registered replacement file and the converter also writes llmeta progress.
+# Non-parallel scan exercises a single converter thread instead of one per
+# stripe.  The property under test is the same in every case.
+sc_stmt="rebuild t"
+if [[ "$TESTCASE" == "sc_commit_map_dml_idxrebuild_generated" ]]; then
+	sc_stmt="rebuild index t ix_v"
+	# Force progress metadata every row, so the converter definitely writes
+	# something outside its own build as well.  The skip still requires
+	# writing a registered file, so this does not weaken the control.
+	send "bdb setattr INDEXREBUILD_SAVE_EVERY_N 1" > /dev/null
+fi
+
+run "$sc_stmt" > /dev/null 2>&1 &
+rebuild_pid=$!
+
+at_end=0
+for (( attempt=0; attempt<600; attempt++ )); do
+	v=$(run "select value from comdb2_tunables where name='sc_is_at_end'")
+	if [[ "$v" == "ON" || "$v" == "1" ]]; then
+		at_end=1
+		break
+	fi
+	kill -0 $rebuild_pid 2>/dev/null || break
+	sleep 0.25
+done
+
+(( at_end == 1 )) || fail \
+	"schema change never reported sc_is_at_end; cannot establish a window in which rows are known to be copied"
+
+sample
+(( regfiles > 0 )) || fail \
+	"no replacement files registered while paused; the registry is not armed, so this test could not detect a wrong skip"
+# Control half: the optimization is actually active in this window.  A full
+# rebuild converts N rows one transaction each, and an index-only rebuild does
+# the same per existing row; each such converter transaction writes its own
+# build's registered replacement file and is therefore skipped.  So at least one
+# skip per converted row is expected here.
+(( skipped >= N )) || fail \
+	"converter skipped only $skipped entries for $N rows; the optimization is not active, so the control half of this test is meaningless"
+
+echo "Window open: all $N rows copied, $regfiles replacement files still registered, converter idle"
+echo "Baseline: added=$added skipped=$skipped marked=$marked matched=$matched"
+
+# ---------------------------------------------------------------- Test A
+# UPDATE a row that is certainly already in NEW.
+before_added=$added; before_skipped=$skipped; before_marked=$marked
+before_matched=$matched; before_maxutxnid=$maxutxnid
+
+run "update t set value = value + 1 where id = 100" > /dev/null
+check_application_txn_retained "A UPDATE id=100"
+
+# ---------------------------------------------------------------- Test B
+# DELETE a copied row.  The delete path differs from update, so this is not
+# implied by Test A.
+before_added=$added; before_skipped=$skipped; before_marked=$marked
+before_matched=$matched; before_maxutxnid=$maxutxnid
+
+run "delete from t where id = 200" > /dev/null
+check_application_txn_retained "B DELETE id=200"
+
+# ---------------------------------------------------------------- Test C
+# INSERT while the schema change is active.
+before_added=$added; before_skipped=$skipped; before_marked=$marked
+before_matched=$matched; before_maxutxnid=$maxutxnid
+
+run "insert into t(id, value) values($((N + 1)), 777)" > /dev/null
+check_application_txn_retained "C INSERT id=$((N + 1))"
+
+# ---------------------------------------------------------------- Test D
+# One application transaction touching several rows.  The skip decision is
+# transaction-wide, so a multi-statement transaction is worth its own case.
+before_added=$added; before_skipped=$skipped; before_marked=$marked
+before_matched=$matched; before_maxutxnid=$maxutxnid
+
+cdb2sql --tabs ${CDB2_OPTIONS} --host $master $dbnm - > /dev/null 2>&1 <<SQL
+begin
+update t set value = value + 10 where id = 300
+update t set value = value + 20 where id = $(( N - 1 ))
+commit
+SQL
+check_application_txn_retained "D multi-row transaction"
+
+# ------------------------------------------------- let the SC finish
+send "sc_pause_at_end 0" > /dev/null
+wait_rebuild_ok
+assert_sc_committed t
+
+# ---------------------------------------------------------------- results
+#
+# End-to-end proof that the test was not vacuous.
+#
+# Every row was already copied into NEW before the DML ran (sc_is_at_end
+# guarantees it), and the table that survives the schema change IS the NEW
+# generation.  So if live schema change had not written the application's
+# changes into NEW, the finished table would still show the pre-DML values.  It
+# does not.  Therefore each application transaction really did write a registered
+# replacement file -- the exact situation in which a wrongly marked transaction
+# would have been skipped -- and was retained anyway.
+#
+# Under ordinary live SC the application's own trans writes NEW directly
+# (add_record -> live_sc_post_add(iq, trans, ...); upd/del likewise): one DB_TXN
+# writes both generations.  Under logical live SC the immediate hook is
+# disabled and the redo thread writes NEW later; there, correct post-SC values
+# additionally prove the redo path ran.
+v100=$(run 'select value from t where id = 100')
+(( v100 == 101 )) || fail "id=100 has value $v100 after SC, expected 101; either the UPDATE was lost, or live SC never propagated it to NEW and this test proves nothing"
+
+d200=$(run 'select count(*) from t where id = 200')
+(( d200 == 0 )) || fail "id=200 still present after SC; the DELETE was lost"
+
+i_new=$(run "select value from t where id = $((N + 1))")
+(( i_new == 777 )) || fail "inserted row has value '$i_new', expected 777"
+i_cnt=$(run "select count(*) from t where id = $((N + 1))")
+(( i_cnt == 1 )) || fail "inserted row appears $i_cnt times, expected exactly 1"
+
+v300=$(run 'select value from t where id = 300')
+(( v300 == 310 )) || fail "id=300 has value $v300 after SC, expected 310"
+vlast=$(run "select value from t where id = $(( N - 1 ))")
+(( vlast == N - 1 + 20 )) || fail "id=$((N-1)) has value $vlast, expected $((N - 1 + 20))"
+
+final=$(run 'select count(*) from t')
+(( final == N )) || fail "table has $final rows, expected $N (=$N -1 deleted +1 inserted)"
+
+do_verify t
+
+sample
+echo "Proved: application DML reached the NEW generation (post-SC values reflect it)"
+echo "        and was retained in the commit map anyway"
+if [[ "$TESTCASE" == "sc_commit_map_dml_logicalredo_generated" ]]; then
+	echo "        (logical live SC: NEW was written only by the redo thread, so"
+	echo "         correct post-SC values also prove the redo path applied them)"
+fi
+echo "SC_DML: rows=$N skipped=$skipped marked=$marked matched=$matched"
+echo "Passed test"

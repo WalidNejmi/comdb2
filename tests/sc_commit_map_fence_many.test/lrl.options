@@ -1,5 +1,4 @@
 utxnid_log on
 enable_snapshot_isolation
-early 0
-setattr SYNCTRANSACTIONS 1
+sc_commit_flags_writer 1
 sc_fence_test_extra_files 300

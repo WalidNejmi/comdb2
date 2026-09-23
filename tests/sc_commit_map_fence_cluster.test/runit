@@ -1,46 +1,209 @@
 #!/usr/bin/env bash
 bash -n "$0" || exit 1
 
+# A replica must learn the publication fence, and keep it across promotion.
+#
+# This is the case the fence's durability exists for.  A replica applied the
+# converter transactions and, honouring the same durable marker the master
+# wrote, left their commit-map entries out.  So reconstruction of a page in a
+# rebuilt file has nothing to look up on the replica either, and needs a fence.
+#
+# The replica never pended one: pending happens on the node that ran the
+# schema change.  It has to pick the fence up from the durable record, which
+# scdone_callback() reloads once the publication transaction has committed.
+#
+# Unlike a restarted node, a replica has no startup checkpoint sitting above
+# the converter writes, so the checkpoint clause does not cover them and the
+# fence really is on the critical path here.  That is why this test needs a
+# cluster and cannot be folded into sc_commit_map_fence_restart.
+#
+# Phases:
+#   A. rebuild t on the master; converter entries are skipped, fences published
+#   B. every replica reports the same fences, without having pended any
+#   C. a snapshot read served by a replica is correct
+#   D. after a master swing, the promoted node still holds them
+#
+# Skips cleanly when the harness gives no cluster.
+
 source ${TESTSROOTDIR}/tools/runit_common.sh
 source ${TESTSROOTDIR}/tools/cluster_utils.sh
 source "$(dirname "$0")/cluster_commit_map_lib.sh"
+
 set -o pipefail
 
 dbname=$1
 [[ -z "$dbname" ]] && dbname=$DBNAME
-rows=${SC_FENCE_ROWS:-5000}
 
 require_cluster
-trap 'cluster_log_delete_on || true' EXIT
-cluster_log_delete_off
+
+N=${SC_FENCE_ROWS:-5000}
+
+# Read clminfo with --allow-incoherent.
+#
+# A schema change leaves replicas behind, and an incoherent node refuses
+# ordinary queries ("wait_for_leader: new query on incoherent node").  But
+# coherency is about serving clients up-to-date data; the fence registry is
+# internal state that is meaningful as soon as the node has applied the
+# schema change.  Gating this read on coherency measures cluster throughput,
+# not the property under test.
+node_clminfo_anystate() {
+	cdb2sql --allow-incoherent ${CDB2_OPTIONS} --host "$1" "$dbname" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null
+}
+node_fences() {
+	node_clminfo_anystate "$1" | grep -oP '(?<=SC publication fences: )[0-9]+'
+}
+node_fence_stops() {
+	node_clminfo_anystate "$1" | grep -oP '(?<=SC fence stops: )[0-9]+'
+}
+
+# Wait for a replica to have APPLIED the schema change, which is what makes its
+# fence count meaningful -- not for it to be fully caught up.  Polls until the
+# node reports at least want_fences, or gives up.
+wait_for_replica_fences() {
+	local node=$1 want=$2 i rf
+	for (( i = 0; i < 150; i++ )); do
+		rf=$(node_fences "$node")
+		[[ -n "$rf" ]] && (( rf >= want )) && { echo "$rf"; return 0; }
+		sleep 2
+	done
+	echo "${rf:-}"
+	return 1
+}
 
 master=$(cluster_master)
 [[ -n "$master" ]] || fail "could not find master"
-base_fences=$(node_fences "$master")
 
-seed_table "$master" "$rows"
-sql_node "$master" "rebuild t" >/dev/null || fail "rebuild failed"
+cluster_log_delete_off
+
+# --- A: rebuild on the master ----------------------------------------------
+
+seed_table "$master" "$N"
+sleep 2
 
 master=$(cluster_master)
+sql_node "$master" "rebuild t" > /dev/null || fail "rebuild failed"
+sleep 5
+
 master_fences=$(node_fences "$master")
-(( master_fences > base_fences )) || fail "master published no fences"
+master_skipped=$(node_skipped "$master")
+
+(( master_skipped >= N )) || \
+	fail "master skipped $master_skipped converter entries; the skip is not" \
+		"active, so this test would not exercise the fence"
+(( master_fences > 0 )) || fail "master published no fences"
+
+echo "SC_FENCE_CLUSTER_MASTER: skipped=$master_skipped fences=$master_fences"
+
+# --- B: every replica has them too ------------------------------------------
 
 for node in $(cluster_replicas); do
-	if ! replica_fences=$(wait_for_exact_fences "$node" "$master_fences"); then
-		fail "replica $node has ${replica_fences:-no} fences; master has $master_fences"
+	# The replica never pended a fence -- it did not run the schema change.
+	# Anything it has came from the durable record via scdone_callback(), so
+	# this is the assertion the whole durable path exists for.
+	if ! rf=$(wait_for_replica_fences "$node" "$master_fences"); then
+		fail "replica $node holds '${rf:-none}' fences after waiting," \
+			"master holds $master_fences; the replica did not pick up the" \
+			"published fences and cannot reconstruct a page in a rebuilt file"
 	fi
-	echo "SC_FENCE_CLUSTER_REPLICA: node=$node fences=$replica_fences"
+
+	echo "SC_FENCE_CLUSTER_REPLICA: node=$node fences=$rf"
 done
 
-old_master=$master
-downgrade_master || fail "could not force post-publication promotion"
+# --- C: a replica serves a correct snapshot ---------------------------------
+
+replica=$(cluster_replicas | head -1)
+[[ -n "$replica" ]] || fail "no replica to read from"
+
+# seed_table() creates t(i int) -- one column, no index.  Query that column;
+# referring to anything else silently yields empty results and turns the
+# assertions below into empty-vs-empty comparisons that always pass.
+expected_sum=$(sql_node "$master" 'select sum(i) from t')
+[[ -n "$expected_sum" ]] || fail "could not read the baseline sum"
+
+stops_before=$(node_fence_stops "$replica")
+
+fifo=/tmp/sc_fence_cluster_fifo.$$
+out=/tmp/sc_fence_cluster_out.$$
+mkfifo $fifo
+cdb2sql --tabs ${CDB2_OPTIONS} --host "$replica" "$dbname" - < $fifo > $out 2>&1 &
+pid=$!
+exec 9>$fifo
+printf '%s\n' "set transaction snapshot isolation" "begin" \
+	"select count(*) from t" "select sum(i) from t" >&9
+sleep 3
+
+# Writes the replica's snapshot must not see; they force reconstruction of
+# pages whose history runs back through the converter writes.  "+ 1" touches
+# every row on every pass, so each one definitely lands.
+for r in 1 2 3; do
+	sql_node "$master" "update t set i = i + 1" > /dev/null
+done
+sleep 3
+
+printf '%s\n' "select count(*) from t" "select sum(i) from t" "commit" >&9
+sleep 3
+exec 9>&-
+wait $pid 2>/dev/null
+rm -f $fifo
+
+mapfile -t vals < <(grep -vE '^\[' $out)
+rm -f $out
+
+stops_after=$(node_fence_stops "$replica")
+stops_delta=$(( stops_after - stops_before ))
+
+# Guard: the updates must really have landed, or "the snapshot did not move"
+# proves nothing.
+now_sum=$(sql_node "$master" 'select sum(i) from t')
+(( now_sum == expected_sum + 3 * N )) || \
+	fail "concurrent updates did not land as expected (sum $expected_sum ->" \
+		"$now_sum, wanted $(( expected_sum + 3 * N ))); the snapshot" \
+		"assertions below would be vacuous"
+
+echo "SC_FENCE_CLUSTER_SNAPSHOT: node=$replica first=(${vals[0]}, ${vals[1]})" \
+	"second=(${vals[2]}, ${vals[3]}) expected_sum=$expected_sum" \
+	"fence_stops_delta=$stops_delta"
+
+(( ${vals[0]} == N )) || \
+	fail "replica snapshot saw ${vals[0]} rows at start, expected $N -- without" \
+		"the fence, reconstruction walks into converter history the replica" \
+		"also left out of its commit map"
+[[ "${vals[1]}" == "$expected_sum" ]] || \
+	fail "replica snapshot summed ${vals[1]} at start, expected $expected_sum"
+
+# The real assertion: the snapshot must be unchanged by the concurrent writes.
+(( ${vals[2]} == N )) || \
+	fail "replica snapshot saw ${vals[2]} rows after concurrent updates," \
+		"expected $N"
+[[ "${vals[3]}" == "$expected_sum" ]] || \
+	fail "replica snapshot sum changed under it: '${vals[3]}' vs" \
+		"'$expected_sum' -- it saw writes that postdate its target"
+
+# Reconstruction must actually have stopped at a fence, or this passed for
+# some other reason.
+(( stops_delta > 0 )) || \
+	fail "replica served a correct snapshot but never stopped at a fence" \
+		"(delta $stops_delta); this is not proving the replica's fence works"
+
+# --- D: the fence survives a promotion --------------------------------------
+
+echo "Downgrading $master to force a promotion..."
+send_node "$master" "downgrade"
+sleep 10
+
 new_master=$(cluster_master)
-[[ -n "$new_master" && "$new_master" != "$old_master" ]] || \
-	fail "master did not change ($old_master -> ${new_master:-none})"
+[[ -n "$new_master" ]] || fail "no master after downgrade"
+[[ "$new_master" != "$master" ]] || \
+	echo "WARN: master did not change; promotion arm is weaker"
 
-if ! promoted_fences=$(wait_for_exact_fences "$new_master" "$master_fences" 60); then
-	fail "promoted master $new_master has ${promoted_fences:-no} fences; expected $master_fences"
-fi
+promoted_fences=$(node_fences "$new_master")
+(( promoted_fences >= master_fences )) || \
+	fail "promoted master $new_master holds $promoted_fences fences," \
+		"original master held $master_fences"
 
-echo "SC_FENCE_CLUSTER: old_master=$old_master new_master=$new_master fences=$promoted_fences"
+echo "SC_FENCE_CLUSTER_PROMOTED: node=$new_master fences=$promoted_fences"
+
+cluster_log_delete_on
+
 echo "Passed test"

@@ -25,6 +25,9 @@ run "insert into t select value, value from generate_series(1, 2000)" >/dev/null
 base_fences=$(fences)
 base_version=$(run "select table_version('t')")
 
+# Finalization inside a caller-owned DDL transaction installs RAM fences before
+# the outer commit. A later DDL failure must remove them when the transaction
+# aborts, just as the durable rows roll back.
 if cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" - \
 	>/tmp/sc_fence_outer_abort.$$ 2>&1 <<'EOF'
 begin
@@ -67,8 +70,7 @@ expect_failed_rebuild sc_fence_persist_fail_after 0
 expect_failed_rebuild sc_fence_persist_fail_after 1
 expect_failed_rebuild sc_fence_test_drop_pending 1 0
 
-run "exec procedure sys.cmd.send('flush')" >/dev/null ||
-	fail "could not flush before restart"
+# A partial durable write must roll back with the publication transaction.
 stop_all_nodes
 sleep 10
 start_all_nodes

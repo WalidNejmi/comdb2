@@ -48,11 +48,11 @@ static size_t encode_value(uint8_t *value, int version, int lsn_file,
     else
         cursor = buf_no_net_put(build_id.bytes, sizeof(build_id.bytes), cursor,
                                 value + SC_PUBLICATION_FENCE_DATA_LEN);
-    if (version == SC_PUBLICATION_FENCE_VERSION) {
-        uint64_t publication_utxnid = 0x8877665544332211ULL;
-        cursor = buf_put(&publication_utxnid, sizeof(publication_utxnid),
-                         cursor, value + SC_PUBLICATION_FENCE_DATA_LEN);
-    }
+            if (version == SC_PUBLICATION_FENCE_VERSION) {
+                        uint64_t publication_utxnid = 0x8877665544332211ULL;
+                        cursor = buf_put(&publication_utxnid, sizeof(publication_utxnid),
+                                                                         cursor, value + SC_PUBLICATION_FENCE_DATA_LEN);
+            }
     return (size_t)(cursor - value);
 }
 
@@ -74,7 +74,7 @@ int main(void)
     CHECK(sc_publication_fence_decode(key, sizeof(key), value, len, &record) == 0,
           "valid v1 rejected");
 
-    len = encode_value(value, 3, 7, 99, 0);
+            len = encode_value(value, 3, 7, 99, 0);
     CHECK(sc_publication_fence_decode(key, sizeof(key), value, 0, &record) != 0,
           "zero-length value accepted");
     CHECK(sc_publication_fence_decode(key, sizeof(key), value, len - 1, &record) != 0,
@@ -87,10 +87,10 @@ int main(void)
     len = encode_value(value, 99, 7, 99, 0);
     CHECK(sc_publication_fence_decode(key, sizeof(key), value, len, &record) != 0,
           "unknown version accepted");
-    len = encode_value(value, 3, 0, 99, 0);
+            len = encode_value(value, 3, 0, 99, 0);
     CHECK(sc_publication_fence_decode(key, sizeof(key), value, len, &record) != 0,
           "zero LSN file accepted");
-    len = encode_value(value, 3, 7, -1, 0);
+            len = encode_value(value, 3, 7, -1, 0);
     CHECK(sc_publication_fence_decode(key, sizeof(key), value, len, &record) != 0,
           "negative LSN offset accepted");
 

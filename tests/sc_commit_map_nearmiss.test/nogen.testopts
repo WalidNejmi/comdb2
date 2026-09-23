@@ -1,0 +1,12 @@
+# Force the legacy (non-generation) commit path, so the rejected candidates go
+# through the regop family rather than regop_gen_endianize.
+#
+# The rejection happens in __txn_sc_commit_flags(), which runs before either
+# family is selected, and the map decision reads its result -- so the outcome
+# must be identical in both. That is the point of running this variant: it
+# pins that the master's decision does not depend on which commit family the
+# transaction happens to land on.
+#
+# The knob is "emit_gen_commits", NOT the berkattr "elect_highest_committed_gen"
+# -- see the same note in sc_commit_map_families.test/nogen.testopts.
+emit_gen_commits off

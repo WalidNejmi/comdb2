@@ -1,0 +1,5 @@
+# The commit-LSN map only exists when utxnids are logged and snapshot
+# isolation is enabled; state the requirement explicitly.  utxnid logging also
+# means commit rectypes appear in their +2000 form in the log.
+utxnid_log on
+enable_snapshot_isolation

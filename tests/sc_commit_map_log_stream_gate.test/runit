@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+set -o pipefail
+
+dbnm=$1
+N=${SC_COMMIT_MAP_ROWS:-2000}
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+counter() {
+	cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+		sed -n "s/.*$1: \([0-9][0-9]*\).*/\1/p" | head -1
+}
+wait_streams() {
+	local want=$1 value
+	for _ in $(seq 1 50); do
+		value=$(counter "SC incapable log streams")
+		[[ "$value" == "$want" ]] && return 0
+		sleep 0.2
+	done
+	fail "incapable stream count did not reach $want (last=$value)"
+}
+
+run "create table t(i int)" >/dev/null
+run "insert into t select value from generate_series(1, $N)" >/dev/null
+
+start_lsn=$(run "select lsn from comdb2_transaction_logs(NULL, NULL, 4) limit 1")
+old_out=/tmp/sc_old_stream.$$
+run "select lsn from comdb2_transaction_logs('$start_lsn', NULL, 9, 10)" \
+	>$old_out 2>&1 &
+old_pid=$!
+wait_streams 1
+
+emitted0=$(counter "SC flags emitted (master)")
+skipped0=$(counter "SC commit-map entries skipped")
+run "rebuild t" >/dev/null || fail "gated rebuild failed"
+emitted1=$(counter "SC flags emitted (master)")
+skipped1=$(counter "SC commit-map entries skipped")
+(( emitted1 == emitted0 )) || fail "writer emitted flags to an incapable log stream"
+(( skipped1 == skipped0 )) || fail "writer skipped map entries while log stream was incapable"
+
+wait "$old_pid" 2>/dev/null || true
+rm -f "$old_out"
+wait_streams 0
+
+capable_start=$(run "select lsn from comdb2_transaction_logs(NULL, NULL, 4) limit 1")
+run "select lsn from comdb2_transaction_logs('$capable_start', NULL, 9, 10, NULL, 1)" \
+	>/tmp/sc_capable_stream.$$ 2>&1 &
+capable_pid=$!
+sleep 1
+marked1=$(counter "SC direct-copy txns marked")
+matched1=$(counter "SC direct-copy txns matched")
+run "rebuild t" >/dev/null || fail "capable rebuild failed"
+emitted2=$(counter "SC flags emitted (master)")
+skipped2=$(counter "SC commit-map entries skipped")
+marked2=$(counter "SC direct-copy txns marked")
+matched2=$(counter "SC direct-copy txns matched")
+streams2=$(counter "SC incapable log streams")
+(( emitted2 - emitted1 >= N )) ||
+	fail "capable stream emitted=$((emitted2-emitted1)) marked=$((marked2-marked1)) matched=$((matched2-matched1)) incapable=$streams2"
+(( skipped2 - skipped1 >= N )) || fail "capable log stream did not permit map omission"
+wait "$capable_pid" 2>/dev/null || true
+rm -f /tmp/sc_capable_stream.$$
+
+if run "select lsn from comdb2_transaction_logs('$capable_start', NULL, 8)" \
+	>/tmp/sc_reject_stream.$$ 2>&1; then
+	rm -f /tmp/sc_reject_stream.$$
+	fail "incapable reader consumed a flagged log stream"
+fi
+grep -q "lacks commit-flag capability" /tmp/sc_reject_stream.$$ || {
+	cat /tmp/sc_reject_stream.$$
+	rm -f /tmp/sc_reject_stream.$$
+	fail "incapable reader failed without the capability error"
+}
+rm -f /tmp/sc_reject_stream.$$
+
+[[ "$(run 'select count(*) from t')" == "$N" ]] || fail "table contents changed"
+echo "SC_LOG_STREAM_GATE: gated_emitted=$((emitted1-emitted0))" \
+	"enabled_emitted=$((emitted2-emitted1)) enabled_skipped=$((skipped2-skipped1))"
+echo "Passed test"
