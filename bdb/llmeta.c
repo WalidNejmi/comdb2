@@ -23,6 +23,7 @@
 #include "bdb_int.h"
 #include "endian_core.h"
 #include "locks.h"
+#include "sc_publication_fence_codec.h"
 #include "genid.h"
 #include <fsnapf.h>
 #include <cdb2_constants.h>
@@ -182,6 +183,7 @@ typedef enum {
     LLMETA_SCHEMACHANGE_LIST = 57,            /* list of all sc-s in a uuid txh */
     LLMETA_SCHEMACHANGE_STATUS_PROTOBUF = 58, /* Indicate protobuf sc */
     LLMETA_MAX_SEQNO = 59,
+    LLMETA_SC_PUBLICATION_FENCE = 60,
 } llmetakey_t;
 
 struct llmeta_file_type_key {
@@ -209,6 +211,9 @@ static int kv_del_by_value(tran_type *tran, void *k, size_t klen, void *v, size_
 static int kv_del(tran_type *tran, void *k, int *bdberr);
 typedef int kv_for_each_cb(void *k, void *v, void *data);
 static int kv_for_each_pair(tran_type *t, void *sk, size_t sklen, kv_for_each_cb *cb, void *data);
+typedef int kv_for_each_len_cb(void *k, void *v, int vlen, void *data);
+static int kv_for_each_pair_len(tran_type *t, void *sk, size_t sklen,
+                                kv_for_each_len_cb *cb, void *data);
 
 static uint8_t *
 llmeta_file_type_key_put(const struct llmeta_file_type_key *p_file_type_key,
@@ -9943,6 +9948,35 @@ static int kv_for_each_pair(tran_type *t, void *sk, size_t sklen, kv_for_each_cb
     return rc;
 }
 
+static int kv_for_each_pair_len(tran_type *t, void *sk, size_t sklen,
+                                kv_for_each_len_cb *cb, void *data)
+{
+    int fnd, bdberr, vlen;
+    uint8_t key[LLMETA_IXLEN], next[LLMETA_IXLEN];
+    void *value;
+
+    int rc = bdb_lite_fetch_partial_tran(llmeta_bdb_state, t, sk, sklen, key,
+                                         &fnd, &bdberr);
+    while (rc == 0 && fnd == 1) {
+        if (memcmp(sk, key, sklen) != 0)
+            break;
+
+        rc = bdb_lite_exact_var_fetch_tran(llmeta_bdb_state, t, key, &value,
+                                           &vlen, &bdberr);
+        if (rc || bdberr != BDBERR_NOERROR)
+            break;
+        rc = cb(key, value, vlen, data);
+        free(value);
+        if (rc)
+            break;
+        rc = bdb_lite_fetch_keys_fwd_tran(llmeta_bdb_state, t, key, next, 1,
+                                          &fnd, &bdberr);
+        memcpy(key, next, sizeof(key));
+    }
+
+    return rc;
+}
+
 static int kv_del(tran_type *tran, void *k, int *bdberr)
 {
     return bdb_lite_exact_del(llmeta_bdb_state, tran, k, bdberr);
@@ -11525,5 +11559,167 @@ int bdb_del_seqno(tran_type *t)
     rc = kv_del(t, &k, &bdberr);
     if (rc != 0)
         logmsg(LOGMSG_WARN, "%s: kv_del rc %d bdberr %d\n", __func__, rc, bdberr);
+    return rc;
+}
+
+struct llmeta_sc_publication_fence_key {
+    int file_type;
+    uint8_t fileid[DB_FILE_ID_LEN];
+};
+
+struct llmeta_sc_publication_fence_data {
+    int version;
+    int lsn_file;
+    int lsn_offset;
+    sc_build_id_t build_id;
+    uint64_t publication_utxnid;
+};
+
+static uint8_t *llmeta_sc_publication_fence_key_put(
+    const struct llmeta_sc_publication_fence_key *key, uint8_t *buf,
+    const uint8_t *end)
+{
+    if (end < buf || end - buf < SC_PUBLICATION_FENCE_KEY_LEN)
+        return NULL;
+    buf = buf_put(&key->file_type, sizeof(key->file_type), buf, end);
+    return buf_no_net_put(key->fileid, sizeof(key->fileid), buf, end);
+}
+
+static uint8_t *llmeta_sc_publication_fence_data_put(
+    const struct llmeta_sc_publication_fence_data *data, uint8_t *buf,
+    const uint8_t *end)
+{
+    if (end < buf || end - buf < SC_PUBLICATION_FENCE_DATA_LEN)
+        return NULL;
+    buf = buf_put(&data->version, sizeof(data->version), buf, end);
+    buf = buf_put(&data->lsn_file, sizeof(data->lsn_file), buf, end);
+    buf = buf_put(&data->lsn_offset, sizeof(data->lsn_offset), buf, end);
+    buf = buf_no_net_put(data->build_id.bytes, sizeof(data->build_id.bytes),
+                         buf, end);
+    return buf_put(&data->publication_utxnid,
+                   sizeof(data->publication_utxnid), buf, end);
+}
+
+static int llmeta_sc_publication_fence_key(const uint8_t *fileid, char *key)
+{
+    struct llmeta_sc_publication_fence_key fence_key;
+    uint8_t *buf = (uint8_t *)key;
+
+    memset(key, 0, LLMETA_IXLEN);
+    fence_key.file_type = LLMETA_SC_PUBLICATION_FENCE;
+    memcpy(fence_key.fileid, fileid, DB_FILE_ID_LEN);
+    return llmeta_sc_publication_fence_key_put(
+               &fence_key, buf, buf + LLMETA_IXLEN) == NULL
+               ? -1
+               : 0;
+}
+
+int bdb_set_sc_publication_fence(tran_type *tran, const uint8_t *fileid,
+                                 unsigned int lsn_file,
+                                 unsigned int lsn_offset,
+                                 const sc_build_id_t *build_id, int *bdberr)
+{
+    char key[LLMETA_IXLEN];
+    uint8_t value[SC_PUBLICATION_FENCE_DATA_LEN];
+    struct llmeta_sc_publication_fence_data data;
+
+    *bdberr = BDBERR_NOERROR;
+    if (fileid == NULL || tran == NULL || tran->tid == NULL ||
+        tran->tid->utxnid == 0 || lsn_file == 0 ||
+        sc_build_id_is_zero(build_id))
+        return -1;
+    if (llmeta_sc_publication_fence_key(fileid, key) != 0) {
+        *bdberr = BDBERR_BADARGS;
+        return -1;
+    }
+
+    data.version = SC_PUBLICATION_FENCE_VERSION;
+    data.lsn_file = (int)lsn_file;
+    data.lsn_offset = (int)lsn_offset;
+    data.build_id = *build_id;
+    data.publication_utxnid = tran->tid->utxnid;
+    if (llmeta_sc_publication_fence_data_put(
+            &data, value, value + sizeof(value)) == NULL) {
+        *bdberr = BDBERR_BADARGS;
+        return -1;
+    }
+    return kv_put(tran, key, value, sizeof(value), bdberr);
+}
+
+int bdb_del_sc_publication_fence(tran_type *tran, const uint8_t *fileid,
+                                 int *bdberr)
+{
+    char key[LLMETA_IXLEN];
+    int rc;
+
+    *bdberr = BDBERR_NOERROR;
+    if (fileid == NULL)
+        return -1;
+    if (llmeta_sc_publication_fence_key(fileid, key) != 0) {
+        *bdberr = BDBERR_BADARGS;
+        return -1;
+    }
+    rc = kv_del(tran, key, bdberr);
+    if (rc != 0 && *bdberr == BDBERR_DEL_DTA)
+        rc = 0;
+    return rc;
+}
+
+struct sc_publication_fence_load {
+    SC_PUBLICATION_FENCE_RECORD *records;
+    int count;
+    int capacity;
+};
+
+static int load_one_sc_publication_fence(void *key, void *value, int valuelen,
+                                         void *arg)
+{
+    struct sc_publication_fence_load *load = arg;
+    SC_PUBLICATION_FENCE_RECORD *records;
+
+    if (load->count == load->capacity) {
+        int capacity = load->capacity == 0 ? 16 : load->capacity * 2;
+        records = realloc(load->records,
+                          (size_t)capacity * sizeof(*records));
+        if (records == NULL)
+            return -1;
+        load->records = records;
+        load->capacity = capacity;
+    }
+    if (sc_publication_fence_decode(
+            key, SC_PUBLICATION_FENCE_KEY_LEN, value, (size_t)valuelen,
+            &load->records[load->count]) != 0) {
+        logmsg(LOGMSG_ERROR, "%s: invalid publication-fence record\n",
+               __func__);
+        return -1;
+    }
+    load->count++;
+    return 0;
+}
+
+int bdb_load_sc_publication_fences(tran_type *tran, int *nloaded, int *bdberr)
+{
+    int file_type = LLMETA_SC_PUBLICATION_FENCE;
+    uint8_t prefix[sizeof(file_type)];
+    struct sc_publication_fence_load load = {0};
+    int rc;
+
+    *bdberr = BDBERR_NOERROR;
+    if (nloaded != NULL)
+        *nloaded = 0;
+    if (buf_put(&file_type, sizeof(file_type), prefix,
+                prefix + sizeof(prefix)) == NULL)
+        return -1;
+
+    rc = kv_for_each_pair_len(tran, prefix, sizeof(prefix),
+                              load_one_sc_publication_fence, &load);
+    if (rc == 0)
+        rc = bdb_sc_publication_fence_reconcile(llmeta_bdb_state,
+                                                load.records, load.count);
+    if (rc != 0)
+        bdb_sc_publication_fence_set_failed(llmeta_bdb_state);
+    if (nloaded != NULL)
+        *nloaded = rc == 0 ? load.count : 0;
+    free(load.records);
     return rc;
 }

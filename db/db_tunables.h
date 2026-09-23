@@ -1101,6 +1101,10 @@ REGISTER_TUNABLE("sc_commit_flags_advertise",
                  "TEST ONLY. Advertise support for schema-change commit flags.",
                  TUNABLE_BOOLEAN, &gbl_sc_commit_flags_advertise,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+REGISTER_TUNABLE("sc_fence_persist_fail_after",
+                 "TEST ONLY. Fail publication after this many durable fence writes.",
+                 TUNABLE_INTEGER, &gbl_sc_fence_persist_fail_after,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 REGISTER_TUNABLE("sc_fence_publish_fail_after",
                  "TEST ONLY. Fail in-memory fence publication after this many files.",
                  TUNABLE_INTEGER, &gbl_sc_fence_publish_fail_after,

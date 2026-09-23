@@ -24,6 +24,7 @@
 #include "schemachange.h"
 #include "sc_global.h"
 #include "sc_logic.h"
+#include "sc_records.h"
 #include "sc_util.h"
 #include "sc_struct.h"
 #include "sc_queues.h"
@@ -355,6 +356,11 @@ static int sc_publish_fences(struct schema_change_type *s, tran_type *tran,
 
     if (gbl_sc_fence_test_drop_pending)
         bdb_sc_publication_fence_discard(s->db->handle, &build_id);
+
+    if (bdb_sc_publication_fence_persist(
+            s->db->handle, tran, &build_id, fence_file, fence_offset,
+            s->sc_expected_fence_count) != 0)
+        return -1;
 
     if (bdb_sc_publication_fence_publish(
             s->db->handle, tran, &build_id, fence_file, fence_offset,

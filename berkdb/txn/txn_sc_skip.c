@@ -389,6 +389,139 @@ done:
 	return (ret);
 }
 
+struct sc_fence_pending_copy_arg {
+	DB_ENV *dbenv;
+	hash_t *files;
+	int ret;
+};
+
+static int
+copy_pending_fence(void *obj, void *arg)
+{
+	SC_PUBLICATION_FENCE *f = obj, *copy, *existing;
+	struct sc_fence_pending_copy_arg *copy_arg = arg;
+
+	if (!IS_ZERO_LSN(f->fence_lsn))
+		return (0);
+
+	existing = hash_find(copy_arg->files, f->fileid);
+	if (existing != NULL) {
+		hash_del(copy_arg->files, existing);
+		__os_free(copy_arg->dbenv, existing);
+	}
+
+	if ((copy_arg->ret = __os_malloc(copy_arg->dbenv, sizeof(*copy),
+	    &copy)) != 0)
+		return (1);
+	*copy = *f;
+	if (hash_add(copy_arg->files, copy) != 0) {
+		__os_free(copy_arg->dbenv, copy);
+		copy_arg->ret = ENOMEM;
+		return (1);
+	}
+	return (0);
+}
+
+static void
+free_fence_hash(dbenv, files)
+	DB_ENV *dbenv;
+	hash_t *files;
+{
+	hash_for(files, &free_sc_publication_fence, dbenv);
+	hash_clear(files);
+	hash_free(files);
+}
+
+int
+__sc_publication_fence_reconcile(dbenv, records, nrecords)
+	DB_ENV *dbenv;
+	const SC_PUBLICATION_FENCE_RECORD *records;
+	int nrecords;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	SC_PUBLICATION_FENCE *f;
+	hash_t *newfiles, *oldfiles;
+	struct sc_fence_pending_copy_arg pending;
+	int ret = 0, i;
+
+	if (reg == NULL || nrecords < 0 || (nrecords > 0 && records == NULL))
+		return (EINVAL);
+
+	newfiles = hash_init_o(offsetof(SC_PUBLICATION_FENCE, fileid),
+	    DB_FILE_ID_LEN);
+	if (newfiles == NULL)
+		return (ENOMEM);
+
+	for (i = 0; i < nrecords; i++) {
+		if (IS_ZERO_LSN(records[i].fence_lsn) ||
+		    sc_build_id_is_zero(&records[i].build_id) ||
+		    hash_find(newfiles, records[i].fileid) != NULL ||
+		    (ret = __os_malloc(dbenv, sizeof(*f), &f)) != 0) {
+			ret = ret != 0 ? ret : EINVAL;
+			goto err;
+		}
+		memcpy(f->fileid, records[i].fileid, DB_FILE_ID_LEN);
+		f->fence_lsn = records[i].fence_lsn;
+		f->publication_utxnid = records[i].publication_utxnid;
+		f->build_id = records[i].build_id;
+		if (hash_add(newfiles, f) != 0) {
+			__os_free(dbenv, f);
+			ret = ENOMEM;
+			goto err;
+		}
+	}
+
+	Pthread_mutex_lock(&reg->lk);
+	oldfiles = reg->files;
+	pending.dbenv = dbenv;
+	pending.files = newfiles;
+	pending.ret = 0;
+	hash_for(oldfiles, &copy_pending_fence, &pending);
+	if (pending.ret != 0) {
+		Pthread_mutex_unlock(&reg->lk);
+		ret = pending.ret;
+		goto err;
+	}
+	reg->files = newfiles;
+	reg->readiness = SC_FENCE_READY;
+	Pthread_mutex_unlock(&reg->lk);
+
+	free_fence_hash(dbenv, oldfiles);
+	return (0);
+
+err:
+	free_fence_hash(dbenv, newfiles);
+	return (ret);
+}
+
+int
+__sc_publication_fence_ready(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	int ready;
+
+	if (reg == NULL)
+		return (0);
+	Pthread_mutex_lock(&reg->lk);
+	ready = reg->readiness == SC_FENCE_READY;
+	Pthread_mutex_unlock(&reg->lk);
+	return (ready);
+}
+
+void
+__sc_publication_fence_set_failed(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+
+	if (reg == NULL)
+		return;
+	Pthread_mutex_lock(&reg->lk);
+	reg->readiness = SC_FENCE_FAILED;
+	Pthread_mutex_unlock(&reg->lk);
+}
+
 struct sc_fence_list_arg {
 	const sc_build_id_t *build_id;
 	u_int8_t *out;

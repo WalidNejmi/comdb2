@@ -40,6 +40,8 @@
 #include <sqlglue.h>
 #include <bdbglue.h>
 
+struct __sc_publication_fence_record;
+
 #include <assert.h>
 
 #include <compile_time_assert.h>
@@ -2563,6 +2565,23 @@ int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
                                      int expected_count);
 int bdb_sc_publication_fence_discard(bdb_state_type *bdb_state,
                                      const sc_build_id_t *build_id);
+int bdb_sc_publication_fence_reconcile(
+    bdb_state_type *bdb_state,
+    const struct __sc_publication_fence_record *records, int nrecords);
+void bdb_sc_publication_fence_set_failed(bdb_state_type *bdb_state);
+int bdb_set_sc_publication_fence(tran_type *tran, const uint8_t *fileid,
+                                 unsigned int lsn_file,
+                                 unsigned int lsn_offset,
+                                 const sc_build_id_t *build_id, int *bdberr);
+int bdb_del_sc_publication_fence(tran_type *tran, const uint8_t *fileid,
+                                 int *bdberr);
+int bdb_load_sc_publication_fences(tran_type *tran, int *nloaded, int *bdberr);
+int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state,
+                                     tran_type *tran,
+                                     const sc_build_id_t *build_id,
+                                     unsigned int fence_file,
+                                     unsigned int fence_offset,
+                                     int expected_count);
 int bdb_get_log_end_lsn(bdb_state_type *bdb_state, unsigned int *file,
                         unsigned int *offset);
 #endif

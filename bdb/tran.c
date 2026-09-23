@@ -67,6 +67,7 @@ static unsigned int curtran_counter = 0;
 int gbl_flush_on_prepare = 1;
 int gbl_wait_for_prepare_seqnum = 1;
 int gbl_debug_sleep_before_prepare = 0;
+int gbl_sc_fence_persist_fail_after = INT_MAX;
 int gbl_sc_fence_publish_fail_after = INT_MAX;
 int gbl_sc_fence_test_extra_files = 0;
 extern int gbl_debug_txn_sleep;
@@ -105,6 +106,11 @@ int __sc_publication_fence_pend(DB_ENV *, const uint8_t *,
 int __sc_publication_fence_publish(DB_ENV *, const sc_build_id_t *, DB_LSN,
                                    uint64_t, int);
 int __sc_publication_fence_discard_build(DB_ENV *, const sc_build_id_t *);
+int __sc_publication_fence_reconcile(DB_ENV *,
+                                     const SC_PUBLICATION_FENCE_RECORD *, int);
+void __sc_publication_fence_set_failed(DB_ENV *);
+int __sc_publication_fence_list_build(DB_ENV *, const sc_build_id_t *,
+                                      uint8_t *, int, int *);
 
 void bdb_tran_set_sc_build(tran_type *tran, const sc_build_id_t *build_id)
 {
@@ -254,6 +260,93 @@ int bdb_sc_publication_fence_discard(bdb_state_type *bdb_state,
     if (bdb_state->parent)
         bdb_state = bdb_state->parent;
     return __sc_publication_fence_discard_build(bdb_state->dbenv, build_id);
+}
+
+int bdb_sc_publication_fence_reconcile(
+    bdb_state_type *bdb_state, const SC_PUBLICATION_FENCE_RECORD *records,
+    int nrecords)
+{
+    if (bdb_state == NULL || nrecords < 0 ||
+        (nrecords > 0 && records == NULL))
+        return -1;
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    return __sc_publication_fence_reconcile(bdb_state->dbenv, records,
+                                             nrecords);
+}
+
+void bdb_sc_publication_fence_set_failed(bdb_state_type *bdb_state)
+{
+    if (bdb_state == NULL)
+        return;
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    __sc_publication_fence_set_failed(bdb_state->dbenv);
+}
+
+int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
+                                     const sc_build_id_t *build_id,
+                                     unsigned int fence_file,
+                                     unsigned int fence_offset,
+                                     int expected_count)
+{
+    uint8_t *fileids = NULL;
+    int nfiles = 0, i, rc, bdberr = 0;
+
+    if (bdb_state == NULL || tran == NULL || tran->tid == NULL ||
+        tran->tid->utxnid == 0 || sc_build_id_is_zero(build_id) ||
+        fence_file == 0 || expected_count <= 0)
+        return -1;
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    rc = __sc_publication_fence_list_build(bdb_state->dbenv, build_id, NULL, 0,
+                                           &nfiles);
+    if (rc != 0 || nfiles != expected_count) {
+        logmsg(LOGMSG_ERROR,
+               "%s: incomplete fence set: expected %d, found %d, rc %d\n",
+               __func__, expected_count, nfiles, rc);
+        return -1;
+    }
+
+    fileids = malloc((size_t)nfiles * DB_FILE_ID_LEN);
+    if (fileids == NULL)
+        return -1;
+
+    rc = __sc_publication_fence_list_build(bdb_state->dbenv, build_id, fileids,
+                                           nfiles, &nfiles);
+    if (rc != 0 || nfiles != expected_count) {
+        logmsg(LOGMSG_ERROR,
+               "%s: fence set changed: expected %d, found %d, rc %d\n",
+               __func__, expected_count, nfiles, rc);
+        free(fileids);
+        return -1;
+    }
+
+    for (i = 0; i < nfiles; i++) {
+        if (i == gbl_sc_fence_persist_fail_after) {
+            logmsg(LOGMSG_ERROR,
+                   "%s: injected failure after %d durable fence writes\n",
+                   __func__, i);
+            free(fileids);
+            return -1;
+        }
+        rc = bdb_set_sc_publication_fence(
+            tran, fileids + (size_t)i * DB_FILE_ID_LEN, fence_file,
+            fence_offset, build_id, &bdberr);
+        if (rc != 0) {
+            logmsg(LOGMSG_ERROR,
+                   "%s: failed to persist fence %d/%d rc %d bdberr %d\n",
+                   __func__, i + 1, nfiles, rc, bdberr);
+            free(fileids);
+            return -1;
+        }
+    }
+
+    free(fileids);
+    return 0;
 }
 
 int bdb_get_log_end_lsn(bdb_state_type *bdb_state, unsigned int *file,

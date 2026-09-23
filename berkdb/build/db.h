@@ -3023,9 +3023,22 @@ struct __sc_publication_fence {
 	sc_build_id_t build_id;
 };
 
+struct __sc_publication_fence_record {
+	u_int8_t fileid[DB_FILE_ID_LEN];
+	DB_LSN fence_lsn;
+	u_int64_t publication_utxnid;
+	sc_build_id_t build_id;
+};
+typedef struct __sc_publication_fence_record SC_PUBLICATION_FENCE_RECORD;
+
+#define SC_FENCE_UNINITIALIZED 0
+#define SC_FENCE_READY 1
+#define SC_FENCE_FAILED 2
+
 struct __sc_publication_fence_registry {
 	pthread_mutex_t lk;
 	hash_t *files;
+	int readiness;
 };
 
 struct __mempv_cache_page_key
