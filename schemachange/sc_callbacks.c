@@ -1347,5 +1347,34 @@ int (*SCDONE_CALLBACKS[])(const char *, void *, scdone_t) = {
 int scdone_callback(bdb_state_type *bdb_state, const char table[], void *arg,
                     scdone_t type)
 {
-    return SCDONE_CALLBACKS[type](table, arg, type);
+    int rc = SCDONE_CALLBACKS[type](table, arg, type);
+    int nfences = 0, bdberr = 0;
+    uint32_t lid = 0;
+    tran_type *tran;
+
+    /*
+     * Fence rows precede scdone in the publication transaction, so they have
+     * reached a replica by the time this callback applies the scdone record.
+     * Read with replication's locker: a fresh locker would wait on llmeta
+     * write locks held by this same apply transaction and self-deadlock.
+     */
+    tran = _tran(&lid, &bdberr, __func__, __LINE__);
+    if (tran == NULL) {
+        logmsg(LOGMSG_ERROR,
+               "%s: could not begin a transaction to refresh publication "
+               "fences (bdberr %d)\n",
+               __func__, bdberr);
+        return rc;
+    }
+
+    if (bdb_load_sc_publication_fences(tran, &nfences, &bdberr) != 0) {
+        logmsg(LOGMSG_ERROR,
+               "%s: failed to refresh schema-change publication fences "
+               "(bdberr %d)\n",
+               __func__, bdberr);
+        rc = -1;
+    }
+
+    _untran(tran, lid);
+    return rc;
 }
