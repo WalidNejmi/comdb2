@@ -360,15 +360,13 @@ static int tranlogNext(sqlite3_vtab_cursor *cur)
       }
   }
 
-  if (pCur->requiredReader && pCur->data.data) {
+  if (pCur->requiredReader && !pCur->commitFlagsCapable && pCur->data.data) {
       u_int32_t rectype;
       LOGCOPY_32(&rectype, pCur->data.data);
       normalize_rectype(&rectype);
-      int record_has_commit_flags = rectype == DB___txn_regop_flags ||
+      if (rectype == DB___txn_regop_flags ||
           rectype == DB___txn_regop_gen_flags ||
-          rectype == DB___txn_regop_gen_flags_endianize;
-      if (!tranlog_reader_accepts_commit_flags(pCur->commitFlagsCapable,
-                                               record_has_commit_flags)) {
+          rectype == DB___txn_regop_gen_flags_endianize) {
           pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
               "transaction-log reader lacks commit-flag capability");
           return SQLITE_ERROR;
@@ -490,6 +488,7 @@ static int tranlogColumn(
 
         if (rectype == DB___txn_regop_gen_flags ||
             rectype == DB___txn_regop_gen_flags_endianize){
+            /* Same offsets as regop_gen; commit_flags is appended later. */
             generation = logrecord_generation_regop_gen(pCur->data.data);
         }
 
@@ -723,7 +722,8 @@ static int tranlogFilter(
     pCur->commitFlagsCapable = 0;
     if( idxNum & 32 ){
         int64_t capabilities = sqlite3_value_int64(argv[i++]);
-        pCur->commitFlagsCapable = tranlog_has_commit_flags_v1(capabilities);
+        pCur->commitFlagsCapable =
+                (capabilities & TRANLOG_CAP_TXN_COMMIT_FLAGS_V1) != 0;
     }
     if (pCur->flags & TRANLOG_FLAGS_SENTINEL) {
         pCur->requiredReader = 1;

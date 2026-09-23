@@ -68,7 +68,6 @@ int gbl_flush_on_prepare = 1;
 int gbl_wait_for_prepare_seqnum = 1;
 int gbl_debug_sleep_before_prepare = 0;
 int gbl_sc_fence_persist_fail_after = INT_MAX;
-int gbl_sc_fence_publish_fail_after = INT_MAX;
 int gbl_sc_fence_test_extra_files = 0;
 extern int gbl_debug_txn_sleep;
 extern int gbl_debug_disttxn_trace;
@@ -95,6 +94,10 @@ void bdb_tran_set_is_sc_rebuild(tran_type *tran, int is_sc_rebuild)
     tran->is_sc_rebuild = is_sc_rebuild;
 }
 
+/*
+ * Schema-change replacement-file tracking; see berkdb/txn/txn_sc_skip.c.
+ * Declared here because bdb/ does not include dbinc/.
+ */
 void __txn_set_sc_build(DB_TXN *, const sc_build_id_t *);
 void __txn_note_sc_file_write_int(DB_TXN *, DB *);
 int __sc_private_file_register(DB_ENV *, const uint8_t *,
@@ -106,12 +109,21 @@ int __sc_publication_fence_pend(DB_ENV *, const uint8_t *,
 int __sc_publication_fence_publish(DB_ENV *, const sc_build_id_t *, DB_LSN,
                                    uint64_t, int);
 int __sc_publication_fence_discard_build(DB_ENV *, const sc_build_id_t *);
+int __sc_publication_fence_install(DB_ENV *, const uint8_t *,
+                                   const sc_build_id_t *, DB_LSN);
 int __sc_publication_fence_reconcile(DB_ENV *,
                                      const SC_PUBLICATION_FENCE_RECORD *, int);
 void __sc_publication_fence_set_failed(DB_ENV *);
 int __sc_publication_fence_list_build(DB_ENV *, const sc_build_id_t *,
                                       uint8_t *, int, int *);
 
+/*
+ * Mark a base schema-change converter transaction with its build id.
+ *
+ * Deliberately not called from trans_start_sc_lowpri(): that helper also
+ * serves logical redo and other schema-change work, and only the base
+ * converter knows why its transaction exists.
+ */
 void bdb_tran_set_sc_build(tran_type *tran, const sc_build_id_t *build_id)
 {
     if (tran == NULL || tran->tid == NULL || sc_build_id_is_zero(build_id))
@@ -134,6 +146,18 @@ void bdb_tran_test_note_sc_public_write(tran_type *tran,
         __txn_note_sc_file_write_int(tran->tid, dbp);
 }
 
+/*
+ * Register the rebuilt replacement files of a table as belonging to build_id.
+ *
+ * Only files the caller marks as rebuilt are registered.  A planned schema
+ * change can rename and reuse an existing file rather than rebuild it; those
+ * files are public, and registering one would make ordinary writes to it look
+ * like private construction.
+ *
+ * dta_rebuilt covers dbp_data[0][*].  blob_rebuilt[i] covers dbp_data[i+1][*]
+ * and ix_rebuilt[i] covers dbp_ix[i]; pass NULL for either to mean "all
+ * rebuilt".
+ */
 int bdb_sc_private_register_files(bdb_state_type *bdb_state,
                                   const sc_build_id_t *build_id,
                                   int dta_rebuilt, const int *blob_rebuilt,
@@ -144,6 +168,7 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state,
 
     if (nregistered != NULL)
         *nregistered = 0;
+
     if (bdb_state == NULL || sc_build_id_is_zero(build_id))
         return -1;
 
@@ -158,6 +183,8 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state,
                 continue;
         }
 
+        /* Only the primary data file is striped unless we are in blobstripe
+         * mode; unused slots are NULL and simply skipped. */
         nstripes = bdb_state->attr->dtastripe;
         if (nstripes < 1)
             nstripes = 1;
@@ -167,9 +194,17 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state,
 
             if (dbp == NULL)
                 continue;
+
             if (__sc_private_file_register(bdb_state->dbenv, dbp->fileid,
                                            build_id) != 0)
                 goto fail;
+
+            /*
+             * Same file, same moment, same rebuilt-only rule: this is where
+             * the exact set of rebuilt files is authoritative, so the
+             * publication fence is pended here rather than recomputed at
+             * finalization.  It stays inert until the build publishes.
+             */
             if (__sc_publication_fence_pend(bdb_state->dbenv, dbp->fileid,
                                             build_id) != 0)
                 goto fail;
@@ -182,11 +217,15 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state,
 
         if (dbp == NULL)
             continue;
+
         if (ix_rebuilt != NULL && (ixnum >= nix || !ix_rebuilt[ixnum]))
             continue;
+
         if (__sc_private_file_register(bdb_state->dbenv, dbp->fileid,
                                        build_id) != 0)
             goto fail;
+
+        /* Fence it too; see the data loop above. */
         if (__sc_publication_fence_pend(bdb_state->dbenv, dbp->fileid,
                                         build_id) != 0)
             goto fail;
@@ -211,11 +250,15 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state,
     return 0;
 
 fail:
+    /*
+     * A partial registration would leave some of the build's own files
+     * unmatched, so drop the lot and run without the optimization.  This is
+     * never a reason to fail a schema change.
+     */
     logmsg(LOGMSG_WARN,
-           "%s: could not register replacement files; classifier disabled "
-           "for this build\n",
-           __func__);
-    __sc_publication_fence_discard_build(bdb_state->dbenv, build_id);
+            "%s: could not register replacement files; commit-map skip "
+            "disabled for this build\n",
+            __func__);
     __sc_private_file_unregister_build(bdb_state->dbenv, build_id);
     __sc_private_registry_note_failure(bdb_state->dbenv);
     return -1;
@@ -230,6 +273,14 @@ int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
     return __sc_private_file_unregister_build(bdb_state->dbenv, build_id);
 }
 
+/*
+ * Publish this build's rebuilt files at fence_file:fence_offset.
+ *
+ * The caller must pass an LSN that is ordered after every modification making
+ * up the initial published image and before the publication commits -- the
+ * schema change's own scdone record, which is written after the file versions
+ * are switched and inside the publication transaction.
+ */
 int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
                                      tran_type *tran,
                                      const sc_build_id_t *build_id,
@@ -243,23 +294,42 @@ int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
         tran->tid->utxnid == 0 || sc_build_id_is_zero(build_id) ||
         fence_file == 0)
         return -1;
+
     if (bdb_state->parent)
         bdb_state = bdb_state->parent;
 
     fence.file = fence_file;
     fence.offset = fence_offset;
+
     return __sc_publication_fence_publish(bdb_state->dbenv, build_id, fence,
                                           tran->tid->utxnid, expected_count);
 }
 
-int bdb_sc_publication_fence_discard(bdb_state_type *bdb_state,
-                                     const sc_build_id_t *build_id)
+/*
+ * Install an already-published fence, as read back from its durable record.
+ *
+ * The registry is process-local, so every node rebuilds it this way after a
+ * restart, recovery or promotion rather than inheriting anything.
+ */
+int bdb_sc_publication_fence_install(bdb_state_type *bdb_state,
+                                     const uint8_t *fileid,
+                                     const sc_build_id_t *build_id,
+                                     unsigned int fence_file,
+                                     unsigned int fence_offset)
 {
-    if (bdb_state == NULL || sc_build_id_is_zero(build_id))
-        return 0;
+    DB_LSN fence;
+
+    if (bdb_state == NULL || fileid == NULL || fence_file == 0)
+        return -1;
+
     if (bdb_state->parent)
         bdb_state = bdb_state->parent;
-    return __sc_publication_fence_discard_build(bdb_state->dbenv, build_id);
+
+    fence.file = fence_file;
+    fence.offset = fence_offset;
+
+    return __sc_publication_fence_install(bdb_state->dbenv, fileid, build_id,
+                                          fence);
 }
 
 int bdb_sc_publication_fence_reconcile(
@@ -269,6 +339,7 @@ int bdb_sc_publication_fence_reconcile(
     if (bdb_state == NULL || nrecords < 0 ||
         (nrecords > 0 && records == NULL))
         return -1;
+
     if (bdb_state->parent)
         bdb_state = bdb_state->parent;
 
@@ -280,12 +351,52 @@ void bdb_sc_publication_fence_set_failed(bdb_state_type *bdb_state)
 {
     if (bdb_state == NULL)
         return;
+
     if (bdb_state->parent)
         bdb_state = bdb_state->parent;
 
     __sc_publication_fence_set_failed(bdb_state->dbenv);
 }
 
+/*
+ * Current end of the log.
+ *
+ * Used to date a schema change's publication fence.  Everything written before
+ * this point -- in particular every modification to the generation's
+ * replacement files -- is ordered before the returned LSN, and the publication
+ * commit comes after it, which is exactly the window the fence has to sit in.
+ */
+int bdb_get_log_end_lsn(bdb_state_type *bdb_state, unsigned int *file,
+                        unsigned int *offset)
+{
+    DB_LSN lsn;
+    int rc;
+
+    if (bdb_state == NULL)
+        return -1;
+
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    rc = bdb_state->dbenv->log_get_last_lsn(bdb_state->dbenv, &lsn);
+    if (rc != 0) {
+        logmsg(LOGMSG_ERROR, "%s: log_get_last_lsn rc %d\n", __func__, rc);
+        return -1;
+    }
+
+    *file = lsn.file;
+    *offset = lsn.offset;
+    return 0;
+}
+
+/*
+ * Make this build's fences durable, inside the publication transaction.
+ *
+ * Writing them here rather than after the commit is what gives the metadata
+ * the same fate as the generation it describes: if publication aborts there is
+ * no record, and there is never a window where the new files are readable but
+ * reconstruction has no stopping proof for them.
+ */
 int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
                                      const sc_build_id_t *build_id,
                                      unsigned int fence_file,
@@ -295,10 +406,11 @@ int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
     uint8_t *fileids = NULL;
     int nfiles = 0, i, rc, bdberr = 0;
 
-    if (bdb_state == NULL || tran == NULL || tran->tid == NULL ||
-        tran->tid->utxnid == 0 || sc_build_id_is_zero(build_id) ||
-        fence_file == 0 || expected_count <= 0)
+    if (bdb_state == NULL || tran == NULL || sc_build_id_is_zero(build_id) ||
+        fence_file == 0 ||
+        expected_count <= 0)
         return -1;
+
     if (bdb_state->parent)
         bdb_state = bdb_state->parent;
 
@@ -306,8 +418,8 @@ int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
                                            &nfiles);
     if (rc != 0 || nfiles != expected_count) {
         logmsg(LOGMSG_ERROR,
-               "%s: incomplete fence set: expected %d, found %d, rc %d\n",
-               __func__, expected_count, nfiles, rc);
+             "%s: incomplete fence set: expected %d, found %d, rc %d\n",
+             __func__, expected_count, nfiles, rc);
         return -1;
     }
 
@@ -319,8 +431,8 @@ int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
                                            nfiles, &nfiles);
     if (rc != 0 || nfiles != expected_count) {
         logmsg(LOGMSG_ERROR,
-               "%s: fence set changed: expected %d, found %d, rc %d\n",
-               __func__, expected_count, nfiles, rc);
+             "%s: fence set changed: expected %d, found %d, rc %d\n",
+             __func__, expected_count, nfiles, rc);
         free(fileids);
         return -1;
     }
@@ -333,13 +445,12 @@ int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
             free(fileids);
             return -1;
         }
-        rc = bdb_set_sc_publication_fence(
-            tran, fileids + (size_t)i * DB_FILE_ID_LEN, fence_file,
-            fence_offset, build_id, &bdberr);
+        rc = bdb_set_sc_publication_fence(tran, fileids + (size_t)i * DB_FILE_ID_LEN, fence_file, fence_offset,
+                                          build_id, &bdberr);
         if (rc != 0) {
             logmsg(LOGMSG_ERROR,
-                   "%s: failed to persist fence %d/%d rc %d bdberr %d\n",
-                   __func__, i + 1, nfiles, rc, bdberr);
+                     "%s: failed to persist fence %d/%d rc %d bdberr %d\n",
+                     __func__, i + 1, nfiles, rc, bdberr);
             free(fileids);
             return -1;
         }
@@ -349,25 +460,19 @@ int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
     return 0;
 }
 
-int bdb_get_log_end_lsn(bdb_state_type *bdb_state, unsigned int *file,
-                        unsigned int *offset)
+/*
+ * Drop the pending fences of a build that will not publish.  Idempotent.
+ */
+int bdb_sc_publication_fence_discard(bdb_state_type *bdb_state,
+                                     const sc_build_id_t *build_id)
 {
-    DB_LSN lsn;
-    int rc;
+    if (bdb_state == NULL || sc_build_id_is_zero(build_id))
+        return 0;
 
-    if (bdb_state == NULL || file == NULL || offset == NULL)
-        return -1;
     if (bdb_state->parent)
         bdb_state = bdb_state->parent;
 
-    rc = bdb_state->dbenv->log_get_last_lsn(bdb_state->dbenv, &lsn);
-    if (rc != 0) {
-        logmsg(LOGMSG_ERROR, "%s: log_get_last_lsn rc %d\n", __func__, rc);
-        return -1;
-    }
-    *file = lsn.file;
-    *offset = lsn.offset;
-    return 0;
+    return __sc_publication_fence_discard_build(bdb_state->dbenv, build_id);
 }
 
 tran_type *bdb_tran_begin_logical_norowlocks_int(bdb_state_type *bdb_state,

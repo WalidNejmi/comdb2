@@ -32,8 +32,8 @@
 #include <mem_berkdb.h>
 #include <sys/time.h>
 #include <comdb2buf.h>
-#include <sys_wrap.h>
 #include <sc_build_id.h>
+#include <sys_wrap.h>
 
 #ifndef COMDB2AR
 #include <mem_override.h>
@@ -170,14 +170,15 @@ struct __utxnid; typedef struct __utxnid UTXNID;
 struct __utxnid_track; typedef struct __utxnid_track UTXNID_TRACK;
 struct __logfile_txn_list; typedef struct __logfile_txn_list LOGFILE_TXN_LIST;
 struct __txn_commit_map; typedef struct __txn_commit_map DB_TXN_COMMIT_MAP;
+struct __modsnap_txn; typedef struct __modsnap_txn MODSNAP_TXN;
 struct __sc_private_file; typedef struct __sc_private_file SC_PRIVATE_FILE;
 struct __sc_private_file_registry;
 	typedef struct __sc_private_file_registry SC_PRIVATE_FILE_REGISTRY;
 struct __sc_publication_fence;
 	typedef struct __sc_publication_fence SC_PUBLICATION_FENCE;
 struct __sc_publication_fence_registry;
-	typedef struct __sc_publication_fence_registry SC_PUBLICATION_FENCE_REGISTRY;
-struct __modsnap_txn; typedef struct __modsnap_txn MODSNAP_TXN;
+	typedef struct __sc_publication_fence_registry
+	    SC_PUBLICATION_FENCE_REGISTRY;
 
 struct __mempv; typedef struct __mempv DB_MEMPV;
 struct __mempv_cache; typedef struct __mempv_cache MEMPV_CACHE;
@@ -1196,7 +1197,20 @@ struct __db_txn {
 	DBT blkseq_key;
 	int wrote_regop_gen;
 
-	/* Direct schema-change converter classification. */
+	/*
+	 * Schema-change replacement-file tracking.
+	 *
+	 * sc_build_id is set only on transactions the base schema-change
+	 * converter explicitly marks.  sc_skip_commit_map is set when such a
+	 * transaction writes a physical file registered to that same build,
+	 * and means: do not add this transaction to the commit-LSN map.
+	 *
+	 * Internal metadata writes are allowed.  A write to any unregistered
+	 * user-table file sets sc_unsafe_public_write and disqualifies the skip.
+	 *
+	 * Zero for both preserves existing behaviour, which is what a freshly
+	 * allocated (zeroed) transaction gets.
+	 */
 	sc_build_id_t sc_build_id;
 	u_int8_t sc_skip_commit_map;
 	u_int8_t sc_unsafe_public_write;
@@ -2965,7 +2979,19 @@ struct __db_env {
 	u_int64_t next_utxnid;
 
 	DB_TXN_COMMIT_MAP* txmap;
+
+	/*
+	 * Physical files belonging to an in-progress schema-change build,
+	 * keyed by Berkeley file id.  Consulted only by transactions the base
+	 * converter marked, so an ordinary write never touches it.
+	 */
 	SC_PRIVATE_FILE_REGISTRY *sc_private_files;
+
+	/*
+	 * Publication fences of rebuilt physical files, keyed by Berkeley file
+	 * id.  Consulted by versioned-page reconstruction; see
+	 * __sc_publication_fence_get().
+	 */
 	SC_PUBLICATION_FENCE_REGISTRY *sc_publication_fences;
 
 	DB_MEMPV *mempv;
@@ -3003,8 +3029,41 @@ struct __txn_commit_map {
 	int64_t smallest_logfile;
 	hash_t *transactions;
 	hash_t *logfile_lists;
+
+	/*
+	 * Observability counters.  All of these are protected by txmap_mutexp
+	 * and are lifetime-since-map-initialization values: they are never
+	 * reset, so an operator sampling 'bdb clminfo' over time can compute
+	 * rates.  Current entry/group counts are deliberately absent here --
+	 * they are already available in O(1) from hash_get_num_entries() on
+	 * the two hashes, and duplicating them would just create a second
+	 * thing to keep in sync.
+	 */
+	u_int64_t peak_entries;
+	u_int64_t peak_logfile_groups;
+
+	u_int64_t entries_added;
+	u_int64_t entries_removed;
+
+	u_int64_t lookup_hits;
+	u_int64_t lookup_misses;
+
+	u_int64_t peak_payload_lower_bound_bytes;
+
+	/*
+	 * Commit-map insertions omitted because the committing transaction
+	 * wrote a replacement file belonging to its own schema-change build.
+	 * This directly measures the behaviour being shipped.
+	 */
+	u_int64_t sc_commit_map_entries_skipped;
 };
 
+/*
+ * One physical file that belongs to an active schema-change build.
+ *
+ * Keyed by Berkeley file id rather than by name or DB * -- names can be
+ * reused and pointers are process-local.
+ */
 struct __sc_private_file {
 	u_int8_t fileid[DB_FILE_ID_LEN];
 	sc_build_id_t build_id;
@@ -3013,9 +3072,29 @@ struct __sc_private_file {
 struct __sc_private_file_registry {
 	pthread_mutex_t lk;
 	hash_t *files;
+
+	/*
+	 * Builds that asked to be registered and could not be.  Those schema
+	 * changes simply run without the optimization.
+	 */
 	u_int64_t failed_registrations;
 };
 
+/*
+ * The publication fence of one rebuilt physical file.
+ *
+ * Every modification that forms the file's initial published image is ordered
+ * at or before fence_lsn, and no snapshot may use the generation before it is
+ * published -- so a page version at or before the fence is already old enough
+ * for any snapshot that can legally read this file.  That is what lets
+ * versioned-page reconstruction stop without a commit-map entry for the
+ * converter transactions, whose entries are deliberately omitted.
+ *
+ * A zero fence_lsn means "registered but not yet published": the entry is
+ * created when the rebuilt file set is still authoritative, and stamped when
+ * the schema change writes its scdone record.  A zero fence never satisfies
+ * the stopping rule, so an unpublished -- or abandoned -- build is inert.
+ */
 struct __sc_publication_fence {
 	u_int8_t fileid[DB_FILE_ID_LEN];
 	DB_LSN fence_lsn;
@@ -3031,22 +3110,29 @@ struct __sc_publication_fence_record {
 };
 typedef struct __sc_publication_fence_record SC_PUBLICATION_FENCE_RECORD;
 
-#define SC_FENCE_UNINITIALIZED 0
-#define SC_FENCE_READY 1
-#define SC_FENCE_FAILED 2
-
 struct __sc_publication_fence_registry {
 	pthread_mutex_t lk;
 	hash_t *files;
 	u_int64_t epoch;
 	int readiness;
+
 	u_int64_t stops;
 	u_int64_t lookup_hits;
 	u_int64_t lookup_misses;
 	u_int64_t target_before_publication;
+
+	/*
+	 * Reconstructed page versions thrown out of the mempv cache because the
+	 * file they belong to gained a fence after they were cached.  Anything
+	 * reconstructed before the fence arrived may have been unwound too far.
+	 */
 	u_int64_t cached_pages_dropped;
 	u_int64_t epoch_retries;
 };
+
+#define SC_FENCE_UNINITIALIZED 0
+#define SC_FENCE_READY 1
+#define SC_FENCE_FAILED 2
 
 struct __mempv_cache_page_key
 {

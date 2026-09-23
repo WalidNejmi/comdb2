@@ -340,49 +340,76 @@ int llog_scdone_rename_wrapper(bdb_state_type *bdb_state,
     return rc;
 }
 
-int gbl_sc_fence_test_drop_pending = 0;
-
+/*
+ * Publish the fences of the files this schema change rebuilt.
+ *
+ * The scdone record is the fence: finalization switched the replacement files'
+ * versions before it was written (see do_finalize below), and it is written
+ * inside the publication transaction, so it is ordered after every
+ * modification in the generation's initial published image and before any
+ * snapshot can legally read that generation.
+ *
+ * Until this runs the build's entries carry a zero fence and are inert, so a
+ * schema change that never reaches here changes nothing.
+ */
 static int sc_publish_fences(struct schema_change_type *s, tran_type *tran,
                              unsigned int fence_file,
                              unsigned int fence_offset)
 {
+    extern int gbl_sc_fence_test_drop_pending;
     sc_build_id_t build_id;
 
-    if (s == NULL || s->db == NULL || s->db->handle == NULL ||
-        fence_file == 0 || s->sc_expected_fence_count == 0)
+    if (s == NULL || s->db == NULL || s->db->handle == NULL || fence_file == 0)
         return 0;
+
     if (!sc_private_build_id(s, &build_id))
+        return 0;
+
+    if (s->sc_expected_fence_count == 0)
         return 0;
 
     if (gbl_sc_fence_test_drop_pending)
         bdb_sc_publication_fence_discard(s->db->handle, &build_id);
 
-    if (bdb_sc_publication_fence_persist(
-            s->db->handle, tran, &build_id, fence_file, fence_offset,
-            s->sc_expected_fence_count) != 0)
+    /*
+     * Durable first, in the publication transaction, so the record shares the
+     * generation's fate.  Then the in-memory registry this node reads from;
+     * other nodes build theirs from the durable record instead.
+     */
+    if (bdb_sc_publication_fence_persist(s->db->handle, tran, &build_id,
+                                         fence_file, fence_offset,
+                                         s->sc_expected_fence_count) != 0)
         return -1;
 
-    if (bdb_sc_publication_fence_publish(
-            s->db->handle, tran, &build_id, fence_file, fence_offset,
-            s->sc_expected_fence_count) != 0) {
+    if (bdb_sc_publication_fence_publish(s->db->handle, tran, &build_id,
+                                         fence_file, fence_offset,
+                                         s->sc_expected_fence_count) != 0) {
         bdb_sc_publication_fence_discard(s->db->handle, &build_id);
         return -1;
     }
+
     return 0;
 }
 
+/*
+ * Drop the fences of a build that did not publish, so a later build of the
+ * same physical file cannot inherit them.
+ */
 static void sc_discard_fences(struct schema_change_type *s)
 {
     sc_build_id_t build_id;
 
     if (s == NULL || s->db == NULL || s->db->handle == NULL)
         return;
+
     if (!sc_private_build_id(s, &build_id))
         return;
+
     bdb_sc_publication_fence_discard(s->db->handle, &build_id);
 }
 
 int gbl_sc_pause_after_fence = 0;
+int gbl_sc_fence_test_drop_pending = 0;
 
 static void sc_test_pause_after_fence(void)
 {
@@ -390,6 +417,7 @@ static void sc_test_pause_after_fence(void)
 
     if (seconds <= 0)
         return;
+
     logmsg(LOGMSG_USER,
            "TEST: pausing %d second(s) after publication fence and before scdone\n",
            seconds);
@@ -407,9 +435,9 @@ static int do_finalize(ddl_t func, struct ireq *iq,
                        struct schema_change_type *s, tran_type *input_tran)
 {
     int rc, bdberr = 0;
-    unsigned int fence_file, fence_offset;
     tran_type *tran = input_tran;
     tran_type *ltran, *ptran;
+    unsigned int fence_file = 0, fence_offset = 0;
 
     if (input_tran == NULL) {
         rc = get_schema_change_txns(iq, &ltran, &ptran, &tran);
@@ -452,6 +480,28 @@ static int do_finalize(ddl_t func, struct ireq *iq,
                    bdb_get_scdone_str(s->done_type), s->tablename, tran);
         }
 
+        /*
+         * Publish BEFORE writing scdone, and before the commit.
+         *
+         * Before the commit because the generation is not visible until the
+         * commit lands, so an early fence cannot be observed, while a late one
+         * leaves a window in which the new files are readable but
+         * reconstruction has no stopping proof for them.
+         *
+         * Before scdone because of how a replicant picks the fence up.  It
+         * loads the durable rows from scdone_callback(), which runs while the
+         * scdone log record is being applied -- so any row written *after*
+         * that record has not been applied yet and the replicant reads
+         * nothing.  Ordering the rows first makes them present by the time the
+         * replicant looks.
+         *
+         * The fence is therefore the log end here rather than the scdone LSN.
+         * Both sit in the required window: every modification to the
+         * generation's replacement files was made by func() above and so
+         * precedes this point, and the publication commit follows it.
+         *
+         * The failure paths below discard it again.
+         */
         if (bdb_get_log_end_lsn(thedb->bdb_env, &fence_file, &fence_offset)) {
             sc_errf(s, "Failed to read log end for the publication fence\n");
             rc = -1;
@@ -462,7 +512,6 @@ static int do_finalize(ddl_t func, struct ireq *iq,
             rc = -1;
             goto abort;
         }
-
         sc_test_pause_after_fence();
 
         rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &bdberr);
@@ -497,6 +546,9 @@ static int do_finalize(ddl_t func, struct ireq *iq,
         sc_del_unused_files(s->db);
     } else {
         int bdberr = 0;
+
+        /* Caller owns the commit; see the note at the sibling call above for
+         * why this has to precede the scdone record. */
         if (bdb_get_log_end_lsn(thedb->bdb_env, &fence_file, &fence_offset)) {
             sc_errf(s, "Failed to read log end for the publication fence\n");
             return -1;
@@ -506,6 +558,7 @@ static int do_finalize(ddl_t func, struct ireq *iq,
             return -1;
         }
         sc_test_pause_after_fence();
+
         rc = llog_scdone_rename_wrapper(thedb->bdb_env, s, tran, &bdberr);
         if (rc || bdberr != BDBERR_NOERROR) {
             sc_errf(s, "Failed to send scdone rc=%d bdberr=%d\n", rc, bdberr);

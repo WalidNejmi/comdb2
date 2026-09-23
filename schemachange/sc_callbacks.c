@@ -1353,10 +1353,33 @@ int scdone_callback(bdb_state_type *bdb_state, const char table[], void *arg,
     tran_type *tran;
 
     /*
-     * Fence rows precede scdone in the publication transaction, so they have
-     * reached a replica by the time this callback applies the scdone record.
-     * Read with replication's locker: a fresh locker would wait on llmeta
-     * write locks held by this same apply transaction and self-deadlock.
+     * Refresh this node's publication-fence registry from llmeta.
+     *
+     * A replica needs the fence for exactly the same reason the master does:
+     * it applied the converter transactions and, honouring the durable marker,
+     * left their commit-map entries out -- so reconstruction of a page in a
+     * rebuilt file has nothing to look up and needs a fence to stop at.  The
+     * registry is process-local and is only otherwise built at startup, so
+     * without this a replica that was already running when the schema change
+     * arrived would never learn the fence.  The same applies to a node
+     * promoted to master later: it must have been maintaining its own.
+     *
+     * This is the right place because the fence record is written in the
+     * publication transaction, after the scdone record, and these callbacks
+     * run once that transaction has committed -- scdone_alter() reads the new
+     * schema out of llmeta here, so llmeta is readable.  Hooking the scdone
+     * log record itself would be too early: the record would not be there yet.
+     *
+     * Read under _tran(), which swaps in replication's locker id.  On a
+     * replicant the transaction carrying the schema change still holds write
+     * locks on the llmeta pages this reads, so querying on any other locker
+     * self-deadlocks against it: the apply thread stops acking and the master
+     * waits out its full seqnum timeout on every schema change.  The sibling
+     * scdone handlers read llmeta this way for exactly the same reason.
+     *
+     * Reloading the whole set rather than one build's worth keeps this
+     * independent of which schema change just landed; installing an entry that
+     * is already present just overwrites it with the same values.
      */
     tran = _tran(&lid, &bdberr, __func__, __LINE__);
     if (tran == NULL) {
@@ -1370,11 +1393,13 @@ int scdone_callback(bdb_state_type *bdb_state, const char table[], void *arg,
     if (bdb_load_sc_publication_fences(tran, &nfences, &bdberr) != 0) {
         logmsg(LOGMSG_ERROR,
                "%s: failed to refresh schema-change publication fences "
-               "(bdberr %d)\n",
+               "(bdberr %d); snapshot reconstruction of rebuilt files on this "
+               "node may be unable to stop\n",
                __func__, bdberr);
         rc = -1;
     }
 
     _untran(tran, lid);
+
     return rc;
 }

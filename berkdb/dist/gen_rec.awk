@@ -465,7 +465,10 @@ function log_function() {
 	if (has_dbp == 1)
 		printf("\tdbenv = dbp->dbenv;\n") >> CFILE;
 
-	# Classify physical writes made by direct schema-change converters.
+	# Schema-change replacement-file check.  Only families that carry a
+	# DB * can attribute the write to a physical file; the rest simply do
+	# nothing for this optimization.  Costs an ordinary transaction three
+	# loads and a predictable branch.  See berkdb/txn/txn_sc_skip.c.
 	if (dbprivate && has_dbp == 1 &&
 	    funcname != "__db_debug" && funcname != "__db_cksum")
 		printf("\t__txn_note_sc_file_write(txnid, dbp);\n") >> CFILE;

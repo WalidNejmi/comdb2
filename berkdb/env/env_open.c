@@ -433,9 +433,14 @@ __dbenv_open(dbenv, db_home, flags, mode)
 			goto err;
 		}
 
-		/* Classification is an optimization aid; failure leaves it disabled. */
+		/*
+		 * An optimization aid: if it cannot be created we simply run
+		 * without it and every transaction goes into the commit map as
+		 * before.  It must never stop the database opening.
+		 */
 		(void)__sc_private_file_registry_init(dbenv);
 
+		/* Flagged commits require this registry for correct reconstruction. */
 		if ((ret = __sc_publication_fence_registry_init(dbenv)) != 0)
 			goto err;
 
@@ -562,34 +567,38 @@ __dbenv_open(dbenv, db_home, flags, mode)
 							break;
 						case (DB___txn_regop_flags):
 							if ((ret = __txn_regop_flags_read(dbenv, data.data,
-							    data.size, &regopflags)) != 0)
+											data.size, &regopflags))!=0)
 								goto err;
 							timestamp = regopflags->timestamp;
 							__os_free(dbenv, regopflags);
+
 							if (timestamp <= gbl_recovery_timestamp) {
-								maxlsn = lsn;
+								maxlsn.file = lsn.file;
+								maxlsn.offset = lsn.offset;
 								goto foundlsn;
 							}
 							break;
 						case (DB___txn_regop_gen_flags):
 						case (DB___txn_regop_gen_flags_endianize):
 							if ((ret = __txn_regop_gen_flags_read(dbenv, data.data,
-							    data.size, &regopgenflags)) != 0)
+											data.size, &regopgenflags))!=0)
 								goto err;
 							timestamp = regopgenflags->timestamp;
 							__os_free(dbenv, regopgenflags);
+
 							if (timestamp <= gbl_recovery_timestamp) {
-								maxlsn = lsn;
+								maxlsn.file = lsn.file;
+								maxlsn.offset = lsn.offset;
 								goto foundlsn;
 							}
 							break;
 						case (DB___txn_dist_commit):
-							if ((ret = __txn_dist_commit_read(dbenv, data.data, 
+							if ((ret = __txn_dist_commit_read(dbenv, data.data,
 											&regopdist))!=0)
 								goto err;
 							timestamp = regopdist->timestamp;
 							__os_free(dbenv, regopdist);
-							
+
 							if (timestamp <= gbl_recovery_timestamp) {
 								maxlsn.file = lsn.file;
 								maxlsn.offset = lsn.offset;
@@ -1016,6 +1025,7 @@ __dbenv_close(dbenv, rep_check)
 
 	/* Release read-only mempool */
 	__txn_commit_map_destroy(dbenv);
+
 	__sc_private_file_registry_destroy(dbenv);
 	__sc_publication_fence_registry_destroy(dbenv);
 

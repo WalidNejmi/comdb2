@@ -47,7 +47,6 @@ static const char revid[] = "$Id: txn_rec.c,v 11.54 2003/10/31 23:26:11 ubell Ex
 
 #include "db_int.h"
 #include "dbinc/db_page.h"
-#include "dbinc/db_swap.h"
 #include "dbinc/txn.h"
 #include "dbinc/db_am.h"
 
@@ -702,6 +701,33 @@ quiet_err:
 	return (ret);
 }
 
+/*
+ * Recovery for the flag-carrying commit records.
+ *
+ * COMMIT A SCOPE: these decode the new records and then behave EXACTLY like
+ * their parent handlers -- commit_flags is read but does not influence
+ * recovery.  No writer emits these records yet, so this is unreachable in
+ * practice; it exists so that reader support can be deployed everywhere before
+ * any node starts writing them (plan Stage A).
+ *
+ * The commit_flags guard on the map-add (TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP) is
+ * added in the recovery-omission commit, together with the mutation test that
+ * proves an independent-restart test fails without it.  The single line each
+ * handler needs is marked below.
+ *
+ * These are parallel implementations rather than a shared helper for the same
+ * reason as in txn_auto.c: the parent handlers are hand-maintained and diverge
+ * in real ways (the gen family updates rep->committed_gen and carries an
+ * explicit context/generation; the regop family recovers its context from the
+ * tail of the locks payload).  The shared-internals refactor belongs with the
+ * commit that makes the two actually behave differently, where the mutation
+ * tests can validate it.
+ */
+
+/*
+ * PUBLIC: int __txn_regop_flags_recover
+ * PUBLIC:    __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
+ */
 int
 __txn_regop_flags_recover(dbenv, dbtp, lsnp, op, info)
 	DB_ENV *dbenv;
@@ -720,35 +746,55 @@ __txn_regop_flags_recover(dbenv, dbtp, lsnp, op, info)
 #endif
 
 	commit_lsn_map = __txn_commit_map_enabled();
+
 	if ((ret = __txn_regop_flags_read(dbenv, dbtp->data, dbtp->size,
 	    &argp)) != 0)
 		return (ret);
+
 	__sc_commit_flags_note(SC_OBS_RECOVERY, argp->commit_flags);
 
 	headp = info;
+
 	if (op == DB_TXN_LOGICAL_BACKWARD_ROLL) {
 		abort();
 	} else if (op == DB_TXN_FORWARD_ROLL) {
 		dbenv->prev_commit_lsn = *lsnp;
+		/*
+		 * If this was a 2-phase-commit transaction, then it
+		 * might already have been removed from the list, and
+		 * that's OK.  Ignore the return code from remove.
+		 */
 		(void)__db_txnlist_remove(dbenv, info, argp->txnid->txnid);
 	} else if ((dbenv->tx_timestamp != 0 &&
-	    argp->timestamp > (int32_t)dbenv->tx_timestamp) ||
+		argp->timestamp > (int32_t)dbenv->tx_timestamp) ||
 	    (!IS_ZERO_LSN(headp->trunc_lsn) &&
-	    log_compare(&headp->trunc_lsn, lsnp) < 0)) {
+		log_compare(&headp->trunc_lsn, lsnp) < 0)) {
+		/*
+		 * We failed either the timestamp check or the trunc_lsn check,
+		 * so we treat this as an abort even if it was a commit record.
+		 */
+
 		if (commit_lsn_map) {
 			ret = __txn_commit_map_remove(dbenv, argp->txnid->utxnid);
-			if (ret == DB_NOTFOUND)
+			if (ret == DB_NOTFOUND) {
+				/*
+				 * Benign, and doubly so here: besides the ordinary
+				 * windowed-cache reasons, an entry intentionally
+				 * omitted via SC_PRIVATE_SKIP_MAP was never present
+				 * to begin with.  An absent map entry is not an
+				 * absent transaction.
+				 */
 				ret = 0;
-			else if (ret != 0) {
-				logmsg(LOGMSG_ERROR,
-				    "%s: Failed to remove %"PRIu64" from the commit map\n",
-				    __func__, argp->txnid->utxnid);
+			} else if (ret != 0) {
+				logmsg(LOGMSG_ERROR, "%s: Failed to remove %"PRIu64" from the commit map\n", __func__,
+					argp->txnid->utxnid);
 				goto quiet_err;
 			}
 		}
 
 		ret = __db_txnlist_update(dbenv,
 		    info, argp->txnid->txnid, TXN_ABORT, NULL);
+
 		if (ret == TXN_IGNORE)
 			ret = TXN_OK;
 		else if (ret == TXN_NOTFOUND)
@@ -756,34 +802,48 @@ __txn_regop_flags_recover(dbenv, dbtp, lsnp, op, info)
 			    info, argp->txnid->txnid, TXN_IGNORE, NULL);
 		else if (ret != TXN_OK)
 			goto err;
+		/* else ret = 0; Not necessary because TXN_OK == 0 */
 	} else {
+		/* This is a normal commit; mark it appropriately. */
 		assert(op == DB_TXN_BACKWARD_ROLL);
-		if (commit_lsn_map && argp->opcode == TXN_COMMIT &&
-		    __txn_commit_map_should_add(argp->commit_flags) &&
-		    (ret = __txn_commit_map_add(dbenv,
-		    argp->txnid->utxnid, *lsnp))) {
-			logmsg(LOGMSG_ERROR,
-			    "%s: Failed to add %"PRIu64" to the commit map\n",
-			    __func__, argp->txnid->utxnid);
+
+		/*
+		 * Honour the master's durable decision for this ROOT transaction.
+		 * Recovery is the last of the four consumers: without this, a node
+		 * rebuilding its map from its own WAL would re-add every entry the
+		 * cluster agreed to omit, and a simple restart would undo the work.
+		 *
+		 * Only the map entry is affected -- the transaction is still
+		 * recovered normally, its generation and context are still applied,
+		 * and child utxnids are unaffected.
+		 */
+		if (commit_lsn_map
+			&& (argp->opcode == TXN_COMMIT)
+			&& !(argp->commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP)
+			&& (ret = __txn_commit_map_add(dbenv, argp->txnid->utxnid, *lsnp))) {
+			logmsg(LOGMSG_ERROR, "%s: Failed to add %"PRIu64" to the commit map\n", __func__,
+				argp->txnid->utxnid);
 			goto quiet_err;
 		}
 
 		ret = __db_txnlist_update(dbenv,
 		    info, argp->txnid->txnid, argp->opcode, lsnp);
+
 		if (ret == TXN_IGNORE)
 			ret = TXN_OK;
 		else if (ret == TXN_NOTFOUND)
-			ret = __db_txnlist_add(dbenv, info, argp->txnid->txnid,
-			    argp->opcode == TXN_ABORT ? TXN_IGNORE : argp->opcode,
-			    lsnp);
+			ret = __db_txnlist_add(dbenv,
+			    info, argp->txnid->txnid,
+			    argp->opcode == TXN_ABORT ?
+			    TXN_IGNORE : argp->opcode, lsnp);
 		else if (ret != TXN_OK)
 			goto err;
+		/* else ret = 0; Not necessary because TXN_OK == 0 */
 	}
 
 	if (ret == 0) {
 		if ((context = __txn_regop_flags_read_context(argp)) != 0)
-			set_commit_context(context, NULL, lsnp, argp,
-			    DB___txn_regop_flags);
+			set_commit_context(context, NULL, lsnp, argp, DB___txn_regop_flags);
 		*lsnp = argp->prev_lsn;
 	}
 
@@ -795,9 +855,14 @@ err:		__db_err(dbenv,
 	}
 quiet_err:
 	__os_free(dbenv, argp);
+
 	return (ret);
 }
 
+/*
+ * PUBLIC: int __txn_regop_gen_flags_recover
+ * PUBLIC:    __P((DB_ENV *, DBT *, DB_LSN *, db_recops, void *));
+ */
 int
 __txn_regop_gen_flags_recover(dbenv, dbtp, lsnp, op, info)
 	DB_ENV *dbenv;
@@ -819,16 +884,24 @@ __txn_regop_gen_flags_recover(dbenv, dbtp, lsnp, op, info)
 	db_rep = dbenv->rep_handle;
 	rep = db_rep->region;
 	commit_lsn_map = __txn_commit_map_enabled();
+
 	if ((ret = __txn_regop_gen_flags_read(dbenv, dbtp->data, dbtp->size,
 	    &argp)) != 0)
 		return (ret);
+
 	__sc_commit_flags_note(SC_OBS_RECOVERY, argp->commit_flags);
 
 	headp = info;
+
 	if (op == DB_TXN_LOGICAL_BACKWARD_ROLL) {
 		abort();
 	} else if (op == DB_TXN_FORWARD_ROLL) {
 		dbenv->prev_commit_lsn = *lsnp;
+		/*
+		 * If this was a 2-phase-commit transaction, then it
+		 * might already have been removed from the list, and
+		 * that's OK.  Ignore the return code from remove.
+		 */
 		(void)__db_txnlist_remove(dbenv, info, argp->txnid->txnid);
 		MUTEX_LOCK(dbenv, db_rep->rep_mutexp);
 		rep->committed_gen = argp->generation;
@@ -840,23 +913,35 @@ __txn_regop_gen_flags_recover(dbenv, dbtp, lsnp, op, info)
 		}
 		MUTEX_UNLOCK(dbenv, db_rep->rep_mutexp);
 	} else if ((dbenv->tx_timestamp != 0 &&
-	    argp->timestamp > (int32_t)dbenv->tx_timestamp) ||
-	    (!IS_ZERO_LSN(headp->trunc_lsn) &&
-	    log_compare(&headp->trunc_lsn, lsnp) < 0)) {
+		argp->timestamp > (int32_t) dbenv->tx_timestamp) ||
+		(!IS_ZERO_LSN(headp->trunc_lsn) &&
+		log_compare(&headp->trunc_lsn, lsnp) < 0)) {
+
 		if (commit_lsn_map) {
 			ret = __txn_commit_map_remove(dbenv, argp->txnid->utxnid);
-			if (ret == DB_NOTFOUND)
+			if (ret == DB_NOTFOUND) {
+				/*
+				 * Benign, and doubly so here: besides the ordinary
+				 * windowed-cache reasons, an entry intentionally
+				 * omitted via SC_PRIVATE_SKIP_MAP was never present
+				 * to begin with.  An absent map entry is not an
+				 * absent transaction.
+				 */
 				ret = 0;
-			else if (ret != 0) {
-				logmsg(LOGMSG_ERROR,
-				    "%s: Failed to remove %"PRIu64" from the commit map\n",
-				    __func__, argp->txnid->utxnid);
+			} else if (ret != 0) {
+				logmsg(LOGMSG_ERROR, "%s: Failed to remove %"PRIu64" from the commit map\n", __func__,
+					argp->txnid->utxnid);
 				goto quiet_err;
 			}
 		}
 
+		/*
+		 * We failed either the timestamp check or the trunc_lsn check,
+		 * so we treat this as an abort even if it was a commit record.
+		 */
 		ret = __db_txnlist_update(dbenv,
 		    info, argp->txnid->txnid, TXN_ABORT, NULL);
+
 		if (ret == TXN_IGNORE)
 			ret = TXN_OK;
 		else if (ret == TXN_NOTFOUND)
@@ -864,49 +949,66 @@ __txn_regop_gen_flags_recover(dbenv, dbtp, lsnp, op, info)
 			    info, argp->txnid->txnid, TXN_IGNORE, NULL);
 		else if (ret != TXN_OK)
 			goto err;
+		/* else ret = 0; Not necessary because TXN_OK == 0 */
 	} else {
+		/* This is a normal commit; mark it appropriately. */
 		assert(op == DB_TXN_BACKWARD_ROLL);
-		if (commit_lsn_map && argp->opcode == TXN_COMMIT &&
-		    __txn_commit_map_should_add(argp->commit_flags) &&
-		    (ret = __txn_commit_map_add(dbenv,
-		    argp->txnid->utxnid, *lsnp))) {
-			logmsg(LOGMSG_ERROR,
-			    "%s: Failed to add %"PRIu64" to the commit map\n",
-			    __func__, argp->txnid->utxnid);
+
+		/*
+		 * Honour the master's durable decision for this ROOT transaction.
+		 * Recovery is the last of the four consumers: without this, a node
+		 * rebuilding its map from its own WAL would re-add every entry the
+		 * cluster agreed to omit, and a simple restart would undo the work.
+		 *
+		 * Only the map entry is affected -- the transaction is still
+		 * recovered normally, its generation and context are still applied,
+		 * and child utxnids are unaffected.
+		 */
+		if (commit_lsn_map
+			&& (argp->opcode == TXN_COMMIT)
+			&& !(argp->commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP)
+			&& (ret = __txn_commit_map_add(dbenv, argp->txnid->utxnid, *lsnp))) {
+			logmsg(LOGMSG_ERROR, "%s: Failed to add %"PRIu64" to the commit map\n", __func__,
+				argp->txnid->utxnid);
 			goto quiet_err;
 		}
 
 		ret = __db_txnlist_update(dbenv,
 		    info, argp->txnid->txnid, argp->opcode, lsnp);
+
 		if (ret == TXN_IGNORE)
 			ret = TXN_OK;
 		else if (ret == TXN_NOTFOUND)
-			ret = __db_txnlist_add(dbenv, info, argp->txnid->txnid,
-			    argp->opcode == TXN_ABORT ? TXN_IGNORE : argp->opcode,
-			    lsnp);
-		else if (ret != TXN_OK)
+			ret = __db_txnlist_add(dbenv,
+			    info, argp->txnid->txnid,
+			    argp->opcode == TXN_ABORT ?
+			    TXN_IGNORE : argp->opcode, lsnp);
+		else if (ret != TXN_OK) {
 			goto err;
+		}
+		/* else ret = 0; Not necessary because TXN_OK == 0 */
 	}
 
 	normalize_rectype(&argp->type);
 	if (ret == 0) {
 		if (argp->context)
-			set_commit_context(argp->context, &argp->generation,
-			    lsnp, argp, argp->type);
+			set_commit_context(argp->context, &(argp->generation), lsnp, argp, argp->type);
 		*lsnp = argp->prev_lsn;
 	}
 
 	if (0) {
 err:		__db_err(dbenv,
 		    "txnid %lx commit record found, already on commit list",
-		    (u_long)argp->txnid->txnid);
+		    (u_long) argp->txnid->txnid);
 		ret = EINVAL;
 	}
 quiet_err:
 	__os_free(dbenv, argp);
+
 	return (ret);
 }
 
+#include "dbinc/db_swap.h"
 #include "dbinc/lock.h"
 #include "dbinc/log.h"
 

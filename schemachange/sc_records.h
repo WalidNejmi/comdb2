@@ -69,6 +69,11 @@ struct convert_record_data {
     unsigned n_genids_changed;
     long long nrecs, prev_nrecs, nrecskip;
     int num_records_per_trans;
+    /*
+     * Build this converter's transactions belong to, or 0 when the commit-map
+     * skip is not active for this schema change.  Copied to every worker
+     * thread along with the rest of this struct.
+     */
     sc_build_id_t sc_private_build_id;
     int num_retry_errors;
     int *tagmap; // mapping of fields from -> to
@@ -103,5 +108,11 @@ void live_sc_enter_exclusive_all(bdb_state_type *, tran_type *);
 
 void *live_sc_logical_redo_thd(struct convert_record_data *data);
 
+/*
+ * Identity of a conversion, correlating its converter transactions with the
+ * replacement files registered for it.  Returns 0 when the commit-map skip is
+ * not active for this schema change.  Finalization uses it to publish those
+ * files' fences.
+ */
 int sc_private_build_id(struct schema_change_type *s, sc_build_id_t *build_id);
 #endif

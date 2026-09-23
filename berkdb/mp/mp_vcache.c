@@ -142,25 +142,40 @@ static int __mempv_cache_find_file(obj, arg)
 	void *arg;
 {
 	MEMPV_CACHE_PAGE_VERSIONS *versions = obj;
-	struct mempv_cache_find_file *find = arg;
+	struct mempv_cache_find_file *a = arg;
 
-	if (memcmp(versions->key.ufid, find->fileid, DB_FILE_ID_LEN) != 0)
+	if (memcmp(versions->key.ufid, a->fileid, DB_FILE_ID_LEN) != 0)
 		return (0);
 
-	find->found = versions;
-	return (1);
+	a->found = versions;
+	return (1); /* stop the walk */
 }
 
 /*
+ * __mempv_cache_invalidate_file --
+ * Drop every cached page version belonging to one physical file.
+ *
+ * Called when a schema-change publication fence is installed for that file.
+ * A page reconstructed while the fence was absent can have been unwound too
+ * far -- that is precisely the bug the fence exists to prevent -- and
+ * __mempv_cache_put() would have cached the wrong image under the target LSN
+ * that produced it.  Installing the fence fixes future reconstructions but
+ * says nothing about images already cached, and a later snapshot with the same
+ * target LSN would be served the bad one straight out of the cache.  Throwing
+ * the file's entries away is cheap: it costs a re-reconstruction, which now
+ * has the fence to stop at.
+ *
+ * Returns the number of page versions dropped.
+ *
  * PUBLIC: int __mempv_cache_invalidate_file
- * PUBLIC:     __P((DB_ENV *, u_int8_t *));
+ * PUBLIC:	__P((DB_ENV *, u_int8_t *));
  */
 int __mempv_cache_invalidate_file(dbenv, fileid)
 	DB_ENV *dbenv;
 	u_int8_t *fileid;
 {
 	MEMPV_CACHE *cache;
-	struct mempv_cache_find_file find;
+	struct mempv_cache_find_file arg;
 	MEMPV_CACHE_PAGE_HEADER *header;
 	int ndropped = 0;
 
@@ -168,35 +183,50 @@ int __mempv_cache_invalidate_file(dbenv, fileid)
 		return (0);
 
 	cache = &dbenv->mempv->cache;
+
 	pthread_mutex_lock(&(cache->lock));
 
-	memcpy(find.fileid, fileid, DB_FILE_ID_LEN);
+	/*
+	 * hash_del() during hash_for() is unsafe, so find one victim per walk.
+	 * A file has at most a handful of cached pages, and this runs once per
+	 * rebuilt file per schema change.
+	 */
+	memcpy(arg.fileid, fileid, DB_FILE_ID_LEN);
 	for (;;) {
-		find.found = NULL;
-		hash_for(cache->pages, &__mempv_cache_find_file, &find);
-		if (find.found == NULL)
+		arg.found = NULL;
+		hash_for(cache->pages, &__mempv_cache_find_file, &arg);
+
+		if (arg.found == NULL)
 			break;
 
+		/*
+		 * Unlink every version of this page from the eviction list before
+		 * freeing it, or the list keeps pointers into freed memory.
+		 * hash_first() restarts the walk, which is what we want: the
+		 * previous entry has just been deleted.
+		 */
 		for (;;) {
-			void *entry = NULL;
-			unsigned int bucket = 0;
+			void *ent = NULL;
+			unsigned int bkt = 0;
 
-			header = hash_first(find.found->versions, &entry, &bucket);
+			header = hash_first(arg.found->versions, &ent, &bkt);
 			if (header == NULL)
 				break;
-			hash_del(find.found->versions, header);
+
+			hash_del(arg.found->versions, header);
 			listc_rfl(&cache->evict_list, header);
 			__os_free(dbenv, header);
 			cache->num_cached_pages--;
 			ndropped++;
 		}
 
-		hash_del(cache->pages, find.found);
-		hash_free(find.found->versions);
-		__os_free(dbenv, find.found);
+		hash_del(cache->pages, arg.found);
+		hash_free(arg.found->versions);
+		__os_free(dbenv, arg.found);
 	}
 
 	pthread_mutex_unlock(&(cache->lock));
+
 	return (ndropped);
 }
 

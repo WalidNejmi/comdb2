@@ -223,9 +223,9 @@ __rep_send_message_gen(dbenv, eid, rtype, lsnp, dbtp, flags, gen, usr_ptr)
 		if (rectype == DB___txn_regop ||
             rectype == DB___txn_regop_gen ||
             rectype == DB___txn_regop_gen_endianize ||
-		rectype == DB___txn_regop_flags ||
-		rectype == DB___txn_regop_gen_flags ||
-		rectype == DB___txn_regop_gen_flags_endianize ||
+            rectype == DB___txn_regop_flags ||
+            rectype == DB___txn_regop_gen_flags ||
+            rectype == DB___txn_regop_gen_flags_endianize ||
             rectype == DB___txn_ckp ||
             rectype == DB___txn_ckp_recovery ||
 			rectype == DB___txn_dist_commit ||

@@ -22,6 +22,10 @@
 #include "sc_global.h"
 #include "sc_schema.h"
 #include "sc_callbacks.h"
+#include "crc32c.h"
+
+/* berkdb: the commit-LSN map only exists when snapshot isolation does. */
+int __txn_commit_map_enabled(void);
 
 #include <bdb_fetch.h>
 #include "dbinc/db_swap.h"
@@ -40,8 +44,6 @@
 
 int gbl_logical_live_sc = 0;
 int gbl_sc_test_converter_public_write = 0;
-
-int __txn_commit_map_enabled(void);
 
 extern __thread snap_uid_t *osql_snap_info; /* contains cnonce */
 extern int gbl_partial_indexes;
@@ -708,6 +710,14 @@ static int convert_record(struct convert_record_data *data)
             return -2;
         }
 
+        /*
+         * Tell this transaction which build it belongs to.  If it then writes
+         * one of that build's registered replacement files, its commit-map
+         * entry is omitted.
+         *
+         * Here and not in trans_start_sc_lowpri(): that helper also serves
+         * logical redo and other schema-change work.
+         */
         if (!sc_build_id_is_zero(&data->sc_private_build_id))
             bdb_tran_set_sc_build(data->trans, &data->sc_private_build_id);
     }
@@ -1413,12 +1423,21 @@ static void stop_sc_redo_wait(bdb_state_type *bdb_state,
 int gbl_sc_pause_at_end = 0;
 int gbl_sc_is_at_end = 0;
 
+/*
+ * Identity of the active conversion.
+ *
+ * This build id is only used to correlate an active converter transaction
+ * with the replacement files registered for that active conversion.  It is
+ * not durable identity and is not used for anything after the conversion ends.
+ */
 int sc_private_build_id(struct schema_change_type *s, sc_build_id_t *build_id)
 {
     memset(build_id, 0, sizeof(*build_id));
 
     if (s == NULL || comdb2uuid_is_zero(s->uuid))
         return 0;
+
+    /* Nothing to skip when the commit map is not maintained. */
     if (!__txn_commit_map_enabled())
         return 0;
 
@@ -1426,6 +1445,13 @@ int sc_private_build_id(struct schema_change_type *s, sc_build_id_t *build_id)
     return 1;
 }
 
+/*
+ * Register this conversion's rebuilt replacement files.
+ *
+ * In scplan, -1 means "build from new schema" and >= 0 means "rename the old
+ * file", so rebuilt == (entry < 0).  Reused files are public and must not be
+ * registered.
+ */
 static int sc_private_register_build(struct dbtable *to,
                                      const sc_build_id_t *build_id,
                                      int *nregistered)
@@ -1438,15 +1464,19 @@ static int sc_private_register_build(struct dbtable *to,
         return -1;
 
     plan = to->plan;
-    if (plan == NULL || !gbl_use_plan)
+    if (plan == NULL || !gbl_use_plan) {
+        /* No plan: the whole generation is new. */
         return bdb_sc_private_register_files(to->handle, build_id, 1, NULL, 0,
-                                             NULL, 0, nregistered);
+                             NULL, 0, nregistered);
+    }
 
     dta_rebuilt = is_dta_being_rebuilt(plan);
+
     for (i = 0; i < MAXBLOBS; i++)
-        blob_rebuilt[i] = plan->blob_plan[i] < 0;
+        blob_rebuilt[i] = (plan->blob_plan[i] < 0);
+
     for (i = 0; i < MAXINDEX; i++)
-        ix_rebuilt[i] = plan->ix_plan[i] < 0;
+        ix_rebuilt[i] = (plan->ix_plan[i] < 0);
 
     return bdb_sc_private_register_files(to->handle, build_id, dta_rebuilt,
                                          blob_rebuilt, MAXBLOBS, ix_rebuilt,
@@ -1634,6 +1664,16 @@ int convert_all_records(struct dbtable *from, struct dbtable *to,
         s->logical_livesc = 0;
     }
 
+    /*
+     * Register this conversion's replacement files.
+     *
+     * Placed here deliberately: everything above can still bail out with a
+     * bare "return -1", and any of those paths would skip the cleanup at the
+     * bottom of this function and leak registrations into the next schema
+     * change.  From here to the single exit there are no early returns.  It is
+     * still before any converter transaction starts, which is what the write
+     * check requires.
+     */
     memset(&data.sc_private_build_id, 0, sizeof(data.sc_private_build_id));
     s->sc_expected_fence_count = 0;
     {
@@ -1758,6 +1798,12 @@ int convert_all_records(struct dbtable *from, struct dbtable *to,
         poll(NULL, 0, 200);
     }
 
+    /*
+     * One cleanup path.  Converters are done, so no further transaction can
+     * match this build, and a registration left behind would be matched by a
+     * later schema change on the same table.  Reached on success, on
+     * conversion failure and on abort alike.
+     */
     if (!sc_build_id_is_zero(&data.sc_private_build_id) && data.to != NULL &&
         data.to->handle != NULL)
         bdb_sc_private_unregister_build(data.to->handle,

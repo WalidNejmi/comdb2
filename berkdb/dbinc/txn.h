@@ -152,28 +152,41 @@ struct __txn_logrec {
 #include "dbinc_auto/txn_ext.h"
 #include "dbinc_auto/xa_ext.h"
 
+/*
+ * Schema-change replacement-file tracking.  See berkdb/txn/txn_sc_skip.c.
+ */
 int __sc_private_file_registry_init __P((DB_ENV *));
 int __sc_private_file_registry_destroy __P((DB_ENV *));
 int __sc_private_file_register __P((DB_ENV *, const u_int8_t *,
-    const sc_build_id_t *));
+	   const sc_build_id_t *));
 int __sc_private_file_lookup __P((DB_ENV *, const u_int8_t *, sc_build_id_t *));
 int __sc_private_file_unregister_build __P((DB_ENV *, const sc_build_id_t *));
 void __sc_private_registry_note_failure __P((DB_ENV *));
 void __sc_private_registry_stats __P((DB_ENV *, int *, u_int64_t *,
-    u_int64_t *));
+	   u_int64_t *));
+void __txn_set_sc_build __P((DB_TXN *, const sc_build_id_t *));
+void __txn_note_sc_file_write_int __P((DB_TXN *, DB *));
+void __sc_direct_copy_stats __P((u_int64_t *, u_int64_t *));
+
+/*
+ * Publication fences of rebuilt physical files.  See txn_sc_skip.c; the
+ * consumer is __mempv_fget() in berkdb/mp/mp_versioned.c.
+ */
 int __sc_publication_fence_registry_init __P((DB_ENV *));
 int __sc_publication_fence_registry_destroy __P((DB_ENV *));
 int __sc_publication_fence_pend __P((DB_ENV *, const u_int8_t *,
-	const sc_build_id_t *));
+	   const sc_build_id_t *));
 int __sc_publication_fence_publish __P((DB_ENV *, const sc_build_id_t *,
-	DB_LSN, u_int64_t, int));
+	   DB_LSN, u_int64_t, int));
+int __sc_publication_fence_install __P((DB_ENV *, const u_int8_t *,
+	   const sc_build_id_t *, DB_LSN));
 int __sc_publication_fence_reconcile __P((DB_ENV *,
-	const SC_PUBLICATION_FENCE_RECORD *, int));
+	   const SC_PUBLICATION_FENCE_RECORD *, int));
 int __sc_publication_fence_discard_build __P((DB_ENV *, const sc_build_id_t *));
 int __sc_publication_fence_list_build __P((DB_ENV *, const sc_build_id_t *,
-	u_int8_t *, int, int *));
+	   u_int8_t *, int, int *));
 int __sc_publication_fence_get __P((DB_ENV *, const u_int8_t *, DB_LSN *,
-	u_int64_t *));
+	   u_int64_t *));
 int __sc_publication_fence_ready __P((DB_ENV *));
 void __sc_publication_fence_set_failed __P((DB_ENV *));
 u_int64_t __sc_publication_fence_epoch __P((DB_ENV *));
@@ -181,25 +194,20 @@ void __sc_publication_fence_test_bump_epoch __P((DB_ENV *));
 void __sc_publication_fence_note_epoch_retry __P((DB_ENV *));
 void __sc_publication_fence_note __P((DB_ENV *, int));
 void __sc_publication_fence_stats __P((DB_ENV *, u_int64_t *, u_int64_t *,
-	u_int64_t *, u_int64_t *, u_int64_t *, u_int64_t *));
-void __txn_set_sc_build __P((DB_TXN *, const sc_build_id_t *));
-void __txn_note_sc_file_write_int __P((DB_TXN *, DB *));
-void __sc_direct_copy_stats __P((u_int64_t *, u_int64_t *, u_int64_t *));
+	   u_int64_t *, u_int64_t *, u_int64_t *, u_int64_t *));
 
-static inline int
-__txn_commit_map_should_add(u_int32_t commit_flags)
-{
-	return (commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP) == 0;
-}
-
-#define SC_OBS_MASTER                   0
-#define SC_OBS_SERIAL                   1
-#define SC_OBS_CONCURRENT               2
-#define SC_OBS_RECOVERY                 3
-#define SC_OBS_UNSUP_CHILDREN           4
-#define SC_OBS_UNSUP_ROWLOCK            5
-#define SC_OBS_UNSUP_DISTRIBUTED        6
-#define SC_OBS_UNSUP_UNKNOWN_FAMILY     7
+/*
+ * Durable-flag observation (see txn_sc_skip.c).  Selects which counter
+ * __sc_commit_flags_note() bumps.
+ */
+#define	SC_OBS_MASTER			0
+#define	SC_OBS_SERIAL			1
+#define	SC_OBS_CONCURRENT		2
+#define	SC_OBS_RECOVERY			3
+#define	SC_OBS_UNSUP_CHILDREN		4
+#define	SC_OBS_UNSUP_ROWLOCK		5
+#define	SC_OBS_UNSUP_DISTRIBUTED	6
+#define	SC_OBS_UNSUP_UNKNOWN_FAMILY	7
 
 typedef struct __sc_commit_flags_stats {
 	u_int64_t flags_emitted_master;
@@ -219,6 +227,13 @@ typedef struct __sc_commit_flags_stats {
 void __sc_commit_flags_note __P((int, u_int32_t));
 void __sc_commit_flags_stats __P((SC_COMMIT_FLAGS_STATS *));
 
+/*
+ * Physical-write check, called from every generated log function that carries
+ * a DB *.  That is every logged page mutation in the database, so the ordinary
+ * case must cost almost nothing: three loads and a predictable branch, no
+	 * lock, no hash lookup, no call.  Only a transaction the base converter marked
+	 * and that has not been disqualified takes the out-of-line path.
+ */
 static inline void
 __txn_note_sc_file_write(DB_TXN *txnp, DB *dbp)
 {
@@ -230,6 +245,12 @@ __txn_note_sc_file_write(DB_TXN *txnp, DB *dbp)
 	__txn_note_sc_file_write_int(txnp, dbp);
 }
 
+/*
+ * Clear schema-change state on a DB_TXN that is being reused rather than
+ * freshly allocated, so it cannot inherit a build id from whatever used the
+ * object before.  Freshly allocated transactions are zeroed and are already
+ * correct.
+ */
 static inline void
 __txn_sc_skip_reset(DB_TXN *txnp)
 {
@@ -240,4 +261,5 @@ __txn_sc_skip_reset(DB_TXN *txnp)
 	txnp->sc_skip_commit_map = 0;
 	txnp->sc_unsafe_public_write = 0;
 }
+
 #endif /* !_TXN_H_ */

@@ -2183,23 +2183,6 @@ __scan_logfiles_for_asof_modsnap(dbenv)
 				GOTOERR;
 			}
 			break;
-		case DB___txn_regop_gen_flags_endianize:
-		case DB___txn_regop_gen_flags: {
-			__txn_regop_gen_flags_args *flags_args = NULL;
-			if ((ret = __txn_regop_gen_flags_read(dbenv, data.data,
-			    data.size, &flags_args)) != 0)
-				GOTOERR;
-			free_ptr = flags_args;
-			if (__txn_commit_map_enabled() && flags_args->opcode == TXN_COMMIT &&
-			    __txn_commit_map_should_add(flags_args->commit_flags) &&
-			    (ret = __txn_commit_map_add(dbenv,
-			    flags_args->txnid->utxnid, lsn))) {
-				logmsg(LOGMSG_ERROR, "%s: Failed to add to commit LSN map\n",
-				    __func__);
-				GOTOERR;
-			}
-			break;
-		}
 		case DB___txn_regop:
 			if ((ret =
 				__txn_regop_read(dbenv, data.data,
@@ -2213,18 +2196,45 @@ __scan_logfiles_for_asof_modsnap(dbenv)
 				GOTOERR;
 			}
 			break;
-		case DB___txn_regop_flags: {
-			__txn_regop_flags_args *flags_args = NULL;
-			if ((ret = __txn_regop_flags_read(dbenv, data.data, data.size,
-			    &flags_args)) != 0)
+		case DB___txn_regop_gen_flags_endianize:
+		case DB___txn_regop_gen_flags: {
+			/*
+			 * Flag-carrying twin of regop_gen, honouring the master's durable
+			 * decision.
+			 *
+			 * This scan is the SECOND place recovery materializes root
+			 * entries -- the handlers in txn_rec.c are the other.  Guarding
+			 * only those leaves this one rebuilding the whole map at startup,
+			 * which is exactly what sc_commit_map_recovery_equality caught.
+			 */
+			__txn_regop_gen_flags_args *txn_gen_flags_args = NULL;
+			if ((ret =
+				__txn_regop_gen_flags_read(dbenv, data.data,
+					data.size, &txn_gen_flags_args)) != 0) {
 				GOTOERR;
-			free_ptr = flags_args;
-			if (__txn_commit_map_enabled() && flags_args->opcode == TXN_COMMIT &&
-			    __txn_commit_map_should_add(flags_args->commit_flags) &&
-			    (ret = __txn_commit_map_add(dbenv,
-			    flags_args->txnid->utxnid, lsn))) {
-				logmsg(LOGMSG_ERROR, "%s: Failed to add to commit LSN map\n",
-				    __func__);
+			}
+			free_ptr = txn_gen_flags_args;
+			if (__txn_commit_map_enabled() && (txn_gen_flags_args->opcode == TXN_COMMIT) &&
+					!(txn_gen_flags_args->commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP) &&
+					(ret = __txn_commit_map_add(dbenv, txn_gen_flags_args->txnid->utxnid, lsn))) {
+				logmsg(LOGMSG_ERROR, "%s: Failed to add to commit LSN map\n", __func__);
+				GOTOERR;
+			}
+			break;
+		}
+		case DB___txn_regop_flags: {
+			/* Flag-carrying twin of regop; see above. */
+			__txn_regop_flags_args *txn_flags_args = NULL;
+			if ((ret =
+				__txn_regop_flags_read(dbenv, data.data,
+					data.size, &txn_flags_args)) != 0) {
+				GOTOERR;
+			}
+			free_ptr = txn_flags_args;
+			if (__txn_commit_map_enabled() && (txn_flags_args->opcode == TXN_COMMIT) &&
+				!(txn_flags_args->commit_flags & TXN_COMMIT_F_SC_PRIVATE_SKIP_MAP) &&
+				(ret = __txn_commit_map_add(dbenv, txn_flags_args->txnid->utxnid, lsn))) {
+				logmsg(LOGMSG_ERROR, "%s: Failed to add to commit LSN map\n", __func__);
 				GOTOERR;
 			}
 			break;

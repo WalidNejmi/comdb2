@@ -3429,6 +3429,13 @@ int bdb_env_init_after_llmeta(bdb_state_type *bdb_state)
         rc = bdb_delete_file_lwm(bdb_state, NULL, &bdberr);
     }
 
+    /*
+     * Rebuild the schema-change publication-fence registry from its durable
+     * records.  It is process-local, so every node does this for itself after
+     * a restart, recovery or promotion rather than inheriting anything from a
+     * previous master.  Without it, reconstruction of a rebuilt file whose
+     * converter entries were omitted has no stopping proof.
+     */
     {
         int nfences = 0, fbdberr = 0;
 

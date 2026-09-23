@@ -8,14 +8,13 @@ int sc_publication_fence_decode(const uint8_t *key, size_t keylen,
                                 const uint8_t *value, size_t valuelen,
                                 SC_PUBLICATION_FENCE_RECORD *record)
 {
-    const uint8_t *cursor = value, *end;
+    const uint8_t *cursor = value, *end = value + valuelen;
     int version, lsn_file, lsn_offset, i;
     uint64_t old_build_id;
 
     if (key == NULL || value == NULL || record == NULL ||
         keylen != SC_PUBLICATION_FENCE_KEY_LEN)
         return -1;
-    end = value + valuelen;
 
     cursor = buf_get(&version, sizeof(version), cursor, end);
     cursor = buf_get(&lsn_file, sizeof(lsn_file), cursor, end);

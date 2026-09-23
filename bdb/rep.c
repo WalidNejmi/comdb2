@@ -507,10 +507,6 @@ static inline void set_coherent_state(bdb_state_type *bdb_state,
                                       const char *func, int line)
 {
     struct hostinfo *h = retrieve_hostinfo(host);
-    Pthread_mutex_lock(&bdb_state->seqnum_info->lock);
-    h->capabilities = 0;
-    h->capabilities_time_ms = 0;
-    Pthread_mutex_unlock(&bdb_state->seqnum_info->lock);
     if (h->coherent_state != state) {
         h->coherent_state = state;
         if (gbl_set_coherent_state_trace) {
@@ -1875,6 +1871,10 @@ int net_hostdown_rtn(netinfo_type *netinfo_ptr, struct interned_string *host)
     print(bdb_state, "net_hostdown_rtn: called for %s\n", host->str);
 
     struct hostinfo *h = retrieve_hostinfo(host);
+    Pthread_mutex_lock(&bdb_state->seqnum_info->lock);
+    h->capabilities = 0;
+    h->capabilities_time_ms = 0;
+    Pthread_mutex_unlock(&bdb_state->seqnum_info->lock);
 
     /* if we're the master */
     if (master_host == bdb_state->repinfo->myhost) {

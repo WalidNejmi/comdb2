@@ -1097,25 +1097,52 @@ REGISTER_TUNABLE("rep_skip_recovery", "Skip recovery if truncate won't unwind a 
                  TUNABLE_BOOLEAN, &gbl_rep_skip_recovery, 0, NULL, NULL, NULL, NULL);
 REGISTER_TUNABLE("emit_gen_commits", "Emit commit-records which include cluster generation.  (Default: on)",
                  TUNABLE_BOOLEAN, &gbl_emit_gen_commits, 0, NULL, NULL, NULL, NULL);
-REGISTER_TUNABLE("sc_commit_flags_advertise",
-                 "TEST ONLY. Advertise support for schema-change commit flags.",
-                 TUNABLE_BOOLEAN, &gbl_sc_commit_flags_advertise,
+/*
+ * Writer switch for the flag-carrying commit records.  Reader support is
+ * unconditional; this controls whether the master EMITS them and, when it
+ * does, omits the converter's own commit-map entry.  Every consumer now acts
+ * on the durable flag -- both replica apply paths, recovery, and the as-of
+ * scan skip the entry too -- so turning this on changes cluster behaviour, not
+ * just the WAL.  Do not enable in a mixed-version cluster: a node without
+ * reader support silently diverges rather than erroring (see berkdb/txn/txn.c).
+ */
+REGISTER_TUNABLE("sc_commit_flags_writer",
+                 "Emit flag-carrying commit records for schema-change direct-copy "
+                 "transactions and skip their commit-map entries cluster-wide.  "
+                 "All nodes must have reader support before enabling.  "
+                 "(Default: off)",
+                 TUNABLE_BOOLEAN, &gbl_sc_commit_flags_writer, 0, NULL, NULL, NULL, NULL);
+/*
+ * TEST ONLY.  Forces the commit-time check to reject every direct-copy
+ * candidate, producing the classifier-says-yes / final-decision-says-no case
+ * that sc_commit_map_nearmiss.test exists to check.  Never enable in
+ * production: it disables the schema-change commit-map optimisation entirely.
+ */
+REGISTER_TUNABLE("sc_commit_flags_force_unsupported",
+                 "TEST ONLY.  Treat every schema-change direct-copy candidate as "
+                 "unsupported at commit time, so it keeps ordinary commit-map "
+                 "history.  Used to exercise the fail-closed path.  (Default: off)",
+                 TUNABLE_BOOLEAN, &gbl_sc_commit_flags_force_unsupported,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 REGISTER_TUNABLE("sc_fence_persist_fail_after",
                  "TEST ONLY. Fail publication after this many durable fence writes.",
                  TUNABLE_INTEGER, &gbl_sc_fence_persist_fail_after,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 REGISTER_TUNABLE("sc_fence_publish_fail_after",
-                 "TEST ONLY. Fail in-memory fence publication after this many files.",
+                 "TEST ONLY. Fail publication after this many in-memory fence installs.",
                  TUNABLE_INTEGER, &gbl_sc_fence_publish_fail_after,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
-REGISTER_TUNABLE("sc_fence_test_drop_pending",
-                 "TEST ONLY. Remove pending fences before schema publication.",
-                 TUNABLE_BOOLEAN, &gbl_sc_fence_test_drop_pending,
+REGISTER_TUNABLE("sc_fence_force_unready",
+                 "TEST ONLY. Make publication-fence readiness checks fail.",
+                 TUNABLE_BOOLEAN, &gbl_sc_fence_force_unready,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 REGISTER_TUNABLE("sc_fence_test_extra_files",
-                 "TEST ONLY. Add synthetic files to a schema-change fence set.",
+                 "TEST ONLY. Add synthetic files to publication-fence builds.",
                  TUNABLE_INTEGER, &gbl_sc_fence_test_extra_files,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+REGISTER_TUNABLE("sc_commit_flags_advertise",
+                 "TEST ONLY. Advertise support for schema-change commit flags.",
+                 TUNABLE_BOOLEAN, &gbl_sc_commit_flags_advertise,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 REGISTER_TUNABLE("mempv_test_pause_before_cache_put",
                  "TEST ONLY. Pause historical-page reconstruction before cache insertion.",
@@ -2413,6 +2440,11 @@ REGISTER_TUNABLE("sc_test_converter_public_write",
 REGISTER_TUNABLE("sc_pause_after_fence",
                  "TEST ONLY. Seconds to pause schema-change after fence establishment and before scdone.",
                  TUNABLE_INTEGER, &gbl_sc_pause_after_fence,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+
+REGISTER_TUNABLE("sc_fence_test_drop_pending",
+                 "TEST ONLY. Drop pending publication fences before persistence.",
+                 TUNABLE_BOOLEAN, &gbl_sc_fence_test_drop_pending,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 
 REGISTER_TUNABLE("cached_output_buffer_max_bytes",

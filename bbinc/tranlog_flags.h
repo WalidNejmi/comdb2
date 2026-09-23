@@ -10,17 +10,4 @@ enum {
 
 enum { TRANLOG_CAP_TXN_COMMIT_FLAGS_V1 = 0x1 };
 
-static inline int
-tranlog_has_commit_flags_v1(unsigned int capabilities)
-{
-    return (capabilities & TRANLOG_CAP_TXN_COMMIT_FLAGS_V1) != 0;
-}
-
-static inline int
-tranlog_reader_accepts_commit_flags(int commit_flags_capable,
-                                    int record_has_commit_flags)
-{
-    return !record_has_commit_flags || commit_flags_capable;
-}
-
 #endif

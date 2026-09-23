@@ -65,6 +65,96 @@ int __txn_commit_map_enabled()
  */
 int64_t gbl_commit_map_remove_miss = 0;
 
+/*
+ * A fixed-size copy of the commit-map statistics, filled in under
+ * txmap_mutexp and formatted after the mutex is dropped.
+ */
+struct commit_map_stats_snapshot {
+	int enabled;
+
+	int64_t highest_logfile;
+	int64_t smallest_logfile;
+
+	u_int64_t current_entries;
+	u_int64_t peak_entries;
+
+	u_int64_t current_logfile_groups;
+	u_int64_t peak_logfile_groups;
+
+	u_int64_t entries_added;
+	u_int64_t entries_removed;
+
+	u_int64_t lookup_hits;
+	u_int64_t lookup_misses;
+
+	u_int64_t payload_lower_bound_bytes;
+	u_int64_t peak_payload_lower_bound_bytes;
+
+	int64_t remove_misses;
+
+	u_int64_t sc_commit_map_entries_skipped;
+
+	u_int64_t sc_direct_copy_marked;
+	u_int64_t sc_direct_copy_matched;
+
+	int sc_registry_available;
+	u_int64_t sc_registered_files;
+	u_int64_t sc_registry_failures;
+};
+
+/*
+ * __txn_commit_map_payload_lower_bound_nolock --
+ *	A *lower bound* on the bytes the commit-LSN map is responsible for.
+ *
+ *	This counts only the payload objects we allocate ourselves: one
+ *	UTXNID_TRACK per tracked transaction and one LOGFILE_TXN_LIST per WAL
+ *	file group.  It deliberately excludes the two top-level hash tables,
+ *	every per-logfile inner hash, their bucket arrays and bookkeeping,
+ *	unused hash capacity, allocator metadata, alignment padding and
+ *	fragmentation.  Actual memory attributable to the map is therefore
+ *	always larger than this number, usually by a wide margin.  It exists so
+ *	that map growth can be compared against itself over time; it must not
+ *	be presented as "commit map memory".
+ *
+ *	Caller must hold txmap_mutexp.
+ */
+static u_int64_t
+__txn_commit_map_payload_lower_bound_nolock(DB_TXN_COMMIT_MAP *txmap)
+{
+	const u_int64_t nentries =
+		(u_int64_t)hash_get_num_entries(txmap->transactions);
+	const u_int64_t ngroups =
+		(u_int64_t)hash_get_num_entries(txmap->logfile_lists);
+
+	return nentries * sizeof(UTXNID_TRACK) + ngroups * sizeof(LOGFILE_TXN_LIST);
+}
+
+/*
+ * __txn_commit_map_update_peaks_nolock --
+ *	Refresh the high-water marks after the map has grown.
+ *
+ *	Caller must hold txmap_mutexp.
+ */
+static void
+__txn_commit_map_update_peaks_nolock(DB_TXN_COMMIT_MAP *txmap)
+{
+	const u_int64_t nentries =
+		(u_int64_t)hash_get_num_entries(txmap->transactions);
+	const u_int64_t ngroups =
+		(u_int64_t)hash_get_num_entries(txmap->logfile_lists);
+	u_int64_t payload;
+
+	if (nentries > txmap->peak_entries)
+		txmap->peak_entries = nentries;
+
+	if (ngroups > txmap->peak_logfile_groups)
+		txmap->peak_logfile_groups = ngroups;
+
+	payload = __txn_commit_map_payload_lower_bound_nolock(txmap);
+	if (payload > txmap->peak_payload_lower_bound_bytes)
+		txmap->peak_payload_lower_bound_bytes = payload;
+}
+
 typedef struct __txn_event TXN_EVENT;
 struct __txn_event {
 	TXN_EVENT_T op;
@@ -574,7 +664,13 @@ static int __txn_commit_map_remove_nolock(dbenv, utxnid, delete_from_logfile_lis
 	}
 
 	hash_del(txmap->transactions, txn);
-	__os_free(dbenv, txn); 
+	/*
+	 * Count the removal here, in the single per-entry path.  The bulk
+	 * logfile delete (__txn_commit_map_delete_logfile_txns) reaches this
+	 * function once per entry, so it must not count again itself.
+	 */
+	++txmap->entries_removed;
+	__os_free(dbenv, txn);
 
 err:
 	return ret;
@@ -610,84 +706,162 @@ int __txn_commit_map_remove(dbenv, utxnid)
  */
 void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 	DB_TXN_COMMIT_MAP * const txmap = dbenv->txmap;
-	u_int64_t marked, matched, unsafe, registered, failures;
-	int available;
+	struct commit_map_stats_snapshot st;
 
+	/*
+	 * Copy a fixed-size snapshot under the mutex, then format outside it.
+	 * Everything here is O(1): no allocation, and no walk of the map.  This
+	 * command has to be safe to run repeatedly against a node whose map
+	 * holds millions of entries.
+	 */
 	if (should_lock) { Pthread_mutex_lock(&txmap->txmap_mutexp); }
 
-	logmsg(lvl, "Highest logfile: %"PRId64"; "
-					"Smallest logfile: %"PRId64"; "
-					"Remove misses: %"PRId64"\n",
-					txmap->highest_logfile,
-					txmap->smallest_logfile,
-					gbl_commit_map_remove_miss);
+	st.enabled = __txn_commit_map_enabled();
+	st.highest_logfile = txmap->highest_logfile;
+	st.smallest_logfile = txmap->smallest_logfile;
+	st.current_entries = (u_int64_t)hash_get_num_entries(txmap->transactions);
+	st.peak_entries = txmap->peak_entries;
+	st.current_logfile_groups =
+		(u_int64_t)hash_get_num_entries(txmap->logfile_lists);
+	st.peak_logfile_groups = txmap->peak_logfile_groups;
+	st.entries_added = txmap->entries_added;
+	st.entries_removed = txmap->entries_removed;
+	st.lookup_hits = txmap->lookup_hits;
+	st.lookup_misses = txmap->lookup_misses;
+	st.payload_lower_bound_bytes =
+		__txn_commit_map_payload_lower_bound_nolock(txmap);
+	st.peak_payload_lower_bound_bytes = txmap->peak_payload_lower_bound_bytes;
+	st.remove_misses = gbl_commit_map_remove_miss;
+	st.sc_commit_map_entries_skipped = txmap->sc_commit_map_entries_skipped;
 
 	if (should_lock) { Pthread_mutex_unlock(&txmap->txmap_mutexp); }
 
-	__sc_direct_copy_stats(&marked, &matched, &unsafe);
-	__sc_private_registry_stats(dbenv, &available, &registered, &failures);
-	logmsg(lvl, "SC direct-copy txns marked: %"PRIu64"\n", marked);
-	logmsg(lvl, "SC direct-copy txns matched: %"PRIu64"\n", matched);
-	logmsg(lvl, "SC direct-copy txns unsafe: %"PRIu64"\n", unsafe);
+	/* Separate lock; must not be taken while holding txmap_mutexp. */
+	__sc_private_registry_stats(dbenv, &st.sc_registry_available,
+			&st.sc_registered_files, &st.sc_registry_failures);
+	__sc_direct_copy_stats(&st.sc_direct_copy_marked,
+			&st.sc_direct_copy_matched);
+
+	/*
+	 * Keep the first line byte-compatible: existing tests and tooling parse
+	 * the "Highest logfile"/"Smallest logfile"/"Remove misses" labels.
+	 */
+	logmsg(lvl, "Highest logfile: %"PRId64"; "
+					"Smallest logfile: %"PRId64"; "
+					"Remove misses: %"PRId64"\n",
+					st.highest_logfile,
+					st.smallest_logfile,
+					st.remove_misses);
+	logmsg(lvl, "Commit map enabled: %d\n", st.enabled);
+	logmsg(lvl, "Current entries: %"PRIu64"\n", st.current_entries);
+	logmsg(lvl, "Peak entries: %"PRIu64"\n", st.peak_entries);
+	logmsg(lvl, "Current logfile groups: %"PRIu64"\n", st.current_logfile_groups);
+	logmsg(lvl, "Peak logfile groups: %"PRIu64"\n", st.peak_logfile_groups);
+	logmsg(lvl, "Entries added: %"PRIu64"\n", st.entries_added);
+	logmsg(lvl, "Entries removed: %"PRIu64"\n", st.entries_removed);
+	logmsg(lvl, "Lookup hits: %"PRIu64"\n", st.lookup_hits);
+	logmsg(lvl, "Lookup misses: %"PRIu64"\n", st.lookup_misses);
+	logmsg(lvl, "Payload lower bound bytes: %"PRIu64"\n",
+					st.payload_lower_bound_bytes);
+	logmsg(lvl, "Peak payload lower bound bytes: %"PRIu64"\n",
+					st.peak_payload_lower_bound_bytes);
+
+	/*
+	 * Commit-map insertions omitted because the committing transaction
+	 * wrote a replacement file of its own schema-change build.  This is
+	 * the number that measures the optimization.
+	 */
+	logmsg(lvl, "SC commit-map entries skipped: %"PRIu64"\n",
+					st.sc_commit_map_entries_skipped);
+
+	/*
+	 * Separates "never a copy transaction" from "was one, but wrote nothing
+	 * belonging to its build".  The skip count alone cannot tell those
+	 * apart, which is what a test needs in order to prove an application
+	 * transaction never entered the classification path at all.
+	 */
+	logmsg(lvl, "SC direct-copy txns marked: %"PRIu64"\n",
+					st.sc_direct_copy_marked);
+	logmsg(lvl, "SC direct-copy txns matched: %"PRIu64"\n",
+					st.sc_direct_copy_matched);
+
+	/*
+	 * Durable-flag observation.  While the writer is enabled but nothing
+	 * acts on the flag, these are how we prove all four consumers agree:
+	 * for the same set of transactions, master / serial replica /
+	 * concurrent replica / recovery must report the SAME would-skip count.
+	 * A node only sees the counters for the roles it actually played.
+	 */
 	{
 		SC_COMMIT_FLAGS_STATS fs;
 
 		__sc_commit_flags_stats(&fs);
 		logmsg(lvl, "SC flags emitted (master): %"PRIu64"\n",
-		    fs.flags_emitted_master);
+						fs.flags_emitted_master);
 		logmsg(lvl, "SC would-skip (master): %"PRIu64"\n",
-		    fs.would_skip_master);
+						fs.would_skip_master);
 		logmsg(lvl, "SC flags decoded (serial replica): %"PRIu64"\n",
-		    fs.flags_decoded_serial);
+						fs.flags_decoded_serial);
 		logmsg(lvl, "SC would-skip (serial replica): %"PRIu64"\n",
-		    fs.would_skip_serial);
+						fs.would_skip_serial);
 		logmsg(lvl, "SC flags decoded (concurrent replica): %"PRIu64"\n",
-		    fs.flags_decoded_concurrent);
+						fs.flags_decoded_concurrent);
 		logmsg(lvl, "SC would-skip (concurrent replica): %"PRIu64"\n",
-		    fs.would_skip_concurrent);
+						fs.would_skip_concurrent);
 		logmsg(lvl, "SC flags decoded (recovery): %"PRIu64"\n",
-		    fs.flags_decoded_recovery);
+						fs.flags_decoded_recovery);
 		logmsg(lvl, "SC would-skip (recovery): %"PRIu64"\n",
-		    fs.would_skip_recovery);
+						fs.would_skip_recovery);
 		logmsg(lvl, "SC unsupported candidate children: %"PRIu64"\n",
-		    fs.unsupported_children);
+						fs.unsupported_children);
 		logmsg(lvl, "SC unsupported candidate rowlock: %"PRIu64"\n",
-		    fs.unsupported_rowlock);
+						fs.unsupported_rowlock);
 		logmsg(lvl, "SC unsupported candidate distributed: %"PRIu64"\n",
-		    fs.unsupported_distributed);
+						fs.unsupported_distributed);
 		logmsg(lvl, "SC unsupported candidate unknown family: %"PRIu64"\n",
-		    fs.unsupported_unknown_family);
+						fs.unsupported_unknown_family);
 	}
-	{
-		extern int bdb_cluster_supports_commit_flags(void *);
-		extern int bdb_sc_incapable_log_streams(void *);
-		logmsg(lvl, "SC cluster supports commit flags: %d\n",
-		    bdb_cluster_supports_commit_flags(dbenv->app_private));
-		logmsg(lvl, "SC incapable log streams: %d\n",
-		    bdb_sc_incapable_log_streams(dbenv->app_private));
-	}
-	{
-		u_int64_t entries, stops, hits, misses, early, dropped, retries = 0;
-		SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
 
-		__sc_publication_fence_stats(dbenv, &entries, &stops, &hits,
-		    &misses, &early, &dropped);
-		logmsg(lvl, "SC publication fences: %"PRIu64"\n", entries);
-		logmsg(lvl, "SC fence stops: %"PRIu64"\n", stops);
-		logmsg(lvl, "SC fence lookup hits: %"PRIu64"\n", hits);
-		logmsg(lvl, "SC fence lookup misses: %"PRIu64"\n", misses);
-		logmsg(lvl, "SC fence target before publication: %"PRIu64"\n", early);
-		logmsg(lvl, "SC fence cached pages dropped: %"PRIu64"\n", dropped);
-		if (reg != NULL) {
-			Pthread_mutex_lock(&reg->lk);
-			retries = reg->epoch_retries;
-			Pthread_mutex_unlock(&reg->lk);
+	extern int bdb_sc_incapable_log_streams(void *);
+	logmsg(lvl, "SC incapable log streams: %d\n",
+	    bdb_sc_incapable_log_streams(dbenv->app_private));
+
+	/*
+	 * Publication fences of rebuilt schema-change files.  'stops' is the
+	 * number of times reconstruction ended at a fence instead of walking
+	 * into converter history that has no commit-map entry -- the count that
+	 * shows the skip is actually being made safe.
+	 */
+	{
+		u_int64_t fentries, fstops, fhits, fmisses, fearly, fdropped;
+
+		__sc_publication_fence_stats(dbenv, &fentries, &fstops, &fhits,
+				&fmisses, &fearly, &fdropped);
+		logmsg(lvl, "SC publication fences: %"PRIu64"\n", fentries);
+		logmsg(lvl, "SC fence stops: %"PRIu64"\n", fstops);
+		logmsg(lvl, "SC fence lookup hits: %"PRIu64"\n", fhits);
+		logmsg(lvl, "SC fence lookup misses: %"PRIu64"\n", fmisses);
+		logmsg(lvl, "SC fence target before publication: %"PRIu64"\n",
+				fearly);
+		logmsg(lvl, "SC fence cached pages dropped: %"PRIu64"\n",
+				fdropped);
+		SC_PUBLICATION_FENCE_REGISTRY *freg = dbenv->sc_publication_fences;
+		u_int64_t retries = 0;
+		if (freg != NULL) {
+			Pthread_mutex_lock(&freg->lk);
+			retries = freg->epoch_retries;
+			Pthread_mutex_unlock(&freg->lk);
 		}
 		logmsg(lvl, "SC fence epoch retries: %"PRIu64"\n", retries);
 	}
-	logmsg(lvl, "SC private registry available: %d\n", available);
-	logmsg(lvl, "SC private registered files: %"PRIu64"\n", registered);
-	logmsg(lvl, "SC private registry failures: %"PRIu64"\n", failures);
+
+	/* Enough to tell whether the mechanism was available at all. */
+	logmsg(lvl, "SC private registry available: %d\n",
+					st.sc_registry_available);
+	logmsg(lvl, "SC private registered files: %"PRIu64"\n",
+					st.sc_registered_files);
+	logmsg(lvl, "SC private registry failures: %"PRIu64"\n",
+					st.sc_registry_failures);
 }
 
 /*
@@ -754,8 +928,10 @@ int __txn_commit_map_get(dbenv, utxnid, commit_lsn)
 	txn = hash_find(txmap->transactions, &utxnid);
 
 	if (txn == NULL) {
+		++txmap->lookup_misses;
 		ret = DB_NOTFOUND;
 	} else {
+		++txmap->lookup_hits;
 		*commit_lsn = txn->commit_lsn;
 	}
 
@@ -839,7 +1015,14 @@ int __txn_commit_map_add_nolock(dbenv, utxnid, commit_lsn)
 	txn->commit_lsn = commit_lsn;
 	hash_add(txmap->transactions, txn);
 	hash_add(to_delete->commit_utxnids, txn);
-	
+
+	/*
+	 * Only a genuinely new UTXNID_TRACK counts: the utxnid-0, zero-LSN,
+	 * duplicate and allocation-failure paths all returned above.
+	 */
+	++txmap->entries_added;
+	__txn_commit_map_update_peaks_nolock(txmap);
+
 	return ret;
 err:
 	if (alloc_delete_list) {

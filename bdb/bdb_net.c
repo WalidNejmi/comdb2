@@ -30,6 +30,7 @@
 #include "bdb_api.h"
 #include "bdb_int.h"
 extern int gbl_sc_commit_flags_advertise;
+
 #include <net.h>
 #include <locks.h>
 #include <sys_wrap.h>

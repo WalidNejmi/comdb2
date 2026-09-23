@@ -38,6 +38,29 @@ int gbl_mempv_test_pause_before_cache_put = 0;
 int gbl_mempv_test_paused = 0;
 int gbl_mempv_test_bump_fence_epoch = 0;
 
+/*
+ * __mempv_sc_fence_guarantees_target --
+ *	Is this page version already the initial published image of a rebuilt
+ *	schema-change file?
+ *
+ *	A schema change rebuilds a file privately, then publishes it.  Every
+ *	modification forming the published image -- the converter's copies and
+ *	any live-schema-change writes mirrored into it -- is ordered at or
+ *	before the generation's fence, and no snapshot may read the generation
+ *	before it is published.  So when
+ *
+ *		page_lsn <= fence
+ *		publication_commit_lsn <= target_lsn
+ *
+ *	the page in hand is at or before an image that was already complete and
+ *	visible by the time the snapshot started, and unwinding it further
+ *	would remove rows the snapshot must see.
+ *
+ *	This is why the converter transactions' commit-map entries can be
+ *	omitted: reconstruction stops here instead of looking them up.  The
+ *	test is on the page's LSN and the fence, never on a commit-map miss --
+ *	a miss still means "not known to have committed" everywhere else.
+ */
 static int
 __mempv_sc_fence_guarantees_target(dbenv, fileid, target_lsn, page_lsn)
 	DB_ENV *dbenv;
@@ -52,7 +75,12 @@ __mempv_sc_fence_guarantees_target(dbenv, fileid, target_lsn, page_lsn)
 	    &publication_utxnid) != 0)
 		return (0);
 
-	/* Legacy v1/v2 records use the fence as their visibility boundary. */
+	/*
+	 * New records identify the publication transaction, whose ordinary
+	 * commit-map entry supplies the exact visibility boundary.  Legacy fence
+	 * records did not store it, so retain their historical fence-as-boundary
+	 * behavior for on-disk compatibility.
+	 */
 	visible_from = fence;
 	if (publication_utxnid != 0 &&
 	    __txn_commit_map_get(dbenv, publication_utxnid, &visible_from) != 0)
@@ -431,7 +459,7 @@ found_page:
 	   }
 	   if (XCHANGE32(gbl_mempv_test_bump_fence_epoch, 0))
 		__sc_publication_fence_test_bump_epoch(dbenv);
-	  if (__sc_publication_fence_epoch(dbenv) != fence_epoch) {
+	   if (__sc_publication_fence_epoch(dbenv) != fence_epoch) {
 		__sc_publication_fence_note_epoch_retry(dbenv);
 		if (logc != NULL) {
 			__log_c_close(logc);

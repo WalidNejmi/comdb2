@@ -2547,16 +2547,38 @@ typedef int (*collect_unused_files_f)(void *args, int lognum, char *filename);
 
 void oldfile_hash_collect(collect_unused_files_f func, void *arg);
 void bdb_tran_set_is_sc_rebuild(tran_type *tran, int is_sc_rebuild);
+
+/*
+ * Schema-change replacement-file tracking.
+ *
+ * Mark a base converter transaction with its build id.  Call only from the
+ * base converter, immediately after the transaction starts -- never from a
+ * generic transaction-start helper.
+ */
 void bdb_tran_set_sc_build(tran_type *tran, const sc_build_id_t *build_id);
 void bdb_tran_test_note_sc_public_write(tran_type *tran,
                                         bdb_state_type *bdb_state, int stripe);
+
+/*
+ * Register the rebuilt replacement files of a table as belonging to a build.
+ * Only rebuilt, not-yet-public files may be registered.
+ */
 int bdb_sc_private_register_files(bdb_state_type *bdb_state,
                                   const sc_build_id_t *build_id,
                                   int dta_rebuilt, const int *blob_rebuilt,
                                   int nblobs, const int *ix_rebuilt, int nix,
                                   int *nregistered);
+
+/* Drop every registration for a build.  Idempotent. */
 int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
                                     const sc_build_id_t *build_id);
+
+/*
+ * Publication fences for the rebuilt files of a schema-change build.  The
+ * fence lets versioned-page reconstruction stop at the generation's initial
+ * published image, which is what makes omitting the converter transactions'
+ * commit-map entries safe.  Pended by bdb_sc_private_register_files().
+ */
 int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
                                      tran_type *tran,
                                      const sc_build_id_t *build_id,
@@ -2565,19 +2587,29 @@ int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
                                      int expected_count);
 int bdb_sc_publication_fence_discard(bdb_state_type *bdb_state,
                                      const sc_build_id_t *build_id);
+int bdb_sc_publication_fence_install(bdb_state_type *bdb_state,
+                                     const uint8_t *fileid,
+                                     const sc_build_id_t *build_id,
+                                     unsigned int fence_file,
+                                     unsigned int fence_offset);
 int bdb_sc_publication_fence_reconcile(
     bdb_state_type *bdb_state,
     const struct __sc_publication_fence_record *records, int nrecords);
 void bdb_sc_publication_fence_set_failed(bdb_state_type *bdb_state);
+
+/*
+ * Durable publication fences, keyed by physical file id.  Written inside the
+ * publication transaction so the record exists exactly when the generation it
+ * describes is visible, and read back to rebuild the in-memory registry after
+ * a restart, recovery or promotion.
+ */
 int bdb_set_sc_publication_fence(tran_type *tran, const uint8_t *fileid,
-                                 unsigned int lsn_file,
-                                 unsigned int lsn_offset,
+                                 unsigned int lsn_file, unsigned int lsn_offset,
                                  const sc_build_id_t *build_id, int *bdberr);
 int bdb_del_sc_publication_fence(tran_type *tran, const uint8_t *fileid,
                                  int *bdberr);
 int bdb_load_sc_publication_fences(tran_type *tran, int *nloaded, int *bdberr);
-int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state,
-                                     tran_type *tran,
+int bdb_sc_publication_fence_persist(bdb_state_type *bdb_state, tran_type *tran,
                                      const sc_build_id_t *build_id,
                                      unsigned int fence_file,
                                      unsigned int fence_offset,

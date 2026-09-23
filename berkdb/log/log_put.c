@@ -144,7 +144,7 @@ int gbl_commit_delay_trace = 0;
 static inline int is_commit_record(int rectype) {
 	switch(rectype) {
 		/* regop regop_gen regop_rowlocks */
-		case (DB___txn_regop): 
+		case (DB___txn_regop):
 		case (DB___txn_regop_gen):
 		case (DB___txn_regop_gen_endianize):
 		case (DB___txn_dist_commit):
@@ -748,7 +748,7 @@ __log_put_next(dbenv, lsn, context, dbt, udbt, hdr, old_lsnp, off_context, key, 
 		unsigned long long ltid = 0, *ltranid = &ltid;
 		int pushlog = 1;
 
-		assert( rectype == DB___txn_regop || 
+		assert( rectype == DB___txn_regop ||
 				rectype == DB___txn_regop_gen ||
 				rectype == DB___txn_regop_rowlocks ||
 				rectype == DB___txn_dist_commit ||
@@ -767,6 +767,11 @@ __log_put_next(dbenv, lsn, context, dbt, udbt, hdr, old_lsnp, off_context, key, 
 			pushlog = (flags & DB_LOG_LOGICAL_COMMIT);
 		}
 
+		/*
+		 * The flag-carrying variants append commit_flags AFTER the fields read
+		 * here, so generation sits at exactly the same offset as in the parent
+		 * record and the same expression serves both.
+		 */
 		if (rectype == DB___txn_regop_gen ||
 			rectype == DB___txn_regop_gen_endianize ||
 			rectype == DB___txn_regop_gen_flags ||
