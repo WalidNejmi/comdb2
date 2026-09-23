@@ -2555,4 +2555,14 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state,
                                   int *nregistered);
 int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
                                     const sc_build_id_t *build_id);
+int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
+                                     tran_type *tran,
+                                     const sc_build_id_t *build_id,
+                                     unsigned int fence_file,
+                                     unsigned int fence_offset,
+                                     int expected_count);
+int bdb_sc_publication_fence_discard(bdb_state_type *bdb_state,
+                                     const sc_build_id_t *build_id);
+int bdb_get_log_end_lsn(bdb_state_type *bdb_state, unsigned int *file,
+                        unsigned int *offset);
 #endif

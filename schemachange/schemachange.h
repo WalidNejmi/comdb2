@@ -270,6 +270,7 @@ struct schema_change_type {
 
     struct dbtable *db;
     struct dbtable *newdb;
+    int sc_expected_fence_count;
 
     // if we are borrowing newdb, then someone else is responsible for freeing it.
     // This information is useful for avoiding double-frees in schema changes

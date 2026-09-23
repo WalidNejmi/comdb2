@@ -19,6 +19,7 @@ static const char revid[] = "$Id: txn_sc_skip.c,v 1.0 2026/09/15 00:00:00 comdb2
 
 #ifndef NO_SYSTEM_INCLUDES
 #include <sys/types.h>
+#include <limits.h>
 #include <string.h>
 #endif
 
@@ -302,6 +303,268 @@ __sc_private_registry_stats(dbenv, available, nfiles, failures)
 	*nfiles = (u_int64_t)hash_get_num_entries(reg->files);
 	*failures = reg->failed_registrations;
 	Pthread_mutex_unlock(&reg->lk);
+}
+
+int
+__sc_publication_fence_registry_init(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg;
+	int ret;
+
+	if ((ret = __os_calloc(dbenv, 1, sizeof(*reg), &reg)) != 0)
+		return (ret);
+
+	reg->files = hash_init_o(offsetof(SC_PUBLICATION_FENCE, fileid),
+	    DB_FILE_ID_LEN);
+	if (reg->files == NULL) {
+		__os_free(dbenv, reg);
+		return (ENOMEM);
+	}
+
+	Pthread_mutex_init(&reg->lk, NULL);
+	dbenv->sc_publication_fences = reg;
+	return (0);
+}
+
+static int
+free_sc_publication_fence(void *obj, void *arg)
+{
+	__os_free((DB_ENV *)arg, obj);
+	return (0);
+}
+
+int
+__sc_publication_fence_registry_destroy(dbenv)
+	DB_ENV *dbenv;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+
+	if (reg == NULL)
+		return (0);
+
+	hash_for(reg->files, &free_sc_publication_fence, (void *)dbenv);
+	hash_clear(reg->files);
+	hash_free(reg->files);
+	Pthread_mutex_destroy(&reg->lk);
+	__os_free(dbenv, reg);
+	dbenv->sc_publication_fences = NULL;
+	return (0);
+}
+
+int
+__sc_publication_fence_pend(dbenv, fileid, build_id)
+	DB_ENV *dbenv;
+	const u_int8_t *fileid;
+	const sc_build_id_t *build_id;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	SC_PUBLICATION_FENCE *f;
+	int ret = 0;
+
+	if (reg == NULL || fileid == NULL || sc_build_id_is_zero(build_id))
+		return (EINVAL);
+
+	Pthread_mutex_lock(&reg->lk);
+	f = hash_find(reg->files, fileid);
+	if (f != NULL) {
+		ZERO_LSN(f->fence_lsn);
+		f->publication_utxnid = 0;
+		f->build_id = *build_id;
+		goto done;
+	}
+
+	if ((ret = __os_calloc(dbenv, 1, sizeof(*f), &f)) != 0)
+		goto done;
+
+	memcpy(f->fileid, fileid, DB_FILE_ID_LEN);
+	f->build_id = *build_id;
+	if (hash_add(reg->files, f) != 0) {
+		__os_free(dbenv, f);
+		ret = ENOMEM;
+	}
+
+done:
+	Pthread_mutex_unlock(&reg->lk);
+	return (ret);
+}
+
+struct sc_fence_list_arg {
+	const sc_build_id_t *build_id;
+	u_int8_t *out;
+	int max;
+	int n;
+};
+
+static int
+collect_one_build_fence(void *obj, void *arg)
+{
+	SC_PUBLICATION_FENCE *f = obj;
+	struct sc_fence_list_arg *list = arg;
+
+	if (!sc_build_id_equal(&f->build_id, list->build_id))
+		return (0);
+	if (list->out == NULL) {
+		list->n++;
+		return (0);
+	}
+	if (list->n >= list->max) {
+		list->n = -1;
+		return (1);
+	}
+	memcpy(list->out + (size_t)list->n * DB_FILE_ID_LEN, f->fileid,
+	    DB_FILE_ID_LEN);
+	list->n++;
+	return (0);
+}
+
+int
+__sc_publication_fence_list_build(dbenv, build_id, out, max, nout)
+	DB_ENV *dbenv;
+	const sc_build_id_t *build_id;
+	u_int8_t *out;
+	int max;
+	int *nout;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	struct sc_fence_list_arg list;
+
+	if (nout == NULL)
+		return (EINVAL);
+	*nout = 0;
+	if (reg == NULL || sc_build_id_is_zero(build_id) || max < 0 ||
+	    (out == NULL && max != 0))
+		return (EINVAL);
+
+	list.build_id = build_id;
+	list.out = out;
+	list.max = out == NULL ? INT_MAX : max;
+	list.n = 0;
+	Pthread_mutex_lock(&reg->lk);
+	hash_for(reg->files, &collect_one_build_fence, &list);
+	Pthread_mutex_unlock(&reg->lk);
+	if (list.n < 0)
+		return (ENOMEM);
+
+	*nout = list.n;
+	return (0);
+}
+
+struct sc_fence_build_arg {
+	const sc_build_id_t *build_id;
+	DB_LSN fence_lsn;
+	u_int64_t publication_utxnid;
+	SC_PUBLICATION_FENCE *found;
+	u_int64_t nstamped;
+	int fail_after;
+	int failed;
+};
+
+static int
+stamp_one_build_fence(void *obj, void *arg)
+{
+	SC_PUBLICATION_FENCE *f = obj;
+	struct sc_fence_build_arg *build = arg;
+
+	if (!sc_build_id_equal(&f->build_id, build->build_id))
+		return (0);
+	if (build->nstamped == (u_int64_t)build->fail_after) {
+		build->failed = 1;
+		return (1);
+	}
+	f->fence_lsn = build->fence_lsn;
+	f->publication_utxnid = build->publication_utxnid;
+	build->nstamped++;
+	return (0);
+}
+
+extern int gbl_sc_fence_publish_fail_after;
+
+int
+__sc_publication_fence_publish(dbenv, build_id, fence_lsn,
+    publication_utxnid, expected_count)
+	DB_ENV *dbenv;
+	const sc_build_id_t *build_id;
+	DB_LSN fence_lsn;
+	u_int64_t publication_utxnid;
+	int expected_count;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	struct sc_fence_build_arg build;
+	int nfiles;
+
+	if (reg == NULL || sc_build_id_is_zero(build_id) ||
+	    IS_ZERO_LSN(fence_lsn) || publication_utxnid == 0 ||
+	    expected_count <= 0)
+		return (EINVAL);
+	if (__sc_publication_fence_list_build(dbenv, build_id, NULL, 0,
+	    &nfiles) != 0 || nfiles != expected_count)
+		return (EINVAL);
+
+	build.build_id = build_id;
+	build.fence_lsn = fence_lsn;
+	build.publication_utxnid = publication_utxnid;
+	build.nstamped = 0;
+	build.fail_after = gbl_sc_fence_publish_fail_after;
+	build.failed = 0;
+	Pthread_mutex_lock(&reg->lk);
+	hash_for(reg->files, &stamp_one_build_fence, &build);
+	Pthread_mutex_unlock(&reg->lk);
+	if (build.failed || build.nstamped != (u_int64_t)expected_count)
+		return (EINVAL);
+	return (0);
+}
+
+static int
+find_one_build_fence(void *obj, void *arg)
+{
+	SC_PUBLICATION_FENCE *f = obj;
+	struct sc_fence_build_arg *build = arg;
+
+	if (!sc_build_id_equal(&f->build_id, build->build_id))
+		return (0);
+	build->found = f;
+	return (1);
+}
+
+int
+__sc_publication_fence_discard_build(dbenv, build_id)
+	DB_ENV *dbenv;
+	const sc_build_id_t *build_id;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+	struct sc_fence_build_arg build;
+
+	if (reg == NULL || sc_build_id_is_zero(build_id))
+		return (0);
+
+	build.build_id = build_id;
+	Pthread_mutex_lock(&reg->lk);
+	for (;;) {
+		build.found = NULL;
+		hash_for(reg->files, &find_one_build_fence, &build);
+		if (build.found == NULL)
+			break;
+		hash_del(reg->files, build.found);
+		__os_free(dbenv, build.found);
+	}
+	Pthread_mutex_unlock(&reg->lk);
+	return (0);
+}
+
+void
+__sc_publication_fence_stats(dbenv, entries)
+	DB_ENV *dbenv;
+	u_int64_t *entries;
+{
+	SC_PUBLICATION_FENCE_REGISTRY *reg = dbenv->sc_publication_fences;
+
+	if (reg != NULL) {
+		Pthread_mutex_lock(&reg->lk);
+		*entries = (u_int64_t)hash_get_num_entries(reg->files);
+		Pthread_mutex_unlock(&reg->lk);
+	} else
+		*entries = 0;
 }
 
 void

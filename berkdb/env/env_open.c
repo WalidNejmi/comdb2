@@ -50,6 +50,8 @@ int __txn_commit_map_init(DB_ENV *);
 int __txn_commit_map_destroy(DB_ENV *);
 int __sc_private_file_registry_init(DB_ENV *);
 int __sc_private_file_registry_destroy(DB_ENV *);
+int __sc_publication_fence_registry_init(DB_ENV *);
+int __sc_publication_fence_registry_destroy(DB_ENV *);
 
 extern int gbl_file_permissions;
 extern int gbl_import_mode;
@@ -433,6 +435,9 @@ __dbenv_open(dbenv, db_home, flags, mode)
 
 		/* Classification is an optimization aid; failure leaves it disabled. */
 		(void)__sc_private_file_registry_init(dbenv);
+
+		if ((ret = __sc_publication_fence_registry_init(dbenv)) != 0)
+			goto err;
 
 		/*
 		 * If the application is running with transactions, initialize
@@ -1012,6 +1017,7 @@ __dbenv_close(dbenv, rep_check)
 	/* Release read-only mempool */
 	__txn_commit_map_destroy(dbenv);
 	__sc_private_file_registry_destroy(dbenv);
+	__sc_publication_fence_registry_destroy(dbenv);
 
 	/* Release versioned memory pool */
 	if (dbenv->mempv != NULL) {

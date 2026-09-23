@@ -67,6 +67,8 @@ static unsigned int curtran_counter = 0;
 int gbl_flush_on_prepare = 1;
 int gbl_wait_for_prepare_seqnum = 1;
 int gbl_debug_sleep_before_prepare = 0;
+int gbl_sc_fence_publish_fail_after = INT_MAX;
+int gbl_sc_fence_test_extra_files = 0;
 extern int gbl_debug_txn_sleep;
 extern int gbl_debug_disttxn_trace;
 extern int __txn_getpriority(DB_TXN *txnp, int *priority);
@@ -98,6 +100,11 @@ int __sc_private_file_register(DB_ENV *, const uint8_t *,
                                const sc_build_id_t *);
 int __sc_private_file_unregister_build(DB_ENV *, const sc_build_id_t *);
 void __sc_private_registry_note_failure(DB_ENV *);
+int __sc_publication_fence_pend(DB_ENV *, const uint8_t *,
+                                const sc_build_id_t *);
+int __sc_publication_fence_publish(DB_ENV *, const sc_build_id_t *, DB_LSN,
+                                   uint64_t, int);
+int __sc_publication_fence_discard_build(DB_ENV *, const sc_build_id_t *);
 
 void bdb_tran_set_sc_build(tran_type *tran, const sc_build_id_t *build_id)
 {
@@ -157,6 +164,9 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state,
             if (__sc_private_file_register(bdb_state->dbenv, dbp->fileid,
                                            build_id) != 0)
                 goto fail;
+            if (__sc_publication_fence_pend(bdb_state->dbenv, dbp->fileid,
+                                            build_id) != 0)
+                goto fail;
             ++count;
         }
     }
@@ -171,6 +181,22 @@ int bdb_sc_private_register_files(bdb_state_type *bdb_state,
         if (__sc_private_file_register(bdb_state->dbenv, dbp->fileid,
                                        build_id) != 0)
             goto fail;
+        if (__sc_publication_fence_pend(bdb_state->dbenv, dbp->fileid,
+                                        build_id) != 0)
+            goto fail;
+        ++count;
+    }
+
+    for (ixnum = 0; ixnum < gbl_sc_fence_test_extra_files; ixnum++) {
+        uint8_t fileid[DB_FILE_ID_LEN];
+        uint32_t suffix = (uint32_t)ixnum;
+
+        memcpy(fileid, build_id->bytes, SC_BUILD_ID_LEN);
+        memcpy(fileid + SC_BUILD_ID_LEN, &suffix, sizeof(suffix));
+        if (__sc_private_file_register(bdb_state->dbenv, fileid, build_id) != 0)
+            goto fail;
+        if (__sc_publication_fence_pend(bdb_state->dbenv, fileid, build_id) != 0)
+            goto fail;
         ++count;
     }
 
@@ -183,6 +209,7 @@ fail:
            "%s: could not register replacement files; classifier disabled "
            "for this build\n",
            __func__);
+    __sc_publication_fence_discard_build(bdb_state->dbenv, build_id);
     __sc_private_file_unregister_build(bdb_state->dbenv, build_id);
     __sc_private_registry_note_failure(bdb_state->dbenv);
     return -1;
@@ -195,6 +222,59 @@ int bdb_sc_private_unregister_build(bdb_state_type *bdb_state,
         return 0;
 
     return __sc_private_file_unregister_build(bdb_state->dbenv, build_id);
+}
+
+int bdb_sc_publication_fence_publish(bdb_state_type *bdb_state,
+                                     tran_type *tran,
+                                     const sc_build_id_t *build_id,
+                                     unsigned int fence_file,
+                                     unsigned int fence_offset,
+                                     int expected_count)
+{
+    DB_LSN fence;
+
+    if (bdb_state == NULL || tran == NULL || tran->tid == NULL ||
+        tran->tid->utxnid == 0 || sc_build_id_is_zero(build_id) ||
+        fence_file == 0)
+        return -1;
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    fence.file = fence_file;
+    fence.offset = fence_offset;
+    return __sc_publication_fence_publish(bdb_state->dbenv, build_id, fence,
+                                          tran->tid->utxnid, expected_count);
+}
+
+int bdb_sc_publication_fence_discard(bdb_state_type *bdb_state,
+                                     const sc_build_id_t *build_id)
+{
+    if (bdb_state == NULL || sc_build_id_is_zero(build_id))
+        return 0;
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+    return __sc_publication_fence_discard_build(bdb_state->dbenv, build_id);
+}
+
+int bdb_get_log_end_lsn(bdb_state_type *bdb_state, unsigned int *file,
+                        unsigned int *offset)
+{
+    DB_LSN lsn;
+    int rc;
+
+    if (bdb_state == NULL || file == NULL || offset == NULL)
+        return -1;
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    rc = bdb_state->dbenv->log_get_last_lsn(bdb_state->dbenv, &lsn);
+    if (rc != 0) {
+        logmsg(LOGMSG_ERROR, "%s: log_get_last_lsn rc %d\n", __func__, rc);
+        return -1;
+    }
+    *file = lsn.file;
+    *offset = lsn.offset;
+    return 0;
 }
 
 tran_type *bdb_tran_begin_logical_norowlocks_int(bdb_state_type *bdb_state,

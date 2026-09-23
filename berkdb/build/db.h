@@ -173,6 +173,10 @@ struct __txn_commit_map; typedef struct __txn_commit_map DB_TXN_COMMIT_MAP;
 struct __sc_private_file; typedef struct __sc_private_file SC_PRIVATE_FILE;
 struct __sc_private_file_registry;
 	typedef struct __sc_private_file_registry SC_PRIVATE_FILE_REGISTRY;
+struct __sc_publication_fence;
+	typedef struct __sc_publication_fence SC_PUBLICATION_FENCE;
+struct __sc_publication_fence_registry;
+	typedef struct __sc_publication_fence_registry SC_PUBLICATION_FENCE_REGISTRY;
 struct __modsnap_txn; typedef struct __modsnap_txn MODSNAP_TXN;
 
 struct __mempv; typedef struct __mempv DB_MEMPV;
@@ -2962,6 +2966,7 @@ struct __db_env {
 
 	DB_TXN_COMMIT_MAP* txmap;
 	SC_PRIVATE_FILE_REGISTRY *sc_private_files;
+	SC_PUBLICATION_FENCE_REGISTRY *sc_publication_fences;
 
 	DB_MEMPV *mempv;
 
@@ -3009,6 +3014,18 @@ struct __sc_private_file_registry {
 	pthread_mutex_t lk;
 	hash_t *files;
 	u_int64_t failed_registrations;
+};
+
+struct __sc_publication_fence {
+	u_int8_t fileid[DB_FILE_ID_LEN];
+	DB_LSN fence_lsn;
+	u_int64_t publication_utxnid;
+	sc_build_id_t build_id;
+};
+
+struct __sc_publication_fence_registry {
+	pthread_mutex_t lk;
+	hash_t *files;
 };
 
 struct __mempv_cache_page_key

@@ -1635,12 +1635,13 @@ int convert_all_records(struct dbtable *from, struct dbtable *to,
     }
 
     memset(&data.sc_private_build_id, 0, sizeof(data.sc_private_build_id));
+    s->sc_expected_fence_count = 0;
     {
         sc_build_id_t build_id;
-        int nregistered;
 
         if (sc_private_build_id(s, &build_id) &&
-            sc_private_register_build(data.to, &build_id, &nregistered) == 0)
+            sc_private_register_build(data.to, &build_id,
+                                      &s->sc_expected_fence_count) == 0)
             data.sc_private_build_id = build_id;
     }
 

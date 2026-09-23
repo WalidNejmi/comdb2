@@ -666,6 +666,12 @@ void __txn_commit_map_print_info(DB_ENV *dbenv, loglvl lvl, int should_lock) {
 		logmsg(lvl, "SC incapable log streams: %d\n",
 		    bdb_sc_incapable_log_streams(dbenv->app_private));
 	}
+		{
+				u_int64_t entries;
+
+				__sc_publication_fence_stats(dbenv, &entries);
+				logmsg(lvl, "SC publication fences: %"PRIu64"\n", entries);
+		}
 	logmsg(lvl, "SC private registry available: %d\n", available);
 	logmsg(lvl, "SC private registered files: %"PRIu64"\n", registered);
 	logmsg(lvl, "SC private registry failures: %"PRIu64"\n", failures);
