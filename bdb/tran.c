@@ -93,6 +93,7 @@ void bdb_tran_set_is_sc_rebuild(tran_type *tran, int is_sc_rebuild)
 }
 
 void __txn_set_sc_build(DB_TXN *, const sc_build_id_t *);
+void __txn_note_sc_file_write_int(DB_TXN *, DB *);
 int __sc_private_file_register(DB_ENV *, const uint8_t *,
                                const sc_build_id_t *);
 int __sc_private_file_unregister_build(DB_ENV *, const sc_build_id_t *);
@@ -104,6 +105,20 @@ void bdb_tran_set_sc_build(tran_type *tran, const sc_build_id_t *build_id)
         return;
 
     __txn_set_sc_build(tran->tid, build_id);
+}
+
+void bdb_tran_test_note_sc_public_write(tran_type *tran,
+                                        bdb_state_type *bdb_state, int stripe)
+{
+    DB *dbp;
+
+    if (tran == NULL || tran->tid == NULL || bdb_state == NULL)
+        return;
+    if (stripe < 0 || stripe >= MAXDTASTRIPE ||
+        (dbp = bdb_state->dbp_data[0][stripe]) == NULL)
+        dbp = bdb_state->dbp_data[0][0];
+    if (dbp != NULL)
+        __txn_note_sc_file_write_int(tran->tid, dbp);
 }
 
 int bdb_sc_private_register_files(bdb_state_type *bdb_state,

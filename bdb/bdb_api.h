@@ -2542,6 +2542,8 @@ typedef int (*collect_unused_files_f)(void *args, int lognum, char *filename);
 void oldfile_hash_collect(collect_unused_files_f func, void *arg);
 void bdb_tran_set_is_sc_rebuild(tran_type *tran, int is_sc_rebuild);
 void bdb_tran_set_sc_build(tran_type *tran, const sc_build_id_t *build_id);
+void bdb_tran_test_note_sc_public_write(tran_type *tran,
+                                        bdb_state_type *bdb_state, int stripe);
 int bdb_sc_private_register_files(bdb_state_type *bdb_state,
                                   const sc_build_id_t *build_id,
                                   int dta_rebuilt, const int *blob_rebuilt,
