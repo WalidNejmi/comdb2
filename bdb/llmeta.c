@@ -11614,6 +11614,8 @@ static uint8_t *
 llmeta_sc_publication_fence_data_put(const struct llmeta_sc_publication_fence_data *p_data, uint8_t *p_buf,
                                      const uint8_t *p_buf_end)
 {
+    uint64_t publication_utxnid;
+
     if (p_buf_end < p_buf || (p_buf_end - p_buf) < LLMETA_SC_PUBLICATION_FENCE_DATA_LEN)
         return NULL;
 
@@ -11622,8 +11624,9 @@ llmeta_sc_publication_fence_data_put(const struct llmeta_sc_publication_fence_da
     p_buf = buf_put(&(p_data->lsn_offset), sizeof(p_data->lsn_offset), p_buf, p_buf_end);
     p_buf = buf_no_net_put(p_data->build_id.bytes,
                            sizeof(p_data->build_id.bytes), p_buf, p_buf_end);
-    p_buf = buf_put(&p_data->publication_utxnid,
-                    sizeof(p_data->publication_utxnid), p_buf, p_buf_end);
+    publication_utxnid = flibc_htonll(p_data->publication_utxnid);
+    p_buf = buf_no_net_put(&publication_utxnid, sizeof(publication_utxnid),
+                           p_buf, p_buf_end);
 
     return p_buf;
 }

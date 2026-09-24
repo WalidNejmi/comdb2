@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include <endian_core.h>
+#include <flibc.h>
 
 #include "sc_publication_fence_codec.h"
 
@@ -42,17 +43,20 @@ static size_t encode_value(uint8_t *value, int version, int lsn_file,
                      value + SC_PUBLICATION_FENCE_DATA_LEN);
     cursor = buf_put(&lsn_offset, sizeof(lsn_offset), cursor,
                      value + SC_PUBLICATION_FENCE_DATA_LEN);
-    if (v1)
-        cursor = buf_put(&old_build_id, sizeof(old_build_id), cursor,
-                         value + SC_PUBLICATION_FENCE_DATA_LEN);
-    else
+      if (v1) {
+            uint64_t network_build_id = flibc_htonll(old_build_id);
+            cursor = buf_no_net_put(&network_build_id, sizeof(network_build_id),
+                                                cursor, value + SC_PUBLICATION_FENCE_DATA_LEN);
+      } else {
         cursor = buf_no_net_put(build_id.bytes, sizeof(build_id.bytes), cursor,
                                 value + SC_PUBLICATION_FENCE_DATA_LEN);
             if (version == SC_PUBLICATION_FENCE_VERSION) {
-                        uint64_t publication_utxnid = 0x8877665544332211ULL;
-                        cursor = buf_put(&publication_utxnid, sizeof(publication_utxnid),
-                                                                         cursor, value + SC_PUBLICATION_FENCE_DATA_LEN);
+                  uint64_t publication_utxnid = 0x8877665544332211ULL;
+                  uint64_t network_utxnid = flibc_htonll(publication_utxnid);
+                  cursor = buf_no_net_put(&network_utxnid, sizeof(network_utxnid),
+                                                      cursor, value + SC_PUBLICATION_FENCE_DATA_LEN);
             }
+      }
     return (size_t)(cursor - value);
 }
 
