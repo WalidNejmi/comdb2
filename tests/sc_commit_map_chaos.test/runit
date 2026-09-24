@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Default: a short CI/smoke profile.
+# Production-like four-hour profile:
+#   SC_CHAOS_DURATION=14400 SC_CHAOS_ROWS=1000000 SC_CHAOS_WRITERS=32 \
+#   SC_CHAOS_REBUILD_INTERVAL=120 SC_CHAOS_RESTART_INTERVAL=180 \
+#   SC_CHAOS_FAILOVER_INTERVAL=300 SC_CHAOS_SNAPSHOT_INTERVAL=15
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+source ${TESTSROOTDIR}/sc_commit_map_fence_cluster.test/cluster_commit_map_lib.sh
+set -o pipefail
+
+dbnm=$1
+duration=${SC_CHAOS_DURATION:-120}
+rows=${SC_CHAOS_ROWS:-100000}
+writers=${SC_CHAOS_WRITERS:-12}
+seed_batch=${SC_CHAOS_SEED_BATCH:-10000}
+rebuild_interval=${SC_CHAOS_REBUILD_INTERVAL:-30}
+restart_interval=${SC_CHAOS_RESTART_INTERVAL:-45}
+failover_interval=${SC_CHAOS_FAILOVER_INTERVAL:-60}
+snapshot_interval=${SC_CHAOS_SNAPSHOT_INTERVAL:-10}
+
+require_cluster
+master=$(cluster_master)
+[[ -n "$master" ]] || fail "could not find master"
+
+state=${TESTDIR}/sc-chaos
+stopfile=$state/stop
+mkdir -p "$state"
+rm -f "$stopfile" "$state"/*.count "$state"/*.errors
+background_pids=()
+
+cleanup() {
+	touch "$stopfile"
+	for pid in "${background_pids[@]}"; do
+		kill "$pid" 2>/dev/null || true
+	done
+	for pid in "${background_pids[@]}"; do
+		wait "$pid" 2>/dev/null || true
+	done
+	for node in $(getclusternodes 2>/dev/null); do
+		send_node "$node" "sc_pause_at_end 0" || true
+		send_node "$node" "sync log-delete on" || true
+	done
+}
+trap cleanup EXIT
+
+sql_master() {
+	local current
+	current=$(cluster_master)
+	[[ -n "$current" ]] || return 1
+	sql_node "$current" "$1"
+}
+
+sql_master_batch() {
+	local current
+	current=$(cluster_master)
+	[[ -n "$current" ]] || return 1
+	printf '%s\n' "$1" | cdb2sql --tabs ${CDB2_OPTIONS} --host "$current" "$dbnm" -
+}
+
+counter() {
+	local label=$1 info current
+	current=$(cluster_master)
+	[[ -n "$current" ]] || return 1
+	info=$(node_clminfo "$current")
+	grep -oP "(?<=${label}: )[0-9]+" <<<"$info"
+}
+
+cluster_counter_sum() {
+	local label=$1 node info value total=0
+	for node in $(getclusternodes); do
+		info=$(node_clminfo "$node") || return 1
+		value=$(grep -oP "(?<=${label}: )[0-9]+" <<<"$info") || return 1
+		total=$((total + value))
+	done
+	echo "$total"
+}
+
+sql_master "create table t(id int, v int)" >/dev/null || fail "could not create table"
+sql_master "create unique index ix_t on t(id)" >/dev/null || fail "could not create index"
+(( seed_batch > 0 )) || fail "SC_CHAOS_SEED_BATCH must be positive"
+for (( seed_start=1; seed_start<=rows; seed_start+=seed_batch )); do
+	seed_end=$((seed_start + seed_batch - 1))
+	(( seed_end > rows )) && seed_end=$rows
+	sql_master "insert into t select value, value from generate_series($seed_start, $seed_end)" \
+		>/dev/null || fail "could not seed rows $seed_start through $seed_end"
+done
+seeded=$(sql_master "select count(*) from t")
+(( seeded == rows )) || fail "seeded $seeded rows, expected $rows"
+
+for node in $(getclusternodes); do
+	send_node "$node" "sync log-delete on"
+done
+
+writer() {
+	local worker=$1 successes=0 errors=0 seq=0 start end id old update_id output
+	start=$(( (worker - 1) * rows / writers + 1 ))
+	end=$(( worker * rows / writers ))
+	while [[ ! -f "$stopfile" ]]; do
+		(( seq++ ))
+		id=$((1000000000 + worker * 10000000 + seq))
+		old=$((id - 1000))
+		update_id=$((start + (seq - 1) % (end - start + 1)))
+		if output=$(sql_master_batch "begin
+update t set v=v+1 where id=$update_id
+insert into t values($id,$seq)
+delete from t where id=$old
+commit" 2>&1); then
+			(( successes++ ))
+		else
+			(( errors++ ))
+			if [[ ! -s "$state/writer.$worker.first-error" ]]; then
+				printf '%s\n' "$output" >"$state/writer.$worker.first-error"
+			fi
+		fi
+	done
+	echo "$successes" >"$state/writer.$worker.count"
+	echo "$errors" >"$state/writer.$worker.errors"
+}
+
+rebuild_worker() {
+	local successes=0 errors=0 output
+	while [[ ! -f "$stopfile" ]]; do
+		if output=$(sql_master "rebuild t" 2>&1); then
+			(( successes++ ))
+		else
+			(( errors++ ))
+			if [[ ! -s "$state/rebuild.first-error" ]]; then
+				printf '%s\n' "$output" >"$state/rebuild.first-error"
+			fi
+		fi
+		for _ in $(seq 1 "$rebuild_interval"); do
+			[[ -f "$stopfile" ]] && break
+			sleep 1
+		done
+	done
+	echo "$successes" >"$state/rebuild.count"
+	echo "$errors" >"$state/rebuild.errors"
+}
+
+snapshot_probe() {
+	local current fifo out pid first second
+	current=$(cluster_master)
+	[[ -n "$current" ]] || return 1
+	fifo=$state/snapshot.fifo.$$
+	out=$state/snapshot.out.$$
+	mkfifo "$fifo"
+	cdb2sql --tabs ${CDB2_OPTIONS} --host "$current" "$dbnm" - <"$fifo" >"$out" 2>&1 &
+	pid=$!
+	exec 9>"$fifo"
+	printf '%s\n' "set transaction snapshot isolation" "begin" \
+		"select count(*), coalesce(sum(v),0) from t" >&9
+	sleep 1
+	printf '%s\n' "select count(*), coalesce(sum(v),0) from t" "commit" >&9
+	exec 9>&-
+	wait "$pid" || { rm -f "$fifo" "$out"; return 1; }
+	mapfile -t values < <(grep -E '^[0-9]+[[:space:]]+-?[0-9]+$' "$out")
+	rm -f "$fifo" "$out"
+	(( ${#values[@]} == 2 )) || return 1
+	first=${values[0]}
+	second=${values[1]}
+	[[ "$first" == "$second" ]] || fail "snapshot changed under traffic: $first -> $second"
+}
+
+for worker_id in $(seq 1 "$writers"); do
+	writer "$worker_id" &
+	background_pids+=("$!")
+done
+rebuild_worker &
+background_pids+=("$!")
+
+deadline=$((SECONDS + duration))
+next_restart=$((SECONDS + restart_interval))
+next_failover=$((SECONDS + failover_interval))
+next_snapshot=$((SECONDS + snapshot_interval))
+restarts=0
+failovers=0
+snapshots=0
+snapshot_errors=0
+replica_index=0
+
+while (( SECONDS < deadline )); do
+	if (( SECONDS >= next_snapshot )); then
+		if snapshot_probe; then (( snapshots++ )); else (( snapshot_errors++ )); fi
+		next_snapshot=$((SECONDS + snapshot_interval))
+	fi
+	if (( SECONDS >= next_restart )); then
+		mapfile -t replicas < <(cluster_replicas)
+		if (( ${#replicas[@]} > 0 )); then
+			replica=${replicas[$((replica_index % ${#replicas[@]}))]}
+			kill_restart_node "$replica" 1
+			(( replica_index++ ))
+			(( restarts++ ))
+		fi
+		next_restart=$((SECONDS + restart_interval))
+	fi
+	if (( SECONDS >= next_failover )); then
+		old_master=$(cluster_master)
+		if downgrade_master; then
+			new_master=$(cluster_master)
+			[[ -n "$new_master" && "$new_master" != "$old_master" ]] ||
+				fail "master did not change during chaos"
+			(( failovers++ ))
+		fi
+		next_failover=$((SECONDS + failover_interval))
+	fi
+	sleep 1
+done
+
+touch "$stopfile"
+for pid in "${background_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+background_pids=()
+wait_for_cluster
+
+writer_success=0
+writer_errors=0
+for worker_id in $(seq 1 "$writers"); do
+	count=$(cat "$state/writer.$worker_id.count" 2>/dev/null || echo 0)
+	errors=$(cat "$state/writer.$worker_id.errors" 2>/dev/null || echo 0)
+	writer_success=$((writer_success + count))
+	writer_errors=$((writer_errors + errors))
+done
+rebuilds=$(cat "$state/rebuild.count" 2>/dev/null || echo 0)
+rebuild_errors=$(cat "$state/rebuild.errors" 2>/dev/null || echo 0)
+
+(( writer_success >= writers )) || fail "insufficient committed traffic: $writer_success"
+(( rebuilds > 0 )) || fail "no schema change completed during chaos"
+(( snapshots > 0 )) || fail "no stable snapshot completed during chaos"
+(( snapshots > snapshot_errors )) ||
+	fail "snapshot probes were mostly unsuccessful: passed=$snapshots errors=$snapshot_errors"
+if (( duration >= failover_interval )); then (( failovers > 0 )) || fail "no promotion completed"; fi
+if (( duration >= restart_interval )); then (( restarts > 0 )) || fail "no replica restart completed"; fi
+
+skipped=$(counter "SC commit-map entries skipped")
+fences=$(counter "SC publication fences")
+stops=$(cluster_counter_sum "SC fence stops")
+(( skipped > 0 && fences > 0 && stops > 0 )) ||
+	fail "optimization not load-bearing: skipped=$skipped fences=$fences stops=$stops"
+
+sql_master "select count(*) from t" >/dev/null || fail "final table read failed"
+do_verify t
+
+echo "SC_CHAOS: duration=$duration rows=$rows writers=$writers commits=$writer_success" \
+	"writer_errors=$writer_errors rebuilds=$rebuilds rebuild_errors=$rebuild_errors" \
+	"snapshots=$snapshots snapshot_errors=$snapshot_errors restarts=$restarts" \
+	"failovers=$failovers skipped=$skipped fences=$fences fence_stops=$stops"
+echo "Passed test"
