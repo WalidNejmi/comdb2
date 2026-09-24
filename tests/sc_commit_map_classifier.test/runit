@@ -102,17 +102,55 @@ if (( marked_delta < N || matched_delta < N )); then
 	exit 1
 fi
 
-if (( skipped_delta != 0 || would_skip_delta != 0 )); then
-	echo "FAIL: mixed private/public converter writes produced" \
-		"$skipped_delta skipped entries and $would_skip_delta skip flags"
+if (( skipped_delta < N || would_skip_delta < N )); then
+	echo "FAIL: safe converter writes produced only $skipped_delta skips and" \
+		"$would_skip_delta durable decisions for $N rows"
 	exit 1
 fi
 
-if (( map_delta < N )); then
-	echo "FAIL: only $map_delta commit-map entries were retained for" \
-		"$N mixed private/public converter transactions"
+if (( map_delta > 200 )); then
+	echo "FAIL: safe converter writes grew the commit map by $map_delta entries"
 	exit 1
 fi
+
+run_on_master "put tunable 'sc_test_converter_public_write' 1"
+before=$(get_clminfo)
+before_current=$(counter "Current entries" "$before")
+before_skipped=$(counter "SC commit-map entries skipped" "$before")
+before_would_skip=$(counter "SC would-skip (master)" "$before")
+run_on_master "rebuild t"
+after=$(get_clminfo)
+public_map_delta=$(( $(counter "Current entries" "$after") - before_current ))
+public_skipped_delta=$(( $(counter "SC commit-map entries skipped" "$after") - before_skipped ))
+public_would_skip_delta=$(( $(counter "SC would-skip (master)" "$after") - before_would_skip ))
+run_on_master "put tunable 'sc_test_converter_public_write' 0"
+
+(( public_skipped_delta == 0 && public_would_skip_delta == 0 &&
+   public_map_delta >= N )) || {
+	echo "FAIL: public-write veto map=$public_map_delta skipped=$public_skipped_delta would_skip=$public_would_skip_delta"
+	exit 1
+}
+
+run_on_master "put tunable 'sc_test_converter_other_build_write' 1"
+before=$(get_clminfo)
+before_current=$(counter "Current entries" "$before")
+before_skipped=$(counter "SC commit-map entries skipped" "$before")
+before_would_skip=$(counter "SC would-skip (master)" "$before")
+run_on_master "rebuild t"
+after=$(get_clminfo)
+other_map_delta=$(( $(counter "Current entries" "$after") - before_current ))
+other_skipped_delta=$(( $(counter "SC commit-map entries skipped" "$after") - before_skipped ))
+other_would_skip_delta=$(( $(counter "SC would-skip (master)" "$after") - before_would_skip ))
+run_on_master "put tunable 'sc_test_converter_other_build_write' 0"
+
+(( other_skipped_delta == 0 && other_would_skip_delta == 0 &&
+   other_map_delta >= N )) || {
+	echo "FAIL: cross-build veto map=$other_map_delta skipped=$other_skipped_delta would_skip=$other_would_skip_delta"
+	exit 1
+}
+
+echo "SC_COMMIT_MAP_CLASSIFIER_EXACT: safe_skipped=$skipped_delta" \
+	"public_retained=$public_map_delta other_build_retained=$other_map_delta"
 
 do_verify t
 

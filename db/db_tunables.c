@@ -415,6 +415,7 @@ extern int gbl_ref_sync_iterations;
 extern int gbl_sc_pause_at_end;
 extern int gbl_sc_is_at_end;
 extern int gbl_sc_test_converter_public_write;
+extern int gbl_sc_test_converter_other_build_write;
 extern int gbl_sc_pause_after_fence;
 extern int gbl_sc_fence_test_drop_pending;
 extern int gbl_max_password_cache_size;

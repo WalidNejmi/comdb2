@@ -44,6 +44,7 @@ int __txn_commit_map_enabled(void);
 
 int gbl_logical_live_sc = 0;
 int gbl_sc_test_converter_public_write = 0;
+int gbl_sc_test_converter_other_build_write = 0;
 
 extern __thread snap_uid_t *osql_snap_info; /* contains cnonce */
 extern int gbl_partial_indexes;
@@ -1211,6 +1212,10 @@ err:
     if (gbl_sc_test_converter_public_write)
         bdb_tran_test_note_sc_public_write(data->trans, data->from->handle,
                                            data->stripe);
+    if (gbl_sc_test_converter_other_build_write)
+        bdb_tran_test_note_sc_other_build_write(data->trans,
+                                                data->from->handle,
+                                                data->stripe);
 
     // now do the commit
     db_seqnum_type ss;

@@ -146,6 +146,31 @@ void bdb_tran_test_note_sc_public_write(tran_type *tran,
         __txn_note_sc_file_write_int(tran->tid, dbp);
 }
 
+void bdb_tran_test_note_sc_other_build_write(tran_type *tran,
+                                             bdb_state_type *bdb_state,
+                                             int stripe)
+{
+    DB *dbp;
+    sc_build_id_t other_build;
+
+    if (tran == NULL || tran->tid == NULL || bdb_state == NULL ||
+        sc_build_id_is_zero(&tran->tid->sc_build_id))
+        return;
+    if (stripe < 0 || stripe >= MAXDTASTRIPE ||
+        (dbp = bdb_state->dbp_data[0][stripe]) == NULL)
+        dbp = bdb_state->dbp_data[0][0];
+    if (dbp == NULL)
+        return;
+
+    other_build = tran->tid->sc_build_id;
+    other_build.bytes[SC_BUILD_ID_LEN - 1] ^= 1;
+    if (__sc_private_file_register(bdb_state->dbenv, dbp->fileid,
+                                   &other_build) != 0)
+        return;
+    __txn_note_sc_file_write_int(tran->tid, dbp);
+    __sc_private_file_unregister_build(bdb_state->dbenv, &other_build);
+}
+
 /*
  * Register the rebuilt replacement files of a table as belonging to build_id.
  *

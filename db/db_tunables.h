@@ -2437,6 +2437,11 @@ REGISTER_TUNABLE("sc_test_converter_public_write",
                  TUNABLE_BOOLEAN, &gbl_sc_test_converter_public_write,
                  EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
 
+REGISTER_TUNABLE("sc_test_converter_other_build_write",
+                 "TEST ONLY. Classify converter transactions as touching another build's user file.",
+                 TUNABLE_BOOLEAN, &gbl_sc_test_converter_other_build_write,
+                 EXPERIMENTAL | INTERNAL, NULL, NULL, NULL, NULL);
+
 REGISTER_TUNABLE("sc_pause_after_fence",
                  "TEST ONLY. Seconds to pause schema-change after fence establishment and before scdone.",
                  TUNABLE_INTEGER, &gbl_sc_pause_after_fence,
