@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+set -euo pipefail
+
+export ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=1:halt_on_error=1:strict_string_checks=1}
+export UBSAN_OPTIONS=${UBSAN_OPTIONS:-halt_on_error=1:print_stacktrace=1}
+
+${TESTSBUILDDIR}/txn_commit_flags_sanitizer
+${TESTSBUILDDIR}/sc_publication_fence_codec_sanitizer
+
+echo "SC_SANITIZERS: wal=passed fence_codec=passed"
+echo "Passed test"

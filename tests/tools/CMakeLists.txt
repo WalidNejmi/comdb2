@@ -152,7 +152,27 @@ add_exe(sc_publication_fence_codec_test
   sc_publication_fence_codec_test.c
   ${PROJECT_SOURCE_DIR}/bdb/sc_publication_fence_codec.c
 )
+
+add_exe(txn_commit_flags_sanitizer
+  txn_commit_flags_roundtrip.c
+  txn_commit_flags_roundtrip_stubs.c
+  ${PROJECT_SOURCE_DIR}/berkdb/txn/txn_auto.c
+)
+
+add_exe(sc_publication_fence_codec_sanitizer
+  sc_publication_fence_codec_test.c
+  ${PROJECT_SOURCE_DIR}/bdb/sc_publication_fence_codec.c
+)
 target_include_directories(sc_publication_fence_codec_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/bdb
+  ${PROJECT_SOURCE_DIR}/berkdb
+  ${PROJECT_SOURCE_DIR}/berkdb/build
+  ${PROJECT_BINARY_DIR}/berkdb
+  ${PROJECT_SOURCE_DIR}/dlmalloc
+  ${PROJECT_SOURCE_DIR}/mem
+  ${PROJECT_BINARY_DIR}/mem
+)
+target_include_directories(sc_publication_fence_codec_sanitizer PRIVATE
   ${PROJECT_SOURCE_DIR}/bdb
   ${PROJECT_SOURCE_DIR}/berkdb
   ${PROJECT_SOURCE_DIR}/berkdb/build
@@ -168,12 +188,37 @@ target_include_directories(txn_commit_flags_roundtrip PRIVATE
   ${PROJECT_SOURCE_DIR}/bdb
   ${PROJECT_SOURCE_DIR}/dlmalloc
 )
+target_include_directories(txn_commit_flags_sanitizer PRIVATE
+  ${PROJECT_SOURCE_DIR}/berkdb/build
+  ${PROJECT_SOURCE_DIR}/berkdb
+  ${PROJECT_BINARY_DIR}/berkdb
+  ${PROJECT_SOURCE_DIR}/bdb
+  ${PROJECT_SOURCE_DIR}/dlmalloc
+)
 target_compile_definitions(txn_commit_flags_roundtrip PRIVATE
   PER_THREAD_MALLOC
   _GNU_SOURCE
   _LINUX_SOURCE
   lint
 )
+target_compile_definitions(txn_commit_flags_sanitizer PRIVATE
+  PER_THREAD_MALLOC
+  _GNU_SOURCE
+  _LINUX_SOURCE
+  lint
+)
+
+foreach(target txn_commit_flags_sanitizer sc_publication_fence_codec_sanitizer)
+  target_compile_options(${target} PRIVATE
+    -fsanitize=address,undefined
+    -fno-omit-frame-pointer
+    -fno-sanitize-recover=all
+  )
+  target_link_options(${target} PRIVATE
+    -fsanitize=address,undefined
+    -fno-sanitize-recover=all
+  )
+endforeach()
 
 if (COMDB2_EXTRA_TESTS)
   include(${COMDB2_EXTRA_TESTS}/CMakeLists.txt)
