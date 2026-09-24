@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+source ${TESTSROOTDIR}/sc_commit_map_fence_cluster.test/cluster_commit_map_lib.sh
+set -o pipefail
+
+dbnm=$1
+N=${SC_OLD_REPLICA_ROWS:-2000}
+old_binary=${SC_OLD_COMDB2_EXE:-}
+require_cluster
+
+master=$(cluster_master)
+[[ -n "$master" ]] || fail "could not find master"
+replica=$(cluster_replicas | head -1)
+[[ -n "$replica" ]] || fail "could not choose replica"
+
+if [[ -z "$old_binary" ]] || ! ssh -n -o StrictHostKeyChecking=no "$replica" \
+	"test -x '$old_binary'"; then
+	if [[ "${SC_REQUIRE_OLD_BINARY:-0}" == 1 ]]; then
+		fail "SC_OLD_COMDB2_EXE must exist on replica $replica"
+	fi
+	echo "Skipped test: install SC_OLD_COMDB2_EXE on every cluster node"
+	echo "Passed test"
+	exit 0
+fi
+
+metric() {
+	node_clminfo "$master" | sed -n "s/.*$1: \([0-9][0-9]*\).*/\1/p" | head -1
+}
+
+current_running=1
+restore_current() {
+	if (( !current_running )); then
+		cdb2sql ${CDB2_OPTIONS} --host "$replica" "$dbnm" \
+			"exec procedure sys.cmd.send('exit')" >/dev/null 2>&1 || true
+		kill -9 "$(cat "${TMPDIR}/${dbnm}.${replica}.pid" 2>/dev/null)" 2>/dev/null || true
+		PARAMS="$dbnm --no-global-lrl"
+		CMD="source ${TESTDIR}/replicant_vars ; ${COMDB2_EXE} ${PARAMS} --lrl ${DBDIR}/${dbnm}.lrl --pidfile ${TMPDIR}/${dbnm}.pid"
+		ssh -n -o StrictHostKeyChecking=no -tt "$replica" "$CMD" \
+			>>"${TESTDIR}/logs/${dbnm}.${replica}.db" 2>&1 &
+		echo $! >"${TMPDIR}/${dbnm}.${replica}.pid"
+		waitmach "$replica" || true
+		current_running=1
+	fi
+}
+trap restore_current EXIT
+
+seed_table "$master" "$N"
+
+# Replace one current replica with a real pre-feature process.
+cdb2sql ${CDB2_OPTIONS} --host "$replica" "$dbnm" \
+	"exec procedure sys.cmd.send('exit')" >/dev/null 2>&1 || true
+kill -9 "$(cat "${TMPDIR}/${dbnm}.${replica}.pid" 2>/dev/null)" 2>/dev/null || true
+PARAMS="$dbnm --no-global-lrl"
+CMD="source ${TESTDIR}/replicant_vars ; ${old_binary} ${PARAMS} --lrl ${DBDIR}/${dbnm}.lrl --pidfile ${TMPDIR}/${dbnm}.pid"
+ssh -n -o StrictHostKeyChecking=no -tt "$replica" "$CMD" \
+	>>"${TESTDIR}/logs/${dbnm}.${replica}.old.db" 2>&1 &
+echo $! >"${TMPDIR}/${dbnm}.${replica}.pid"
+current_running=0
+waitmach "$replica"
+# A pre-feature heartbeat has no capability trailer.  Wait beyond the master's
+# freshness window as well, so a cached advertisement from the replaced process
+# cannot leave the writer gate open.
+sleep 12
+
+emitted0=$(metric "SC flags emitted (master)")
+skipped0=$(metric "SC commit-map entries skipped")
+sql_node "$master" "rebuild t" >/dev/null || fail "gated rebuild failed"
+emitted1=$(metric "SC flags emitted (master)")
+skipped1=$(metric "SC commit-map entries skipped")
+(( emitted1 == emitted0 && skipped1 == skipped0 )) ||
+	fail "writer emitted to real old replica: emitted=$((emitted1-emitted0)) skipped=$((skipped1-skipped0))"
+
+restore_current
+sleep 3
+sql_node "$master" "rebuild t" >/dev/null || fail "capable rebuild failed"
+emitted2=$(metric "SC flags emitted (master)")
+skipped2=$(metric "SC commit-map entries skipped")
+(( emitted2 - emitted1 >= N && skipped2 - skipped1 >= N )) ||
+	fail "writer did not resume after upgrading replica"
+
+echo "SC_OLD_REPLICA: node=$replica gated=0 enabled_emitted=$((emitted2-emitted1)) enabled_skipped=$((skipped2-skipped1))"
+echo "Passed test"

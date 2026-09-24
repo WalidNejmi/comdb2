@@ -181,6 +181,9 @@ fi
 # path the writer can reach but the reader cannot.
 # ---------------------------------------------------------------------------
 if [[ -n "${CLUSTER}" ]]; then
+	require_serial=0
+	[[ "${TESTCASE:-}" == *serial* ]] && require_serial=1
+	serial_nodes=0
 	node_val() {
 		cdb2sql ${CDB2_OPTIONS} --host "$1" "$dbnm" \
 			"exec procedure sys.cmd.send('bdb clminfo')" \
@@ -204,6 +207,15 @@ if [[ -n "${CLUSTER}" ]]; then
 		# rather than guessing which is configured.
 		r_dec=$(( s_dec + c_dec ))
 		r_skip=$(( s_skip + c_skip ))
+		if (( require_serial )); then
+			if (( s_dec < d_emitted || s_skip != s_dec || c_dec != 0 || c_skip != 0 )); then
+				echo "DISAGREE: $n did not use the required serial apply path" \
+					"(serial $s_dec/$s_skip concurrent $c_dec/$c_skip)"
+				agree=0
+			else
+				(( serial_nodes++ ))
+			fi
+		fi
 
 		echo "SC_COMMIT_MAP_FLAGS_OBSERVE_REPLICA: node=$n decoded=$r_dec" \
 			"would_skip=$r_skip (serial $s_dec/$s_skip," \
@@ -224,6 +236,9 @@ if [[ -n "${CLUSTER}" ]]; then
 	if (( agree == 0 )); then
 		fail "consumers do not agree on the durable decision; the flag must" \
 			"not be honoured until they do (plan Gate 3)"
+	fi
+	if (( require_serial && serial_nodes == 0 )); then
+		fail "serial replica variant observed no serial apply consumers"
 	fi
 
 	# -----------------------------------------------------------------

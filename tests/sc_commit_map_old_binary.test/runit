@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+set -o pipefail
+
+dbnm=$1
+N=${SC_OLD_BINARY_ROWS:-2000}
+old_binary=${SC_OLD_COMDB2_EXE:-}
+
+if [[ -n "${CLUSTER:-}" ]]; then
+	echo "Test requires a disposable single-node database; skipping cluster"
+	echo "Passed test"
+	exit 0
+fi
+if [[ -z "$old_binary" || ! -x "$old_binary" ]]; then
+	if [[ "${SC_REQUIRE_OLD_BINARY:-0}" == 1 ]]; then
+		echo "FAIL: SC_OLD_COMDB2_EXE must name an executable pre-feature binary"
+		exit 1
+	fi
+	echo "Skipped test: set SC_OLD_COMDB2_EXE to a pre-feature comdb2 binary"
+	echo "Passed test"
+	exit 0
+fi
+
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+counter() {
+	cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" \
+		"exec procedure sys.cmd.send('bdb clminfo')" 2>/dev/null |
+		sed -n "s/.*$1: \([0-9][0-9]*\).*/\1/p" | head -1
+}
+
+current_stopped=0
+current_started=0
+rebuild_pid=
+restore_current() {
+	[[ -n "$rebuild_pid" ]] && wait "$rebuild_pid" 2>/dev/null || true
+	if [[ -f "${TMPDIR}/${dbnm}.old.pid" ]]; then
+		kill -9 "$(cat "${TMPDIR}/${dbnm}.old.pid")" 2>/dev/null || true
+		rm -f "${TMPDIR}/${dbnm}.old.pid"
+	fi
+	if (( current_stopped && !current_started )); then
+		start_all_nodes
+		wait_up || true
+		current_started=1
+	fi
+}
+trap restore_current EXIT
+
+run "exec procedure sys.cmd.send('sync log-delete off 60')" >/dev/null
+run "create table t(i int)"
+run "insert into t select value from generate_series(1, $N)"
+emitted_before=$(counter "SC flags emitted (master)")
+run "put tunable 'sc_pause_at_end' 1"
+run "rebuild t" >/dev/null 2>&1 &
+rebuild_pid=$!
+paused=0
+for _ in $(seq 1 1200); do
+	value=$(run "select value from comdb2_tunables where name='sc_is_at_end'" 2>/dev/null)
+	if [[ "$value" == "ON" || "$value" == "1" ]]; then
+		paused=1
+		break
+	fi
+	kill -0 "$rebuild_pid" 2>/dev/null || break
+	sleep 0.25
+done
+(( paused == 1 )) || { echo "FAIL: converter did not pause before finalization"; exit 1; }
+emitted_after=$(counter "SC flags emitted (master)")
+(( emitted_after - emitted_before >= N )) || {
+	echo "FAIL: new binary emitted only $((emitted_after-emitted_before)) flag records"
+	exit 1
+}
+
+# Force recovery through retained flag records. This database is disposable.
+stop_all_nodes
+current_stopped=1
+wait "$rebuild_pid" 2>/dev/null || true
+rebuild_pid=
+old_log=${TESTDIR}/logs/${dbnm}.old-binary.db
+old_pidfile=${TMPDIR}/${dbnm}.old.pid
+set +e
+timeout --kill-after=5s 45s "$old_binary" "$dbnm" --no-global-lrl \
+	--lrl "$DBDIR/${dbnm}.lrl" --pidfile "$old_pidfile" >"$old_log" 2>&1
+old_rc=$?
+set -e
+
+if (( old_rc == 0 || old_rc == 124 )); then
+	echo "FAIL: old binary did not reject flag-bearing WAL (rc=$old_rc)"
+	exit 1
+fi
+grep -Eq 'Illegal record type (153|154|155)|unsupported.*record|unknown.*record' \
+	"$old_log" || {
+	echo "FAIL: old binary exited without an explicit unknown-record error"
+	tail -80 "$old_log"
+	exit 1
+}
+
+restore_current
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: new binary did not restart"; exit 1; }
+[[ "$(run 'select count(*) from t')" == "$N" ]] || {
+	echo "FAIL: current binary could not recover the database after old-binary rejection"
+	exit 1
+}
+
+echo "SC_OLD_BINARY: rows=$N emitted=$((emitted_after-emitted_before)) old_rc=$old_rc"
+echo "Passed test"
