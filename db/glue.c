@@ -3461,7 +3461,7 @@ static void net_forgetmenot(void *hndl, void *uptr, char *fromnode,
  * perform trigger_reg_to_cpu() later, so we only read the network-order
  * spname_len into a temporary and must not byteswap the packet here.
  */
-static int valid_trigger_reg_payload(const void *dtap, int dtalen)
+static int valid_trigger_reg_current(const void *dtap, int dtalen)
 {
     const size_t name_off = offsetof(trigger_reg_t, spname);
     const size_t len_off = offsetof(trigger_reg_t, spname_len);
@@ -3544,6 +3544,52 @@ static int valid_trigger_reg_payload(const void *dtap, int dtalen)
         return 0;
 
     return 1;
+}
+
+/*
+ * R6 peers send the older layout, which has no spname_len and no hostname:
+ *
+ *   {int node; int elect_cookie; genid_t trigger_cookie; char spname[];}
+ *
+ * so the name starts where spname_len is in the current layout. The installed
+ * receiver (r6_compat's trigger_recv_nodenum) converts it to the current form
+ * using strlen/strcpy, so the name must be NUL-terminated within dtalen and
+ * shorter than MAX_SPNAME before it gets there.
+ */
+static int valid_trigger_reg_r6(const void *dtap, int dtalen)
+{
+    const size_t name_off = offsetof(trigger_reg_t, spname_len);
+
+    if ((size_t)dtalen <= name_off)
+        return 0;
+
+    const char *spname = (const char *)dtap + name_off;
+    const char *nul = memchr(spname, '\0', (size_t)dtalen - name_off);
+
+    if (nul == NULL || nul == spname || (size_t)(nul - spname) >= MAX_SPNAME)
+        return 0;
+
+    return 1;
+}
+
+/*
+ * Pick the layout the same way the receiver will parse it: the receiver that
+ * understands R6 treats a nonzero node as the R6 layout, and the default
+ * receiver always parses the current layout. Validating by any other rule
+ * would let a packet pass as one layout and be parsed as the other.
+ */
+static int valid_trigger_reg_payload(const void *dtap, int dtalen)
+{
+    if (dtap == NULL || dtalen < 0 || (size_t)dtalen < sizeof(int))
+        return 0;
+
+    int node;
+    memcpy(&node, dtap, sizeof(node));
+
+    if (node != 0 && trigger_recv_accepts_r6())
+        return valid_trigger_reg_r6(dtap, dtalen);
+
+    return valid_trigger_reg_current(dtap, dtalen);
 }
 
 static void net_trigger_register(void *hndl, void *uptr, char *fromnode,
