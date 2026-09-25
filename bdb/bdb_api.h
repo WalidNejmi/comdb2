@@ -2540,4 +2540,16 @@ typedef int (*collect_unused_files_f)(void *args, int lognum, char *filename);
 
 void oldfile_hash_collect(collect_unused_files_f func, void *arg);
 void bdb_tran_set_is_sc_rebuild(tran_type *tran, int is_sc_rebuild);
+void bdb_schema_change_checkpoint_lock(bdb_state_type *bdb_state);
+void bdb_schema_change_checkpoint_unlock(bdb_state_type *bdb_state);
+int bdb_schema_change_checkpoint(bdb_state_type *bdb_state,
+                                 unsigned int minimum_file,
+                                 unsigned int minimum_offset,
+                                 unsigned int *barrier_file,
+                                 unsigned int *barrier_offset,
+                                 unsigned int *floor_file,
+                                 unsigned int *floor_offset,
+                                 int *bdberr);
+int bdb_get_log_end_lsn(bdb_state_type *bdb_state, unsigned int *file,
+                        unsigned int *offset);
 #endif

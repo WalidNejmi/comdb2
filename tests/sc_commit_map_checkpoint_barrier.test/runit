@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+set -o pipefail
+
+dbnm=$1
+N=${SC_COMMIT_MAP_ROWS:-10000}
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+fail() { echo "FAIL: $*"; exit 1; }
+
+run "create table t(i int)" >/dev/null
+run "insert into t select value from generate_series(1, $N)" >/dev/null
+run "create table blocker(i int)" >/dev/null
+
+cdb2sql ${CDB2_OPTIONS} --host "$master" "$dbnm" - >/dev/null 2>&1 <<'EOF' &
+begin
+insert into blocker values(1)
+select sleep(5)
+commit
+EOF
+reader_pid=$!
+sleep 1
+start=$SECONDS
+run "rebuild t" >/dev/null || fail "rebuild failed"
+elapsed=$((SECONDS - start))
+wait "$reader_pid" || fail "concurrent reader failed"
+
+(( elapsed >= 3 )) ||
+	fail "schema-change barrier did not wait for concurrent reader ($elapsed seconds)"
+grep -q "checkpoint floor .* covers conversion" "$TESTDIR/logs/$dbnm.db" ||
+	fail "rebuild did not establish a verified checkpoint"
+[[ "$(run 'select count(*) from t')" == "$N" ]] ||
+	fail "rebuild changed table contents"
+
+echo "SC_COMMIT_MAP_CHECKPOINT_BARRIER: rows=$N wait_seconds=$elapsed"
+echo "Passed test"

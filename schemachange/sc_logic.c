@@ -363,7 +363,34 @@ static int do_finalize(ddl_t func, struct ireq *iq,
     if (s->db)
         sc_nrecs = s->db->sc_nrecs; // take a copy, func will clear to 0
 
+    if (s->sc_commit_map_checkpoint)
+        bdb_schema_change_checkpoint_lock(thedb->bdb_env);
+
     rc = func(iq, s, tran);
+
+    if (rc == 0 && s->sc_commit_map_checkpoint) {
+        unsigned int barrier_file, barrier_offset;
+        unsigned int floor_file, floor_offset;
+
+        if (bdb_schema_change_checkpoint(
+                thedb->bdb_env, s->sc_commit_map_checkpoint_file,
+                s->sc_commit_map_checkpoint_offset, &barrier_file,
+                &barrier_offset, &floor_file, &floor_offset, &bdberr) != 0) {
+            sc_errf(s, "Failed to establish schema-change checkpoint\n");
+            rc = -1;
+        } else {
+            logmsg(LOGMSG_INFO,
+                   "%s: checkpoint floor %u:%u covers conversion %u:%u "
+                   "after barrier %u:%u\n",
+                   __func__, floor_file, floor_offset,
+                   s->sc_commit_map_checkpoint_file,
+                   s->sc_commit_map_checkpoint_offset, barrier_file,
+                   barrier_offset);
+        }
+    }
+
+    if (s->sc_commit_map_checkpoint)
+        bdb_schema_change_checkpoint_unlock(thedb->bdb_env);
 
     if (rc) {
         if (input_tran == NULL)
@@ -696,6 +723,7 @@ static int do_schema_change_tran_int(sc_arg_t *arg)
     }
 
     s->iq = iq;
+    s->sc_commit_map_checkpoint = 0;
 
     if (s->kind == SC_ALTERTABLE_PENDING || s->preempted == SC_ACTION_RESUME)
         detached = 1;

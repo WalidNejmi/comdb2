@@ -1402,12 +1402,14 @@ static void stop_sc_redo_wait(bdb_state_type *bdb_state,
 
 int gbl_sc_pause_at_end = 0;
 int gbl_sc_is_at_end = 0;
+extern int gbl_sc_commit_map_skip;
 
 int convert_all_records(struct dbtable *from, struct dbtable *to,
                         unsigned long long *sc_genids,
                         struct schema_change_type *s)
 {
     struct convert_record_data data = {0};
+    int checkpoint_commit_map, skip_commit_map;
     int ii;
     s->sc_thd_failed = 0;
 
@@ -1437,7 +1439,10 @@ int convert_all_records(struct dbtable *from, struct dbtable *to,
     /* set up internal rebuild request */
     init_fake_ireq(thedb, &data.iq);
     data.iq.usedb = data.from;
-    data.iq.opcode = OP_REBUILD;
+    skip_commit_map = gbl_sc_commit_map_skip;
+    checkpoint_commit_map = skip_commit_map || s->resume;
+    s->sc_commit_map_checkpoint = checkpoint_commit_map;
+    data.iq.opcode = skip_commit_map ? OP_REBUILD : 0;
     data.iq.debug = 0; /*gbl_who;*/
 
     /* For first cut, read all blobs.  Later we can optimise by only reading
@@ -1695,6 +1700,15 @@ int convert_all_records(struct dbtable *from, struct dbtable *to,
     /* wait for logical redo thread */
     while (s->logical_livesc && !s->hitLastCnt) {
         poll(NULL, 0, 200);
+    }
+
+    if (outrc == 0 && checkpoint_commit_map) {
+        if (bdb_get_log_end_lsn(from->handle,
+                                &s->sc_commit_map_checkpoint_file,
+                                &s->sc_commit_map_checkpoint_offset) != 0) {
+            sc_errf(s, "Failed to read schema-change conversion LSN\n");
+            outrc = -1;
+        }
     }
 
     return outrc;

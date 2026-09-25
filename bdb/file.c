@@ -1680,6 +1680,80 @@ int bdb_flush_noforce(bdb_state_type *bdb_state, int *bdberr)
     return rc;
 }
 
+void bdb_schema_change_checkpoint_lock(bdb_state_type *bdb_state)
+{
+    BDB_WRITELOCK(__func__);
+}
+
+void bdb_schema_change_checkpoint_unlock(bdb_state_type *bdb_state)
+{
+    BDB_RELLOCK();
+}
+
+int bdb_schema_change_checkpoint(bdb_state_type *bdb_state,
+                                 unsigned int minimum_file,
+                                 unsigned int minimum_offset,
+                                 unsigned int *barrier_file,
+                                 unsigned int *barrier_offset,
+                                 unsigned int *floor_file,
+                                 unsigned int *floor_offset,
+                                 int *bdberr)
+{
+    DB_LSN barrier;
+    DB_LSN minimum = {minimum_file, minimum_offset};
+    DB_TXN_STAT *stats = NULL;
+    int rc;
+
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+
+    *bdberr = BDBERR_NOERROR;
+    __log_txn_lsn(bdb_state->dbenv, &barrier, NULL, NULL);
+
+    rc = ll_checkpoint(bdb_state, 1);
+    if (rc == 0)
+        rc = bdb_state->dbenv->txn_stat(bdb_state->dbenv, &stats, 0);
+    if (rc != 0 || stats == NULL ||
+        log_compare(&stats->st_ckp_lsn, &minimum) < 0) {
+        logmsg(LOGMSG_ERROR,
+               "%s: rc %d minimum %u:%u barrier %u:%u checkpoint %u:%u "
+               "floor %u:%u\n",
+               __func__, rc, minimum.file, minimum.offset, barrier.file,
+               barrier.offset,
+               stats ? stats->st_last_ckp.file : 0,
+               stats ? stats->st_last_ckp.offset : 0,
+               stats ? stats->st_ckp_lsn.file : 0,
+               stats ? stats->st_ckp_lsn.offset : 0);
+        free(stats);
+        *bdberr = BDBERR_MISC;
+        return -1;
+    }
+
+    if (barrier_file)
+        *barrier_file = barrier.file;
+    if (barrier_offset)
+        *barrier_offset = barrier.offset;
+    if (floor_file)
+        *floor_file = stats->st_ckp_lsn.file;
+    if (floor_offset)
+        *floor_offset = stats->st_ckp_lsn.offset;
+    free(stats);
+    return 0;
+}
+
+int bdb_get_log_end_lsn(bdb_state_type *bdb_state, unsigned int *file,
+                        unsigned int *offset)
+{
+    DB_LSN lsn;
+
+    if (bdb_state->parent)
+        bdb_state = bdb_state->parent;
+    __log_txn_lsn(bdb_state->dbenv, &lsn, NULL, NULL);
+    *file = lsn.file;
+    *offset = lsn.offset;
+    return 0;
+}
+
 static int bdb_lock_children_lock(bdb_state_type *bdb_state)
 {
     if (bdb_state->parent)
@@ -5813,7 +5887,23 @@ static bdb_state_type *bdb_open_int(int envonly, const char name[], const char d
         bdb_state->callback = bdb_callback;
 
         bdb_state->bdb_lock = mymalloc(sizeof(pthread_rwlock_t));
-        Pthread_rwlock_init(bdb_state->bdb_lock, NULL);
+        pthread_rwlockattr_t attr;
+        int attr_rc = pthread_rwlockattr_init(&attr);
+        if (attr_rc == 0)
+            attr_rc = pthread_rwlockattr_setkind_np(
+                &attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+        if (attr_rc != 0) {
+            logmsg(LOGMSG_FATAL, "failed to initialize bdb lock attributes: %s\n",
+                   strerror(attr_rc));
+            abort();
+        }
+        Pthread_rwlock_init(bdb_state->bdb_lock, &attr);
+        attr_rc = pthread_rwlockattr_destroy(&attr);
+        if (attr_rc != 0) {
+            logmsg(LOGMSG_FATAL, "failed to destroy bdb lock attributes: %s\n",
+                   strerror(attr_rc));
+            abort();
+        }
         Pthread_mutex_init(&(bdb_state->children_lock), NULL);
         bdb_state->have_children_lock = 0;
 
