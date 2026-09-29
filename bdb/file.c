@@ -8683,9 +8683,13 @@ retry:
     }
     if (!retry) {
         for (int i = 0; i < tablecount; i++) {
-            if (bdb_state->children[i])
+            if (bdb_state->children[i]) {
                 bdb_state->children[i]->version_num =
                     cache->entries[i];
+                if (bdb_state->children[i]->origname != NULL &&
+                    strcasecmp(bdb_state->children[i]->name, bdb_state->children[i]->origname) != 0)
+                    cache->entries[i] = 0;
+            }
         }
     }
     bdb_unlock_children_lock(bdb_state);

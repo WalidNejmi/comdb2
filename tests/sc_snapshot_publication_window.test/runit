@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+set -o pipefail
+
+dbnm=$1
+N=${SC_PUBLICATION_ROWS:-1000}
+master=$(getmaster)
+[[ -n "$master" ]] || { echo "FAIL: could not find master"; exit 1; }
+
+run() { cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" "$1"; }
+send() { run "exec procedure sys.cmd.send('$1')" >/dev/null; }
+fail() { echo "FAIL: $*"; exit 1; }
+
+snapshot_pid=
+sc_pid=
+fifos=()
+outputs=()
+cleanup()
+{
+	send "sc_pause_at_end 0" >/dev/null 2>&1 || true
+	[[ -n "$snapshot_pid" ]] && kill "$snapshot_pid" >/dev/null 2>&1 || true
+	[[ -n "$sc_pid" ]] && kill "$sc_pid" >/dev/null 2>&1 || true
+	rm -f "${fifos[@]}" "${outputs[@]}"
+}
+trap cleanup EXIT
+
+# Start a snapshot after conversion creates F2 but before F2 is published. The
+# second read must fail closed instead of accepting the unpublished generation.
+run_case()
+{
+	local table=$1 kind=$2
+	local fifo=/tmp/sc_snapshot_publication_${table}_fifo.$$
+	local out=/tmp/sc_snapshot_publication_${table}_out.$$
+	local fresh=/tmp/sc_snapshot_publication_${table}_fresh.$$
+	local value ddl
+
+	if [[ "$kind" == "rebuild" ]]; then
+		ddl="rebuild $table"
+	else
+		ddl="alter table $table {schema{int i int j int k null=yes}}"
+	fi
+
+	fifos+=("$fifo")
+	outputs+=("$out" "$fresh")
+	send "sc_pause_at_end 1"
+	run "$ddl" >/dev/null 2>&1 &
+	sc_pid=$!
+	for _ in $(seq 1 600); do
+		value=$(run "select value from comdb2_tunables where name='sc_is_at_end'" 2>/dev/null || true)
+		[[ "$value" == "ON" || "$value" == "1" ]] && break
+		sleep 0.1
+	done
+	[[ "$value" == "ON" || "$value" == "1" ]] ||
+		fail "$table schema change never reached the publication pause"
+
+	mkfifo "$fifo"
+	cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" - <"$fifo" >"$out" 2>&1 &
+	snapshot_pid=$!
+	exec 9>"$fifo"
+	printf '%s\n' "set transaction snapshot isolation" "begin" \
+		"select count(*), sum(j) from $table" >&9
+	for _ in $(seq 1 100); do
+		grep -q "^${N}[[:space:]]${expected_sum}$" "$out" && break
+		sleep 0.1
+	done
+	grep -q "^${N}[[:space:]]${expected_sum}$" "$out" ||
+		fail "$table snapshot did not read F1 before publication"
+
+	send "sc_pause_at_end 0"
+	wait "$sc_pid" || fail "$table schema change failed"
+	sc_pid=
+	printf '%s\n' "select count(*), sum(j) from $table" "commit" >&9
+	exec 9>&-
+	wait "$snapshot_pid" || true
+	snapshot_pid=
+
+	grep -q "table \"$table\" was schema changed" "$out" || {
+		cat "$out"
+		fail "$table did not fail schema-changed after publication"
+	}
+	grep -q '^\[commit\] failed' "$out" || {
+		cat "$out"
+		fail "$table snapshot commit unexpectedly succeeded"
+	}
+
+	# A snapshot started after publication must cache F2 normally and see rows.
+	cdb2sql --tabs ${CDB2_OPTIONS} --host "$master" "$dbnm" - >"$fresh" 2>&1 <<EOF
+set transaction snapshot isolation
+begin
+select count(*), sum(j) from $table
+commit
+EOF
+	grep -q "^${N}[[:space:]]${expected_sum}$" "$fresh" || {
+		cat "$fresh"
+		fail "$table fresh post-publication snapshot was incorrect"
+	}
+
+	echo "SC_SNAPSHOT_PUBLICATION_WINDOW: table=$table kind=$kind"
+}
+
+for table in rebuild_t alter_t; do
+	run "create table $table(i int, j int)" >/dev/null
+	run "insert into $table select value, value from generate_series(1, $N)" >/dev/null
+done
+expected_sum=$(run "select sum(j) from rebuild_t")
+
+run_case rebuild_t rebuild
+run_case alter_t alter
+
+do_verify rebuild_t
+do_verify alter_t
+echo "Passed test"
