@@ -186,7 +186,6 @@ __db_panic(dbenv, errval)
 	DB_ENV *dbenv;
 	int errval;
 {
-    dbenv->log_flush(dbenv, NULL);
 	if (dbenv != NULL) {
 		PANIC_SET(dbenv, 1);
 

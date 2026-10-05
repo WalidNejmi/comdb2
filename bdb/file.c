@@ -2360,13 +2360,7 @@ static void panic_func(DB_ENV *dbenv, int errval)
 
     Pthread_mutex_lock(&(bdb_state->exit_lock));
 
-    pstack_self();
     logmsg(LOGMSG_FATAL, "PANIC: comdb2 shutting down error:%d\n", errval);
-
-    /* this code sometimes deadlocks.  install a timer - if it fires, we
-       abort.  We don't lose much since we are about to exit anyway. */
-    signal(SIGALRM, SIG_DFL);
-    alarm(15);
 
     /* Take a full diagnostic snapshot.  Disable the panic logic for this
      * to work. */
@@ -2374,11 +2368,15 @@ static void panic_func(DB_ENV *dbenv, int errval)
         char buf[100];
         int len = snprintf(buf, sizeof(buf), "f %s/panic_full_diag fulldiag", bdb_state->dir);
         logmsg(LOGMSG_FATAL, "PANIC: running bdb '%s' command to grab diagnostics\n", buf);
+        signal(SIGALRM, SIG_DFL);
+        alarm(15);
         dbenv->set_flags(dbenv, DB_NOPANIC, 1);
         bdb_process_user_command(bdb_state, buf, len, 0);
         dbenv->set_flags(dbenv, DB_NOPANIC, 0);
+        alarm(0);
     }
-    alarm(0);
+    fflush(stdout);
+    fflush(stderr);
     abort();
 }
 
