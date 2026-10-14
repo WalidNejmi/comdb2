@@ -623,6 +623,10 @@ void eventlog_add(const struct reqlogger *logger)
     populate_obj(obj, logger);
     int call_roll_cleanup = 0;
 
+    /* render the event before taking eventlog_lk; buf points into val */
+    cson_buffer buf;
+    cson_output_buffer(val, &buf);
+
     Pthread_mutex_lock(&eventlog_lk);
 
     if (eventlog != NULL && eventlog_enabled) {
@@ -631,7 +635,8 @@ void eventlog_add(const struct reqlogger *logger)
             call_roll_cleanup = 1;
         }
         add_to_fingerprints(logger);
-        cson_output(val, write_json, eventlog);
+        if (write_json(eventlog, buf.mem, buf.used) == 0)
+            write_json(eventlog, "\n", 1);
     }
     Pthread_mutex_unlock(&eventlog_lk);
 
