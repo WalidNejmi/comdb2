@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Every running statement gets a random (version 4) uuid, shown in
+# comdb2_connections and accepted by 'sql ucancel uuid'.
+
+dbnm=$1
+export CDB2_DISABLE_SOCKPOOL=1
+
+host=$(echo $CLUSTER | awk '{print $1}')
+if [[ -n "$host" ]]; then
+    hostflags="--host $host"
+else
+    hostflags=""
+fi
+r="${CDB2SQL_EXE} -s -tabs ${CDB2_OPTIONS} $dbnm default $hostflags"
+
+failexit() {
+    echo "Failed: $1"
+    exit 1
+}
+
+# Print the uuid of the running statement $1 once it shows up
+uuid_of() {
+    local u
+    for i in $(seq 1 50); do
+        u=$($r "select uuid from comdb2_connections where sql = '$1'")
+        [[ -n "$u" ]] && echo "$u" && return 0
+        sleep 0.2
+    done
+    failexit "statement '$1' never showed up in comdb2_connections"
+}
+
+v4='^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+
+$r "select sleep(30)" > /dev/null 2>&1 &
+first=$!
+$r "select sleep(31)" > /dev/null 2>&1 &
+second=$!
+
+u1=$(uuid_of "select sleep(30)") || exit 1
+u2=$(uuid_of "select sleep(31)") || exit 1
+[[ "$u1" =~ $v4 ]] || failexit "uuid '$u1' is not a version 4 uuid"
+[[ "$u2" =~ $v4 ]] || failexit "uuid '$u2' is not a version 4 uuid"
+[[ "$u1" != "$u2" ]] || failexit "two running statements share uuid $u1"
+again=$(uuid_of "select sleep(30)") || exit 1
+[[ "$again" == "$u1" ]] || failexit "uuid changed while the statement ran: $u1 -> $again"
+
+# Cancel the first statement by its uuid; the second one keeps running
+$r "exec procedure sys.cmd.send('sql ucancel uuid $u1')" > /dev/null
+start=$SECONDS
+wait $first && failexit "cancelled statement succeeded"
+(( SECONDS - start < 15 )) || failexit "cancel took $((SECONDS - start))s"
+[[ $($r "select count(*) from comdb2_connections where sql = 'select sleep(31)'") == 1 ]] ||
+    failexit "the other statement stopped too"
+
+$r "exec procedure sys.cmd.send('sql ucancel uuid $u2')" > /dev/null
+wait $second
+echo "Success"

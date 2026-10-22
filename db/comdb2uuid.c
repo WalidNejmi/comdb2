@@ -15,8 +15,26 @@
  */
 
 #include "comdb2uuid.h"
+#ifdef __linux__
+#include <sys/random.h>
+#endif
 
-void comdb2uuid(uuid_t u) { uuid_generate(u); }
+/*
+ * Random (version 4) uuid, the same kind uuid_generate() returns. libuuid
+ * opens, reads and closes /dev/urandom and reseeds rand() on every call;
+ * one getrandom() call gives the same bytes much more cheaply.
+ */
+void comdb2uuid(uuid_t u)
+{
+#ifdef __linux__
+    if (getrandom(u, sizeof(uuid_t), 0) == sizeof(uuid_t)) {
+        u[6] = (u[6] & 0x0f) | 0x40; /* version 4 */
+        u[8] = (u[8] & 0x3f) | 0x80; /* RFC 4122 variant */
+        return;
+    }
+#endif
+    uuid_generate(u);
+}
 
 char *comdb2uuidstr(uuid_t u, char out[37]);
 inline char *comdb2uuidstr(uuid_t u, char out[37])
