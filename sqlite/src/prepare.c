@@ -24,6 +24,8 @@ void comdb2SetWriteFlag(int);
 
 #include "cdb2_constants.h"
 #include <logmsg.h>
+#include "comdb2_atomic.h"
+extern int64_t gbl_sql_reprepares;
 #endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
 
 /*
@@ -932,6 +934,9 @@ int sqlite3Reprepare(Vdbe *p){
   assert( sqlite3_mutex_held(sqlite3VdbeDb(p)->mutex) );
   zSql = sqlite3_sql((sqlite3_stmt *)p);
   assert( zSql!=0 );  /* Reprepare only called for prepare_v2() statements */
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+  ATOMIC_ADD64(gbl_sql_reprepares, 1);
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
   db = sqlite3VdbeDb(p);
   assert( sqlite3_mutex_held(db->mutex) );
   prepFlags = sqlite3VdbePrepareFlags(p);

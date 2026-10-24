@@ -1624,6 +1624,7 @@ extern int gbl_max_sc_lists;
 
 extern int64_t gbl_num_auth_allowed;
 extern int64_t gbl_num_auth_denied;
+extern int64_t gbl_sql_reprepares;
 
 extern const char *const gbl_db_git_version_sha;
 extern const char gbl_db_version[];

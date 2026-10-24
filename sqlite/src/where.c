@@ -2276,6 +2276,36 @@ static int whereLoopInsert(WhereLoopBuilder *pBuilder, WhereLoop *pTemplate){
   return rc;
 }
 
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+/*
+** Return true if column iCol of the table open on cursor iCur can hold each
+** value at most once: the rowid, the INTEGER PRIMARY KEY, or the only column
+** of a unique index that is not partial.
+*/
+static int whereColumnIsUnique(SrcList *pTabList, int iCur, int iCol){
+  int i;
+  for(i=0; i<pTabList->nSrc; i++){
+    struct SrcList_item *pItem = &pTabList->a[i];
+    Table *pTab = pItem->pTab;
+    Index *pIdx;
+    if( pItem->iCursor!=iCur ) continue;
+    if( pTab==0 ) return 0;
+    if( iCol==XN_ROWID ) return 1;
+    if( iCol<0 ) return 0;
+    if( iCol==pTab->iPKey ) return 1;
+    for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+      if( pIdx->nKeyCol!=1 || pIdx->aiColumn[0]!=iCol ) continue;
+      if( pIdx->pPartIdxWhere ) continue;
+      if( IsUniqueIndex(pIdx) || is_comdb2_index_unique(pTab->zName, pIdx->zName) ){
+        return 1;
+      }
+    }
+    return 0;
+  }
+  return 0;
+}
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
+
 /*
 ** Adjust the WhereLoop.nOut value downward to account for terms of the
 ** WHERE clause that reference the loop but which are not used by an
@@ -2339,8 +2369,19 @@ static void whereLoopOutputAdjust(
           Expr *pRight = pTerm->pExpr->pRight;
           Parse *pParse = pWC->pWInfo->pParse;
           int k = 0;
+          int bUnique = 0;
           testcase( pTerm->pExpr->op==TK_IS );
-          if( sqlite3ExprIsInteger(pRight, &k, pParse) && k>=(-1) && k<=1 ){
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+          /* A unique column cannot be the boolean or common-default column
+          ** that the -1/0/1 case below guards against, so skip it. This
+          ** also keeps sqlite3ExprIsInteger() from peeking at a bound value,
+          ** which would mark the statement as depending on that binding and
+          ** force a full re-prepare every time a new value is bound. */
+          bUnique = whereColumnIsUnique(pWC->pWInfo->pTabList,
+                                        pTerm->leftCursor, pTerm->u.leftColumn);
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
+          if( !bUnique && sqlite3ExprIsInteger(pRight, &k, pParse)
+           && k>=(-1) && k<=1 ){
             k = 10;
           }else{
             k = 20;
@@ -2700,8 +2741,20 @@ static int whereLoopAddBtreeIndex(
       }else{
 #ifdef SQLITE_ENABLE_STAT3_OR_STAT4
         tRowcnt nOut = 0;
-        if( nInMul==0 
-         && pProbe->nSample 
+        int bUniqueEq = 0;
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+        /* "=" on every column of a unique index matches at most one row
+        ** whatever the value, so the samples cannot improve the estimate.
+        ** Probing them with a bound value would also mark the statement as
+        ** depending on that binding, forcing a full re-prepare every time
+        ** a new value is bound. */
+        bUniqueEq = eOp==WO_EQ && nEq==pProbe->nKeyCol
+            && (IsUniqueIndex(pProbe)
+                || is_comdb2_index_unique(pSrc->pTab->zName, pProbe->zName));
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
+        if( nInMul==0
+         && !bUniqueEq
+         && pProbe->nSample
          && pNew->u.btree.nEq<=pProbe->nSampleCol
          && ((eOp & WO_IN)==0 || !ExprHasProperty(pTerm->pExpr, EP_xIsSelect))
          && OptimizationEnabled(db, SQLITE_Stat34)

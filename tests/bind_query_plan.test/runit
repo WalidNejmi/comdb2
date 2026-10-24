@@ -48,4 +48,44 @@ if ! diff plan_bound.txt plan_literal.txt > /dev/null; then
     exit 1
 fi
 
+# Unique columns: the planner must not depend on a value bound to a unique
+# column, or every new binding would force a full re-prepare.
+cdb2sql ${CDB2_OPTIONS} $dbnm default "CREATE TABLE t3(id INT PRIMARY KEY, u INT UNIQUE, v INT)"
+cdb2sql ${CDB2_OPTIONS} $dbnm default "WITH s(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM s WHERE i<99) INSERT INTO t3 SELECT i, i, i%3 FROM s"
+cdb2sql ${CDB2_OPTIONS} $dbnm default "ANALYZE t3"
+
+# Bound and literal values must still give the same plan, including the
+# -1/0/1 values that get special treatment on non-unique columns.
+for col in id u; do
+    for val in -1 0 1 5; do
+        echo "@bind CDB2_INTEGER val $val
+explain query plan SELECT * FROM t3 WHERE $col = @val" | cdb2sql ${CDB2_OPTIONS} $dbnm default - | grep "detail=" | sed "s/id=[0-9]*/id=N/" > plan_bound.txt
+        cdb2sql ${CDB2_OPTIONS} $dbnm default "explain query plan SELECT * FROM t3 WHERE $col = $val" | grep "detail=" | sed "s/id=[0-9]*/id=N/" > plan_literal.txt
+        if ! diff plan_bound.txt plan_literal.txt > /dev/null; then
+            echo "FAIL: $col = $val: bound parameter produces different query plan than literal"
+            diff plan_bound.txt plan_literal.txt
+            exit 1
+        fi
+    done
+done
+
+# Re-binding a value on a unique column must not re-prepare the statement.
+# Metrics are per node, so run the queries and read the metric on one host.
+host=$(cdb2sql --tabs ${CDB2_OPTIONS} $dbnm default 'select comdb2_host()')
+reprepares() {
+    cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $host "select value from comdb2_metrics where name = 'sql_reprepares'"
+}
+for col in id u; do
+    before=$(reprepares)
+    for i in $(seq 1 50); do
+        echo "@bind CDB2_INTEGER val $((i % 4 - 1))"
+        echo "SELECT v FROM t3 WHERE $col = @val"
+    done | cdb2sql ${CDB2_OPTIONS} $dbnm --host $host - > /dev/null
+    after=$(reprepares)
+    if [[ $after -ne $before ]]; then
+        echo "FAIL: $((after - before)) re-prepares for 50 bound lookups on unique column $col"
+        exit 1
+    fi
+done
+
 echo "Success!"

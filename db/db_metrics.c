@@ -105,6 +105,7 @@ struct comdb2_metrics_store {
     int64_t minimum_truncation_offset;
     int64_t minimum_truncation_timestamp;
     int64_t reprepares;
+    int64_t sql_reprepares;
     int64_t nonsql;
     int64_t vreplays;
     int64_t nsslfullhandshakes;
@@ -318,6 +319,10 @@ comdb2_metric gbl_metrics[] = {
 #endif
     {"reprepares", "Number of times statements are reprepared by sqlitex", STATISTIC_INTEGER,
      STATISTIC_COLLECTION_TYPE_CUMULATIVE, &stats.reprepares, NULL},
+    {"sql_reprepares",
+     "Number of times the SQL engine recompiled a prepared statement (after a schema change, or because a new "
+     "binding could change its plan)",
+     STATISTIC_INTEGER, STATISTIC_COLLECTION_TYPE_CUMULATIVE, &stats.sql_reprepares, NULL},
     {"verify_replays", "Number of replays on verify errors", STATISTIC_INTEGER, STATISTIC_COLLECTION_TYPE_CUMULATIVE,
      &stats.vreplays, NULL},
     {"nsslfullhandshakes", "Number of SSL full handshakes", STATISTIC_INTEGER, STATISTIC_COLLECTION_TYPE_CUMULATIVE,
@@ -833,6 +838,7 @@ int refresh_metrics(void)
     stats.nsslpartialhandshakes = gbl_ssl_num_partial_handshakes;
     stats.auth_allowed = gbl_num_auth_allowed;
     stats.auth_denied = gbl_num_auth_denied;
+    stats.sql_reprepares = gbl_sql_reprepares;
     stats.legacy_requests = gbl_legacy_requests;
     curtran_puttran(trans);
 
