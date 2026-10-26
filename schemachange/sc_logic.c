@@ -1927,6 +1927,16 @@ int scdone_abort_cleanup(struct ireq *iq)
             cleanup_newdb(newdb);
         }
     } else if (s->db && s->db->handle) {
+        /* An alter or truncate whose do_ddl part succeeded still owns its new
+         * btrees: the transaction aborted because another schema change in it
+         * failed.  Remove them like a failed alter or truncate does itself. */
+        struct dbtable *newdb = s->newdb;
+        if (s->sc_rc == SC_OK && !s->already_finalized && !s->newdb_borrowed && newdb && newdb != s->db &&
+            newdb->handle) {
+            delete_temp_table(iq, newdb);
+            cleanup_newdb(newdb);
+            s->newdb = NULL;
+        }
         tran_type *lock_trans = NULL;
         if ((rc = trans_start(iq, NULL, &lock_trans)) == 0) {
             dbtable *db = NULL;
