@@ -114,6 +114,7 @@ static int apply_changes(struct ireq *iq, blocksql_tran_t *tran, void *iq_tran,
 static int req2blockop(int reqtype);
 extern const char *get_tablename_from_rpl(int is_uuid, const char *rpl,
                                           int rpllen, int *tableversion);
+int osql_insert_has_upsert_flags(int is_uuid, const uint8_t *rpl, int rpllen);
 
 void get_dist_txnid_from_dist_txn_rpl(int is_uuid, char *rpl, int rplen, char **dist_txnid, int64_t *timestamp);
 void get_dist_txnid_from_prepare_rpl(int is_uuid, char *rpl, int rplen, char **dist_txnid, int64_t *timestamp);
@@ -427,6 +428,72 @@ void osql_bplog_close(blocksql_tran_t **ptran)
     free(tran);
 }
 
+/*
+ * An upsert picks between insert, update and doing nothing from the rows it
+ * finds when it is applied, so it has to see this transaction's other writes
+ * in the order the client issued them. Re-key the ops saved so far by their
+ * sequence number alone, which is how they are saved when reordering is off,
+ * and save the rest of the transaction that way too.
+ */
+static int disable_reorder(blocksql_tran_t *tran)
+{
+    struct temp_table *tbls[2] = {tran->db, tran->db_ins};
+    struct temp_table *seq_tbl;
+    int bdberr = 0;
+    int rc = 0;
+
+    seq_tbl = bdb_temp_array_create(thedb->bdb_env, &bdberr);
+    if (!seq_tbl || bdberr) {
+        logmsg(LOGMSG_ERROR, "%s: failed to create temp table bdberr=%d\n", __func__, bdberr);
+        return -1;
+    }
+    bdb_temp_table_set_cmp_func(seq_tbl, osql_bplog_key_cmp);
+
+    for (int i = 0; i < 2 && rc == 0; i++) {
+        if (!tbls[i])
+            continue;
+        struct temp_cursor *cur = bdb_temp_table_cursor(thedb->bdb_env, tbls[i], NULL, &bdberr);
+        if (!cur || bdberr) {
+            logmsg(LOGMSG_ERROR, "%s: failed to create cursor bdberr=%d\n", __func__, bdberr);
+            rc = -1;
+            break;
+        }
+        int r;
+        for (r = bdb_temp_table_first(thedb->bdb_env, cur, &bdberr); r == 0;
+             r = bdb_temp_table_next(thedb->bdb_env, cur, &bdberr)) {
+            oplog_key_t key = {0};
+            key.seq = ((oplog_key_t *)bdb_temp_table_key(cur))->seq;
+            rc = bdb_temp_table_put(thedb->bdb_env, seq_tbl, &key, sizeof(key), bdb_temp_table_data(cur),
+                                    bdb_temp_table_datasize(cur), NULL, &bdberr);
+            if (rc) {
+                logmsg(LOGMSG_ERROR, "%s: failed to copy op seq=%u rc=%d bdberr=%d\n", __func__, key.seq, rc,
+                       bdberr);
+                break;
+            }
+        }
+        /* anything but running off the end means ops were not copied */
+        if (rc == 0 && r != IX_EMPTY && r != IX_PASTEOF && r != IX_NOTFND) {
+            logmsg(LOGMSG_ERROR, "%s: failed to read ops rc=%d bdberr=%d\n", __func__, r, bdberr);
+            rc = -1;
+        }
+        bdb_temp_table_close_cursor(thedb->bdb_env, cur, &bdberr);
+    }
+
+    if (rc) {
+        bdb_temp_table_close(thedb->bdb_env, seq_tbl, &bdberr);
+        return rc;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        if (tbls[i])
+            bdb_temp_table_close(thedb->bdb_env, tbls[i], &bdberr);
+    }
+    tran->db = seq_tbl;
+    tran->db_ins = NULL;
+    tran->is_reorder_on = 0;
+    return 0;
+}
+
 static int setup_reorder_key(blocksql_tran_t *tran, int type, osql_sess_t *sess, unsigned long long rqid, char *rpl,
                              int rpllen, oplog_key_t *key)
 {
@@ -533,6 +600,20 @@ static int setup_reorder_key(blocksql_tran_t *tran, int type, osql_sess_t *sess,
         sess->tran_rows++;
         break;
     case OSQL_INSERT:
+        if (osql_insert_has_upsert_flags(tran->is_uuid, (const uint8_t *)rpl, rpllen)) {
+            int rc = disable_reorder(tran);
+            if (rc)
+                return rc;
+            sess->has_upsert = 1;
+            /* save this op as an unordered one too */
+            unsigned int seq = key->seq;
+            memset(key, 0, sizeof(*key));
+            key->seq = seq;
+            tran->last_is_ins = 0;
+            sess->tran_rows++;
+            return 0;
+        }
+        /* fall through */
     case OSQL_INSREC:
         tran->last_is_ins = 1;
         sess->tran_rows++;
@@ -687,7 +768,7 @@ int osql_bplog_saveop(osql_sess_t *sess, blocksql_tran_t *tran, char *rpl,
     /* add the op into the temporary table */
     Pthread_mutex_lock(&tran->store_mtx);
 
-    struct temp_table *tmptbl = tran->db;
+    struct temp_table *tmptbl;
     if (tran->is_reorder_on) {
         rc = setup_reorder_key(tran, type, sess, sess->rqid, rpl, rplen, &key);
         if (rc != 0) {
@@ -696,9 +777,11 @@ int osql_bplog_saveop(osql_sess_t *sess, blocksql_tran_t *tran, char *rpl,
                    osql_reqtype_str(type), tran->seq);
             return rc;
         }
-        if (tran->last_is_ins && tran->db_ins) { // insert into ins temp table
-            tmptbl = tran->db_ins;
-        }
+    }
+    /* after setup_reorder_key(), which can replace tran->db */
+    tmptbl = tran->db;
+    if (tran->is_reorder_on && tran->last_is_ins && tran->db_ins) { // insert into ins temp table
+        tmptbl = tran->db_ins;
     }
 
     DEBUG_PRINT_TMPBL_SAVING();
@@ -1060,8 +1143,11 @@ static int process_this_session(
      * NB: the idea is that single row transactions can not deadlock but
      * update can have a del/ins index component and can deadlock -- in future
      * consider reordering for single upd stmts (only if performance
-     * improves so this requires a solid test). */
-    if (sess->tran_rows > 1 && gbl_reorder_idx_writes)
+     * improves so this requires a solid test).
+     * Not with upserts either: their keys are added right away to detect
+     * conflicts, so a deferred delete of the same key earlier in this txn
+     * would still be in the index and turn into a false conflict. */
+    if (sess->tran_rows > 1 && gbl_reorder_idx_writes && !sess->has_upsert)
         iq->osql_flags |= OSQL_FLAGS_REORDER_IDX_ON;
 
     while (!rc && !rc_out) {

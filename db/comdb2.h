@@ -1274,6 +1274,7 @@ struct osql_sess {
     unsigned is_reorder_on : 1;
     unsigned is_delayed : 1;
     unsigned is_final : 1;
+    unsigned has_upsert : 1; /* an insert carries ON CONFLICT (upsert) flags */
 
     /* from sorese */
     const char *target_host; /* replicant machine; NULL if local */

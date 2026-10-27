@@ -7443,6 +7443,24 @@ const char *get_tablename_from_rpl(int is_uuid, const uint8_t *rpl, int rpllen,
     return tablename;
 }
 
+/* Return 1 if an OSQL_INSERT carries ON CONFLICT (upsert) flags. */
+int osql_insert_has_upsert_flags(int is_uuid, const uint8_t *rpl, int rpllen)
+{
+    osql_ins_t dt;
+    const uint8_t *p_buf =
+        rpl + (is_uuid ? sizeof(osql_uuid_rpl_t) : sizeof(osql_rpl_t));
+    const uint8_t *p_buf_end = p_buf + OSQLCOMM_INS_TYPE_LEN;
+    const uint8_t *p_rpl_end = rpl + rpllen;
+
+    if (p_buf_end > p_rpl_end)
+        p_buf_end = p_rpl_end;
+
+    if (!osqlcomm_ins_type_get(&dt, p_buf, p_buf_end, 0 /* is_legacy */))
+        return 0;
+
+    return dt.upsert_flags != 0;
+}
+
 void get_dist_txnid_from_prepare_rpl(int is_uuid, char *inrpl, int rpllen, char **dist_txnid, int64_t *timestamp)
 {
     uint8_t *rpl = (uint8_t *)inrpl;

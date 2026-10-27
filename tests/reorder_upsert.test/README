@@ -1,0 +1,9 @@
+Upserts with reorder_socksql_no_deadlock and reorder_idx_writes on.
+
+An upsert picks between insert, update and doing nothing from the rows it
+finds when it is applied, so it must see the transaction's other writes in the
+order they were issued. Reordering moved upserts after deletes, and deferring
+index deletes made an upsert collide with a key its own transaction had
+already deleted, which looked like a verify error and was replayed until the
+transaction failed. A transaction that contains an upsert is now applied in
+issue order. The noreorder variant runs the same checks with reordering off.

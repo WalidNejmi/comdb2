@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+
+dbnm=$1
+
+if [ "x$dbnm" == "x" ] ; then
+    failexit "need a DB name"
+fi
+
+sql() {
+    cdb2sql --tabs ${CDB2_OPTIONS} $dbnm default "$1"
+}
+
+# Run the statements on stdin as one transaction at isolation level $1.
+# Prints nothing on success, the error otherwise.
+txn() {
+    { echo "set transaction $1"; echo "begin"; cat; echo "commit"; } |
+        cdb2sql ${CDB2_OPTIONS} $dbnm default - 2>&1 | grep -iE "fail|error"
+}
+
+expect() {
+    local what=$1 got=$2 want=$3
+    if [[ "$got" != "$want" ]]; then
+        failexit "$what: got [$got], want [$want]"
+    fi
+}
+
+n=0
+for level in "blocksql" "read committed" "snapshot isolation" "serializable"; do
+    n=$((n + 1))
+
+    # Upsert that updates, a delete, then an upsert that inserts. blocksql
+    # does not let a transaction see its own writes, so it is not run there.
+    if [[ "$level" != "blocksql" ]]; then
+        sql "create table a$n(id int primary key, v int)"
+        sql "insert into a$n values(1, 1)"
+        err=$(txn "$level" <<EOF
+insert into a$n values(1, 5) on conflict(id) do update set v = v + 100
+delete from a$n where id = 1
+insert into a$n values(1, 7) on conflict(id) do update set v = v + 1000
+EOF
+)
+        expect "$level: upsert, delete, upsert commit" "$err" ""
+        expect "$level: upsert, delete, upsert result" "$(sql "select id, v from a$n")" "$(printf '1\t7')"
+    fi
+
+    # Upsert that does nothing, a delete of the row it hit, then an insert.
+    sql "create table b$n(id int primary key, v int)"
+    sql "insert into b$n values(1, 1)"
+    err=$(txn "$level" <<EOF
+insert into b$n values(1, 5) on conflict do nothing
+delete from b$n where id = 1
+insert into b$n values(1, 9)
+EOF
+)
+    expect "$level: upsert-nothing, delete, insert commit" "$err" ""
+    expect "$level: upsert-nothing, delete, insert result" "$(sql "select id, v from b$n")" "$(printf '1\t9')"
+
+    # The rest needs a transaction that sees its own writes.
+    [[ "$level" == "blocksql" ]] && continue
+
+    # The upsert arrives after updates on one table and inserts on another,
+    # and more writes follow it; all of them must be applied.
+    sql "create table c$n(id int primary key, v int)"
+    sql "create table d$n(id int primary key, v int)"
+    sql "insert into c$n select value, value from generate_series(1, 20)"
+    err=$(txn "$level" <<EOF
+update c$n set v = v * 10 where id <= 10
+insert into d$n values(1, 1)
+insert into d$n values(2, 2)
+insert into c$n values(5, 0) on conflict(id) do update set v = -5
+delete from c$n where id = 20
+insert into d$n values(3, 3)
+update c$n set v = 0 where id = 19
+EOF
+)
+    expect "$level: mixed txn commit" "$err" ""
+    expect "$level: mixed txn rows" "$(sql "select count(*), (select v from c$n where id = 5), (select v from c$n where id = 19) from c$n")" "$(printf '19\t-5\t0')"
+    expect "$level: mixed txn sums" "$(sql "select (select sum(v) from c$n where id <= 10 and id != 5), (select count(*) from d$n)")" "$(printf '500\t3')"
+done
+
+echo "Success"
