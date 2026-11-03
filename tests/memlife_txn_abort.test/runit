@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: per-transaction state on rollback (osql session, shadow tables).
+# Invariant: aborted transactions free what commits free.
+source ${TESTSROOTDIR}/memlife_common.sh
+memlife_setup() { $SQLM "CREATE TABLE t (i INT, b BLOB)" >/dev/null; }
+memlife_iteration() {
+    for k in $(seq 1 1000); do echo "BEGIN"; echo "INSERT INTO t VALUES ($k, x'00112233')"; echo "ROLLBACK"; done |
+        $SQLM - >/dev/null
+}
+
+memlife_main

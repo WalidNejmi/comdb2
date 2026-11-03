@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: per-transaction state on commit. 5000 single-row transactions,
+# then one bulk delete. commit_map keeps an entry per commit until the log file
+# holding it is deleted: that release event is tested in memlife_reclaim.
+# Invariant: per-transaction memory is freed at commit.
+source ${TESTSROOTDIR}/memlife_common.sh
+MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+memlife_setup() { $SQLM "CREATE TABLE t (i INT, s TEXT)" >/dev/null; }
+memlife_iteration() {
+    seq 1 5000 | sed "s/.*/INSERT INTO t VALUES (&, 'committed')/" | $SQLM - >/dev/null
+    $SQLM "DELETE FROM t WHERE 1" >/dev/null
+}
+memlife_reclaim() { memlife_force_log_deletion; }
+
+memlife_main

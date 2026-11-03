@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: time-partition shards. Manual partition with retention 2; each
+# iteration writes rows and rolls it out (oldest shard is truncated).
+# Invariant: partition metadata does not grow with the number of rollouts.
+source ${TESTSROOTDIR}/memlife_common.sh
+MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+memlife_reclaim() { memlife_force_log_deletion; }
+epoch=1
+wait_rollout() {   # wait for the master to apply rollout epoch $1 (cron event)
+    local i e
+    for (( i = 0; i < 120; i++ )); do
+        e=$($SQLM --tabs "SELECT epoch FROM comdb2_cron_events WHERE name='Truncate' AND type='tp'")
+        [[ "$e" == "$1" ]] && return 0
+        sleep 1
+    done
+    echo "rollout to epoch $1 not applied (epoch '$e')" >&2; exit 1
+}
+memlife_setup() { $SQLM "CREATE TABLE tp (a INT, s TEXT) PARTITIONED BY MANUAL RETENTION 2 START 1" >/dev/null; }
+memlife_iteration() {
+    $SQLM "INSERT INTO tp SELECT value, 'shard row' FROM generate_series(1, 500)" >/dev/null
+    $SQLM "PUT COUNTER tp INCREMENT" >/dev/null
+    epoch=$((epoch + 1))
+    wait_rollout $epoch
+    echo -e "$1\t$epoch\t$($SQLM --tabs "SELECT count(*) FROM comdb2_timepartshards WHERE name='tp'")" >> $MEMLIFE_DIR/shards.tsv
+}
+
+memlife_main

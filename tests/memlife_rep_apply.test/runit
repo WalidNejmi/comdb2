@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Multi-node lifecycle: replicant transaction apply (LC cache forced on).
+# Each iteration commits 2000 single-row transactions on the master and waits
+# until every replicant has applied them; every node is snapshotted
+# separately and compared with itself (physical node, role recorded).
+# Invariant: replication apply state does not grow with applied transactions
+# (historical leak: LC cache child_utxnids, fixed in 48cc34d81).
+source ${TESTSROOTDIR}/memlife_common.sh
+[ -z "${CLUSTER}" ] && { echo "memlife_rep_apply needs a cluster; skipping"; exit 0; }
+rows=0
+memlife_setup() { $SQLM "CREATE TABLE t (i INT)" >/dev/null; }
+memlife_iteration() {
+    seq $((rows + 1)) $((rows + 2000)) | sed 's/.*/INSERT INTO t VALUES(&)/' | $SQLM - >/dev/null
+    rows=$((rows + 2000))
+}
+memlife_settle() {   # every node has the rows: replication caught up
+    local n i c
+    for n in $memlife_nodes; do
+        for (( i = 0; i < 120; i++ )); do
+            c=$(cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $n "SELECT count(*) FROM t")
+            [[ "$c" == "$rows" ]] && break
+            sleep 1
+        done
+    done
+    sleep 2
+}
+
+memlife_main

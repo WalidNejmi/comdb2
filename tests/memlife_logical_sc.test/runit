@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: logical live schema change (log-cursor redo of concurrent writes).
+# ALTER ADD COLUMN then DROP COLUMN on the same table while it is updated.
+# Invariant: redo state (log cursor copies, redo blobs) is freed when the SC ends.
+source ${TESTSROOTDIR}/memlife_common.sh
+MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+memlife_reclaim() { memlife_force_log_deletion; }
+memlife_setup() {
+    $SQLM "CREATE TABLE t (i INT PRIMARY KEY, b BLOB)" >/dev/null
+    $SQLM "INSERT INTO t SELECT value, randomblob(200) FROM generate_series(1, ${MEMLIFE_SC_ROWS:-20000})" >/dev/null
+}
+memlife_iteration() {   # MEMLIFE_SC_ROWS / MEMLIFE_SC_UPDATES shrink it for a Valgrind rerun
+    local p
+    ( for k in $(seq 1 ${MEMLIFE_SC_UPDATES:-600}); do echo "UPDATE t SET b = randomblob(200) WHERE i % 50 = $((k % 50))"; done |
+        $SQLM - >/dev/null 2>&1 ) & p=$!
+    $SQLM "ALTER TABLE t ADD COLUMN c INT" >/dev/null
+    $SQLM "ALTER TABLE t DROP COLUMN c" >/dev/null
+    wait $p 2>/dev/null
+}
+
+memlife_main

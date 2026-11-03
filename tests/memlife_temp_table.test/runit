@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: temp tables and sorter cursors (ResetSorter path of
+# temp_table_truncate_leak, UNION/CTE materialization).
+# Invariant: temp tables and their cursors are freed with the statement.
+source ${TESTSROOTDIR}/memlife_common.sh
+memlife_setup() {
+    $SQLM "CREATE TABLE p (i INTEGER PRIMARY KEY, j INTEGER)" >/dev/null
+    $SQLM "CREATE TABLE q (i INTEGER, j INTEGER)" >/dev/null
+    $SQLM "CREATE INDEX q_i_j ON q(i, j)" >/dev/null
+    $SQLM "INSERT INTO p SELECT value, value FROM generate_series(1, 2000)" >/dev/null
+    $SQLM "INSERT INTO q SELECT value % 2000 + 1, value FROM generate_series(1, 4000)" >/dev/null
+    $SQLM "ANALYZE p" >/dev/null; $SQLM "ANALYZE q" >/dev/null
+}
+memlife_iteration() {
+    { for k in $(seq 1 50); do echo "SELECT * FROM p, q WHERE p.i = q.i ORDER BY p.i, q.j LIMIT 100 OFFSET 50"; done
+      for k in $(seq 1 20); do echo "WITH c AS (SELECT j FROM q WHERE i < $((k * 50))) SELECT count(*) FROM (SELECT j FROM c UNION SELECT j FROM p)"; done
+    } | $SQLM - >/dev/null
+}
+
+memlife_main

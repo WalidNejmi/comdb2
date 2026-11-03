@@ -1,0 +1,2 @@
+timeseries_metrics_maxpoints 100
+berkattr cache_lc 1

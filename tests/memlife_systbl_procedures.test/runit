@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: rows of the comdb2_procedures system table (version strings are
+# allocated per row; historical leak fixed in 3aa6939f5, systbl_proc_leak).
+# Invariant: reading the system table frees what it allocates.
+source ${TESTSROOTDIR}/memlife_common.sh
+memlife_setup() {
+    local i
+    for i in $(seq 1 100); do $SQLM "CREATE PROCEDURE sp$i { local function main (e) end }" >/dev/null; done
+    sleep 5   # longer than sqlenginepool linger: start from zero SQL threads
+}
+memlife_iteration() { yes 'SELECT name, version FROM comdb2_procedures' | head -200 | $SQLM - >/dev/null; }
+
+memlife_main
