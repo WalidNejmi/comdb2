@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: index metadata. CREATE INDEX -> DROP INDEX on one table.
+# Invariant: dropped indexes leave nothing behind.
+source ${TESTSROOTDIR}/memlife_common.sh
+MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+memlife_reclaim() { memlife_force_log_deletion; }
+memlife_setup() {
+    $SQLM "CREATE TABLE t (i INT, j INT, s TEXT)" >/dev/null
+    $SQLM "INSERT INTO t SELECT value, value % 100, 'abc' FROM generate_series(1, 5000)" >/dev/null
+}
+memlife_iteration() {
+    local k
+    for k in $(seq 1 10); do
+        $SQLM "CREATE INDEX ti ON t(j, i)" >/dev/null
+        $SQLM "SELECT count(*) FROM t WHERE j = 7" >/dev/null
+        $SQLM "ALTER TABLE t DROP INDEX ti" >/dev/null
+    done
+}
+
+memlife_main

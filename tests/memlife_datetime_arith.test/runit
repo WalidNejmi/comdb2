@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: Mem objects reused by datetime/interval arithmetic in the VDBE
+# (historical leak fixed in d1e35065d, sql_datetime_interval_arithmetic_leak).
+# Invariant: per-row arithmetic results are freed when the Mem is reused.
+source ${TESTSROOTDIR}/memlife_common.sh
+memlife_setup() {
+    $SQLM "CREATE TABLE leak (key cstring(8), payload cstring(128), tm datetime, intv intervalds)" >/dev/null
+    yes 'INSERT INTO leak VALUES ("alice", "It is only with the heart that one can see rightly; what is essential is invisible to the eye.", now(), 0)' |
+        head -1000 | $SQLM - >/dev/null
+}
+memlife_iteration() { yes 'SELECT payload FROM leak WHERE tm + intv < now() AND key = "alice"' | head -300 | $SQLM - >/dev/null; }
+
+memlife_main

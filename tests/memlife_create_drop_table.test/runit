@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: table + schema metadata. CREATE -> use -> DROP, same table name
+# every time (no unique SQL text, so the fingerprint cache does not grow).
+# Invariant: no per-table memory survives DROP.
+source ${TESTSROOTDIR}/memlife_common.sh
+MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+memlife_reclaim() { memlife_force_log_deletion; }
+memlife_iteration() {
+    local k
+    for k in $(seq 1 20); do
+        $SQLM "CREATE TABLE t (i INT, s TEXT)" >/dev/null
+        $SQLM "INSERT INTO t SELECT value, 'x' FROM generate_series(1, 100)" >/dev/null
+        $SQLM "SELECT count(*) FROM t" >/dev/null
+        $SQLM "DROP TABLE t" >/dev/null
+    done
+}
+
+memlife_main

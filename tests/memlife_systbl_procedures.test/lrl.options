@@ -1,0 +1,4 @@
+timeseries_metrics_maxpoints 100
+sqlenginepool linger 4
+sqlenginepool mint 0
+sqlenginepool maxt 1
