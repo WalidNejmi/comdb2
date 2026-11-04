@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: queue + Lua consumer: create procedure and consumer, enqueue 100
+# events (inserts), consume them, drop consumer and procedure; 5 times per
+# iteration.
+# Invariant: queue, consumer and trigger state are freed when they are dropped.
+source ${TESTSROOTDIR}/memlife_common.sh
+MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+memlife_reclaim() { memlife_force_log_deletion; }
+SP='{local function main() db:num_columns(1) db:column_type("int", 1) db:column_name("i", 1) local c = db:consumer() for k = 1, 100 do local e = c:get() c:emit(e.new.i) c:consume() end end}'
+memlife_setup() { memlife_sql "CREATE TABLE q (i INT)" >/dev/null; }
+memlife_iteration() {
+    local k
+    for k in $(seq 1 5); do
+        memlife_sql "CREATE PROCEDURE cons VERSION 'v1' $SP" >/dev/null
+        memlife_sql "CREATE LUA CONSUMER cons ON (TABLE q FOR INSERT)" >/dev/null
+        memlife_sql "INSERT INTO q SELECT value FROM generate_series(1, 100)" >/dev/null
+        memlife_require "100 events consumed" test "$(memlife_sql "EXEC PROCEDURE cons()" --tabs | wc -l)" = 100
+        memlife_sql "DROP LUA CONSUMER cons" >/dev/null
+        memlife_sql "DROP PROCEDURE cons VERSION 'v1'" >/dev/null
+        memlife_sql "DELETE FROM q WHERE 1" >/dev/null
+    done
+}
+
+memlife_main

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: Lua stored procedure create -> execute -> drop, 20 times per
+# iteration (same name and version); the procedure builds tables and strings
+# and runs a query.
+# Invariant: Lua VM state and procedure caches are freed at drop/exit.
+source ${TESTSROOTDIR}/memlife_common.sh
+SP='{local function main(n) db:setmaxinstructions(1000000) local t = {} for i = 1, n do t[i] = string.rep("x", i % 50) .. i end local s = db:prepare("SELECT count(*) AS c FROM t") local r = s:fetch() db:emit(r) return 0 end}'
+memlife_setup() { memlife_sql "CREATE TABLE t (i INT)" >/dev/null; memlife_sql "INSERT INTO t SELECT value FROM generate_series(1, 100)" >/dev/null; }
+memlife_iteration() {
+    local k
+    for k in $(seq 1 20); do
+        memlife_sql "CREATE PROCEDURE lp VERSION 'v1' $SP" >/dev/null
+        memlife_require "procedure output" test "$(memlife_sql "EXEC PROCEDURE lp(2000)" --tabs)" = 100
+        memlife_sql "DROP PROCEDURE lp VERSION 'v1'" >/dev/null
+    done
+}
+
+memlife_main

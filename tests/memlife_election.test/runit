@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Multi-node lifecycle: master swing. Each iteration downgrades the master
+# twice and waits until every node agrees on a new coherent master; writes go
+# to the current master. Every physical node is compared with itself; roles
+# are recorded at every snapshot.
+# Invariant: elections do not leave per-election state behind.
+source ${TESTSROOTDIR}/memlife_common.sh
+MEMLIFE_NEEDS_CLUSTER=1
+old=
+master_seen_by() { cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $1 "SELECT host FROM comdb2_cluster WHERE is_master = 'Y'" 2>/dev/null; }
+new_master_agreed() {
+    local n m first=
+    for n in $memlife_nodes; do
+        m=$(master_seen_by $n) && [[ -n $m ]] || return 1
+        [[ -z $first ]] && first=$m
+        [[ $m == "$first" ]] || return 1
+    done
+    [[ $first != "$old" ]] || return 1
+    [[ $(cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $first "SELECT count(*) FROM comdb2_cluster WHERE coherent_state != 'coherent'") == 0 ]] || return 1
+    master=$first
+}
+election_diag() {
+    local n
+    echo "  previous master $old"
+    for n in $memlife_nodes; do echo "  $n sees master: $(master_seen_by $n)"; done
+}
+memlife_setup() { memlife_sql "CREATE TABLE t (i INT)" >/dev/null; }
+memlife_iteration() {
+    local k
+    for k in 1 2; do
+        old=$master
+        cdb2sql ${CDB2_OPTIONS} $dbnm --host $old "EXEC PROCEDURE sys.cmd.send('downgrade')" >/dev/null ||
+            memlife_fail WORKLOAD_FAIL "downgrade of $old failed"
+        memlife_wait_until 120 "a new master agreed by every node" new_master_agreed election_diag ||
+            memlife_fail WORKLOAD_FAIL "no new master after downgrading $old"
+        memlife_sql "INSERT INTO t SELECT value FROM generate_series(1, 100)" >/dev/null
+    done
+    echo -e "$1\t$master" >> $MEMLIFE_DIR/masters.tsv
+}
+
+memlife_main

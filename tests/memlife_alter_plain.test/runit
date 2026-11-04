@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: plain (non-logical) ALTER TABLE: ADD COLUMN (appended: instant)
+# then DROP COLUMN (table rebuild) on one table, 5 times per iteration, no
+# concurrent writes.
+# Invariant: the rebuild path frees its converter state and old schema
+# (logical live SC is covered by memlife_logical_sc).
+source ${TESTSROOTDIR}/memlife_common.sh
+MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+memlife_reclaim() { memlife_force_log_deletion; }
+memlife_setup() {
+    memlife_sql "CREATE TABLE t (i INT PRIMARY KEY, s TEXT)" >/dev/null
+    memlife_sql "INSERT INTO t SELECT value, 'abc' FROM generate_series(1, 5000)" >/dev/null
+}
+memlife_iteration() {
+    local k
+    for k in $(seq 1 5); do
+        memlife_sql "ALTER TABLE t ADD COLUMN c INT" >/dev/null
+        memlife_sql "ALTER TABLE t DROP COLUMN c" >/dev/null
+    done
+    memlife_require "5000 rows kept" test "$(memlife_sql "SELECT count(*) FROM t" --tabs)" = 5000
+}
+
+memlife_main

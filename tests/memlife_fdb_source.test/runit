@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Note: the fdb connection to a "local" database fails ("Can't connect to db")
+# when the remote database name is 16 characters or longer (11 works; harness
+# names are <test name without _><test id>), so on such hosts this test fails
+# closed (WORKLOAD_FAIL), as fdb_read_no_remtran does.
+# Lifecycle: remote (fdb) handles on the database that opens them. The source
+# database (SECONDARY_DBNAME, measured here) reads a table of the target
+# database (DBNAME) through LOCAL_<target>.t: 50 short sessions plus one
+# session with 50 statements per iteration.
+# Invariant: remote cursors, connections and cached remote schema are freed
+# or bounded when the sessions end.
+source ${TESTSROOTDIR}/memlife_common.sh
+tgt=$dbnm tgt_opts=$CDB2_OPTIONS
+dbnm=$SECONDARY_DBNAME CDB2_OPTIONS="--cdb2cfg ${SECONDARY_CDB2_CONFIG}"
+memlife_setup() {
+    cdb2sql ${tgt_opts} $tgt default "CREATE TABLE t (i INT)" >/dev/null &&
+        cdb2sql ${tgt_opts} $tgt default "INSERT INTO t SELECT value FROM generate_series(1, 1000)" >/dev/null ||
+        memlife_fail WORKLOAD_FAIL "cannot create the remote table on $tgt"
+    memlife_require "remote table readable" test "$(memlife_sql "SELECT count(*) FROM LOCAL_${tgt}.t" --tabs)" = 1000
+}
+remote_reads() { seq 1 50 | sed "s/.*/SELECT count(*) FROM LOCAL_${tgt}.t WHERE i > &/"; }
+memlife_iteration() {
+    local k
+    for k in $(seq 1 50); do memlife_sql "SELECT count(*) FROM LOCAL_${tgt}.t WHERE i > $k" >/dev/null; done
+    memlife_batch remote_reads
+}
+
+memlife_main

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Cache lifecycle: the query fingerprint hash keeps one entry per distinct
+# normalized SQL text, up to max_query_fingerprints (1000). 200 new texts per
+# iteration fill it by iteration 5; it must stop growing there.
+# Invariant: the fingerprint cache is bounded (other memlife tests reuse their
+# SQL text, so this cache does not grow there).
+source ${TESTSROOTDIR}/memlife_common.sh
+: ${MEMLIFE_ITERS:=16}
+memlife_setup() { memlife_sql "CREATE TABLE t (i INT)" >/dev/null; memlife_sql "INSERT INTO t VALUES (1)" >/dev/null; }
+texts() { local k; for k in $(seq 1 200); do echo "SELECT i AS c_${it}_$k FROM t"; done; }
+memlife_iteration() { it=$1; memlife_batch texts; }
+
+memlife_main

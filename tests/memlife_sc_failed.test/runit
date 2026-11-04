@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: failed schema change. CREATE UNIQUE INDEX on a column with
+# duplicates fails during the index build, 5 times per iteration.
+# Invariant: a failed schema change frees what it allocated (the success path
+# is covered by memlife_add_drop_index).
+source ${TESTSROOTDIR}/memlife_common.sh
+MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+memlife_reclaim() { memlife_force_log_deletion; }
+memlife_setup() {
+    memlife_sql "CREATE TABLE t (i INT, j INT)" >/dev/null
+    memlife_sql "INSERT INTO t SELECT value, value % 10 FROM generate_series(1, 5000)" >/dev/null
+}
+memlife_iteration() {
+    local k
+    for k in $(seq 1 5); do memlife_sql_expect_failure "CREATE UNIQUE INDEX tj ON t(j)"; done
+    memlife_require "no index left behind" test "$(memlife_sql "SELECT count(*) FROM comdb2_keys WHERE tablename = 't'" --tabs)" = 0
+}
+
+memlife_main

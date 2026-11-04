@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Multi-node lifecycle: replica restart and catch-up. Each iteration kills and
+# restarts one replica, writes 1000 rows while it rejoins, and waits until it
+# has caught up. The restarted replica is a new process every time
+# (MEMLIFE_RESTARTED_NODES: reported, not classified); the master and the
+# other replica are compared with themselves.
+# Invariant: a node leaving and rejoining leaves no per-connection or
+# per-node replication state behind on the nodes that stay up.
+source ${TESTSROOTDIR}/memlife_common.sh
+source ${TESTSROOTDIR}/tools/cluster_utils.sh
+failexit() { memlife_fail INFRA_FAIL "cluster_utils: $*"; }
+MEMLIFE_NEEDS_CLUSTER=1
+rows=0 victim=
+memlife_setup() {
+    local n
+    for n in $memlife_nodes; do [[ $n != "$master" && $n != "$(hostname -s)" ]] && { victim=$n; break; }; done
+    [[ -n $victim ]] || for n in $memlife_nodes; do [[ $n != "$master" ]] && { victim=$n; break; }; done
+    [[ -n $victim ]] || memlife_fail INFRA_FAIL "no replica to restart"
+    MEMLIFE_RESTARTED_NODES=$victim
+    echo "memlife: restarting replica $victim every iteration"
+    memlife_sql "CREATE TABLE t (i INT)" >/dev/null
+}
+caught_up() {
+    local n c
+    for n in $memlife_nodes; do
+        c=$(cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $n "SELECT count(*) FROM t" 2>/dev/null) || return 1
+        [[ $c == "$rows" ]] || return 1
+    done
+}
+rep_diag() {
+    local n
+    echo "  expected $rows rows; restarted replica $victim"
+    for n in $memlife_nodes; do echo "  $n: $(cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $n "SELECT count(*) FROM t" 2>&1) rows"; done
+}
+memlife_iteration() {
+    kill_restart_node $victim 2 0 >/dev/null 2>&1
+    memlife_sql "INSERT INTO t SELECT value FROM generate_series(1, 1000)" >/dev/null
+    rows=$((rows + 1000))
+    memlife_wait_until 300 "replica $victim restarted and caught up" caught_up rep_diag ||
+        memlife_fail WORKLOAD_FAIL "replica $victim did not catch up"
+}
+
+memlife_main

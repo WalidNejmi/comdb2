@@ -1,0 +1,3 @@
+timeseries_metrics_maxpoints 100
+ssl_allow_remsql 1
+foreign_db_resolve_local 1

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: deadlock detection. Write reordering (which avoids deadlocks) is
+# off, as in deadlock_load. Each iteration 8 writers insert and update the
+# same keys of a table with two indexes (200 autocommit INSERT + UPDATE each),
+# then the rows are deleted; the master's deadlock detector resolves the
+# conflicts and the transactions are retried. Each iteration must record new
+# deadlocks (comdb2_metrics).
+# Invariant: deadlock detector maps are bounded.
+source ${TESTSROOTDIR}/memlife_common.sh
+MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+memlife_reclaim() { memlife_force_log_deletion; }
+deadlocks() { cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $master "SELECT value FROM comdb2_metrics WHERE name = 'deadlocks'"; }
+memlife_setup() {
+    memlife_sql "CREATE TABLE t1 (a INT, b INT)" >/dev/null
+    memlife_sql "CREATE INDEX ix1 ON t1(a)" >/dev/null
+    memlife_sql "CREATE INDEX ix2 ON t1(b)" >/dev/null
+}
+writes() {   # writes <worker>
+    local k
+    for k in $(seq 1 200); do
+        echo "INSERT INTO t1 (a, b) VALUES ($k, $k)"
+        echo "UPDATE t1 SET b = $(( $1 * 1000 + k )) WHERE a = $k"
+    done
+}
+memlife_iteration() {
+    local before after w
+    before=$(deadlocks) || memlife_fail INFRA_FAIL "cannot read comdb2_metrics"
+    for w in $(seq 1 8); do memlife_bg_start w$w memlife_batch writes $w; done
+    for w in $(seq 1 8); do memlife_bg_wait w$w; done
+    memlife_sql "DELETE FROM t1 WHERE 1" >/dev/null
+    after=$(deadlocks) || memlife_fail INFRA_FAIL "cannot read comdb2_metrics"
+    echo -e "$1\t$(( after - before ))" >> $MEMLIFE_DIR/deadlocks.tsv
+    memlife_require "deadlocks were detected (before $before, after $after)" test $(( after - before )) -gt 0
+}
+
+memlife_main

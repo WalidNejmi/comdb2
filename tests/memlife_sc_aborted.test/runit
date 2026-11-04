@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: aborted schema change. ALTER TABLE DROP COLUMN (a rebuild; an
+# appended ADD COLUMN is instant and converts nothing) is slowed down
+# (SC_FORCE_DELAY + scdelay) and aborted (scabort) while it converts records,
+# twice per iteration.
+# Invariant: an aborted schema change frees its converter state and new files.
+source ${TESTSROOTDIR}/memlife_common.sh
+MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+memlife_reclaim() { memlife_force_log_deletion; }
+memlife_setup() {
+    memlife_sql "CREATE TABLE t (i INT, s TEXT, x INT)" >/dev/null
+    memlife_sql "INSERT INTO t SELECT value, 'row to convert', value FROM generate_series(1, 5000)" >/dev/null
+}
+alter_aborted() {   # the ALTER must fail: it is aborted
+    if cdb2sql ${CDB2_OPTIONS} $dbnm --host $master "ALTER TABLE t DROP COLUMN x" >/dev/null 2>&1; then
+        memlife_fail WORKLOAD_FAIL "ALTER finished before it was aborted"
+    fi
+}
+sc_converting() {
+    [[ $(cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $master "SELECT count(*) FROM comdb2_sc_status WHERE status = 'RUNNING' AND converted > 0") -ge 1 ]]
+}
+sc_diag() { cdb2sql ${CDB2_OPTIONS} $dbnm --host $master "SELECT name, status, converted, error FROM comdb2_sc_status"; }
+sc_idle() { [[ $(cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $master "SELECT count(*) FROM comdb2_sc_status WHERE status = 'RUNNING'") == 0 ]]; }
+memlife_iteration() {
+    local k
+    for k in 1 2; do
+        memlife_sql "EXEC PROCEDURE sys.cmd.send('scdelay 2')" >/dev/null
+        memlife_bg_start alter alter_aborted
+        memlife_wait_until 60 "schema change converting records" sc_converting sc_diag ||
+            memlife_fail WORKLOAD_FAIL "the schema change did not start converting"
+        memlife_sql "EXEC PROCEDURE sys.cmd.send('scabort')" >/dev/null
+        memlife_bg_wait alter
+        memlife_sql "EXEC PROCEDURE sys.cmd.send('scdelay 0')" >/dev/null
+        memlife_wait_until 60 "no schema change running" sc_idle sc_diag || memlife_fail WORKLOAD_FAIL "aborted schema change still running"
+        memlife_require "column x kept after the abort" test "$(memlife_sql "SELECT count(x) FROM t" --tabs)" = 5000
+    done
+}
+
+memlife_main

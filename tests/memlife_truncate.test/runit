@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: TRUNCATE (fastinit): populate 5000 rows, truncate, 5 times per
+# iteration. Truncate replaces the table files; the old ones wait on the
+# unused-file list until log deletion (tested by the reclaim).
+# Invariant: truncated tables leave nothing behind once their files are purged.
+source ${TESTSROOTDIR}/memlife_common.sh
+MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+memlife_reclaim() { memlife_force_log_deletion; }
+memlife_setup() { memlife_sql "CREATE TABLE t (i INT, s TEXT)" >/dev/null; memlife_sql "CREATE INDEX ti ON t(i)" >/dev/null; }
+memlife_iteration() {
+    local k
+    for k in $(seq 1 5); do
+        memlife_sql "INSERT INTO t SELECT value, 'to be truncated' FROM generate_series(1, 5000)" >/dev/null
+        memlife_sql "TRUNCATE TABLE t" >/dev/null
+        memlife_require "t is empty after truncate" test "$(memlife_sql "SELECT count(*) FROM t" --tabs)" = 0
+    done
+}
+
+memlife_main

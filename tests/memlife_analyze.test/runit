@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: ANALYZE (sampling, temp tables, sqlite_stat1/stat4 rewrite)
+# three times per iteration on a 20,000-row table with two indexes.
+# Invariant: analyze frees its sampling and statistics state.
+source ${TESTSROOTDIR}/memlife_common.sh
+memlife_setup() {
+    memlife_sql "CREATE TABLE t (i INT, j INT, s TEXT)" >/dev/null
+    memlife_sql "CREATE INDEX ti ON t(i)" >/dev/null
+    memlife_sql "CREATE INDEX tj ON t(j, i)" >/dev/null
+    memlife_sql "INSERT INTO t SELECT value, value % 97, hex(randomblob(8)) FROM generate_series(1, 20000)" >/dev/null
+}
+memlife_iteration() {
+    local k
+    for k in 1 2 3; do memlife_sql "ANALYZE t" >/dev/null; done
+    memlife_require "statistics written" test "$(memlife_sql "SELECT count(*) FROM sqlite_stat1 WHERE tbl = 't'" --tabs)" -ge 2
+}
+
+memlife_main

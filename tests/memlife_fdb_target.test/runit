@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Note: needs remote database names under 16 characters (see memlife_fdb_source).
+# Lifecycle: remote (fdb) requests on the database that serves them. The
+# source database (SECONDARY_DBNAME) reads a table of the target database
+# (DBNAME, measured here) through LOCAL_<target>.t: 50 short sessions plus one
+# session with 50 statements per iteration.
+# Invariant: per-request remote SQL state on the target is freed.
+source ${TESTSROOTDIR}/memlife_common.sh
+src_sql() {   # src_sql <sql> [cdb2sql options]: on the source database
+    local sql=$1; shift
+    cdb2sql --cdb2cfg ${SECONDARY_CDB2_CONFIG} "$@" $SECONDARY_DBNAME default "$sql" ||
+        memlife_fail WORKLOAD_FAIL "SQL on the source database failed: $sql"
+}
+memlife_setup() {
+    memlife_sql "CREATE TABLE t (i INT)" >/dev/null
+    memlife_sql "INSERT INTO t SELECT value FROM generate_series(1, 1000)" >/dev/null
+    memlife_require "remote table readable" test "$(src_sql "SELECT count(*) FROM LOCAL_${dbnm}.t" --tabs)" = 1000
+}
+remote_reads() { seq 1 50 | sed "s/.*/SELECT count(*) FROM LOCAL_${dbnm}.t WHERE i > &/"; }
+memlife_iteration() {
+    local k st
+    for k in $(seq 1 50); do src_sql "SELECT count(*) FROM LOCAL_${dbnm}.t WHERE i > $k" >/dev/null; done
+    remote_reads | cdb2sql --cdb2cfg ${SECONDARY_CDB2_CONFIG} $SECONDARY_DBNAME default - >/dev/null
+    st=("${PIPESTATUS[@]}")
+    (( st[0] == 0 && st[1] == 0 )) || memlife_fail WORKLOAD_FAIL "remote read batch failed"
+}
+
+memlife_main
