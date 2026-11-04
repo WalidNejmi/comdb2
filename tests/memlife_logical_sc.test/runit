@@ -4,20 +4,31 @@ bash -n "$0" || exit 1
 # Lifecycle: logical live schema change (log-cursor redo of concurrent writes).
 # ALTER ADD COLUMN then DROP COLUMN on the same table while it is updated.
 # Invariant: redo state (log cursor copies, redo blobs) is freed when the SC ends.
+# The updater must run during the schema change and every update must succeed.
 source ${TESTSROOTDIR}/memlife_common.sh
 MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+MEMLIFE_VALGRIND_HINT="MEMLIFE_SC_ROWS=2000 MEMLIFE_SC_UPDATES=100"
+updates=${MEMLIFE_SC_UPDATES:-600}
 memlife_reclaim() { memlife_force_log_deletion; }
 memlife_setup() {
-    $SQLM "CREATE TABLE t (i INT PRIMARY KEY, b BLOB)" >/dev/null
-    $SQLM "INSERT INTO t SELECT value, randomblob(200) FROM generate_series(1, ${MEMLIFE_SC_ROWS:-20000})" >/dev/null
+    memlife_sql "CREATE TABLE t (i INT PRIMARY KEY, b BLOB)" >/dev/null
+    memlife_sql "INSERT INTO t SELECT value, randomblob(200) FROM generate_series(1, ${MEMLIFE_SC_ROWS:-20000})" >/dev/null
 }
-memlife_iteration() {   # MEMLIFE_SC_ROWS / MEMLIFE_SC_UPDATES shrink it for a Valgrind rerun
-    local p
-    ( for k in $(seq 1 ${MEMLIFE_SC_UPDATES:-600}); do echo "UPDATE t SET b = randomblob(200) WHERE i % 50 = $((k % 50))"; done |
-        $SQLM - >/dev/null 2>&1 ) & p=$!
-    $SQLM "ALTER TABLE t ADD COLUMN c INT" >/dev/null
-    $SQLM "ALTER TABLE t DROP COLUMN c" >/dev/null
-    wait $p 2>/dev/null
+update_statements() {
+    local k
+    for k in $(seq 1 $updates); do echo "UPDATE t SET b = randomblob(200) WHERE i % 50 = $((k % 50))"; done
+}
+updater() { memlife_batch update_statements; }
+memlife_iteration() {
+    local during=0
+    memlife_bg_start updater updater
+    memlife_require "the updater is running when the schema change starts" memlife_bg_running updater
+    memlife_sql "ALTER TABLE t ADD COLUMN c INT" >/dev/null
+    memlife_bg_running updater && during=1
+    memlife_sql "ALTER TABLE t DROP COLUMN c" >/dev/null
+    memlife_bg_wait updater
+    # iteration, update statements run (all succeeded), updater still running after ADD COLUMN
+    echo -e "$1\t$updates\t$during" >> $MEMLIFE_DIR/sc.tsv
 }
 
 memlife_main

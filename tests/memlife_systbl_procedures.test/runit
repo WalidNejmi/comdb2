@@ -7,9 +7,11 @@ bash -n "$0" || exit 1
 source ${TESTSROOTDIR}/memlife_common.sh
 memlife_setup() {
     local i
-    for i in $(seq 1 100); do $SQLM "CREATE PROCEDURE sp$i { local function main (e) end }" >/dev/null; done
+    for i in $(seq 1 100); do memlife_sql "CREATE PROCEDURE sp$i { local function main (e) end }" >/dev/null; done
+    memlife_require "100 procedures" test "$(memlife_sql "SELECT count(*) FROM comdb2_procedures WHERE name LIKE 'sp%'" --tabs)" = 100
     sleep 5   # longer than sqlenginepool linger: start from zero SQL threads
 }
-memlife_iteration() { yes 'SELECT name, version FROM comdb2_procedures' | head -200 | $SQLM - >/dev/null; }
+selects() { seq 1 200 | sed 's/.*/SELECT name, version FROM comdb2_procedures/'; }
+memlife_iteration() { memlife_batch selects; }
 
 memlife_main

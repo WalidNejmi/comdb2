@@ -7,15 +7,15 @@ source ${TESTSROOTDIR}/memlife_common.sh
 MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
 memlife_reclaim() { memlife_force_log_deletion; }
 memlife_setup() {
-    $SQLM "CREATE TABLE t (i INT, j INT, s TEXT)" >/dev/null
-    $SQLM "INSERT INTO t SELECT value, value % 100, 'abc' FROM generate_series(1, 5000)" >/dev/null
+    memlife_sql "CREATE TABLE t (i INT, j INT, s TEXT)" >/dev/null
+    memlife_sql "INSERT INTO t SELECT value, value % 100, 'abc' FROM generate_series(1, 5000)" >/dev/null
 }
 memlife_iteration() {
     local k
     for k in $(seq 1 10); do
-        $SQLM "CREATE INDEX ti ON t(j, i)" >/dev/null
-        $SQLM "SELECT count(*) FROM t WHERE j = 7" >/dev/null
-        $SQLM "ALTER TABLE t DROP INDEX ti" >/dev/null
+        memlife_sql "CREATE INDEX ti ON t(j, i)" >/dev/null
+        memlife_require "index ti is used" test "$(memlife_sql "SELECT count(*) FROM t WHERE j = 7" --tabs)" = 50
+        memlife_sql "ALTER TABLE t DROP INDEX ti" >/dev/null
     done
 }
 

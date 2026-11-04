@@ -8,22 +8,18 @@ source ${TESTSROOTDIR}/memlife_common.sh
 MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
 memlife_reclaim() { memlife_force_log_deletion; }
 epoch=1
-wait_rollout() {   # wait for the master to apply rollout epoch $1 (cron event)
-    local i e
-    for (( i = 0; i < 120; i++ )); do
-        e=$($SQLM --tabs "SELECT epoch FROM comdb2_cron_events WHERE name='Truncate' AND type='tp'")
-        [[ "$e" == "$1" ]] && return 0
-        sleep 1
-    done
-    echo "rollout to epoch $1 not applied (epoch '$e')" >&2; exit 1
+rollout_applied() {   # the master applied rollout epoch $epoch (cron event)
+    [[ $(memlife_sql "SELECT epoch FROM comdb2_cron_events WHERE name='Truncate' AND type='tp'" --tabs) == "$epoch" ]]
 }
-memlife_setup() { $SQLM "CREATE TABLE tp (a INT, s TEXT) PARTITIONED BY MANUAL RETENTION 2 START 1" >/dev/null; }
+rollout_diag() { echo "  expected epoch $epoch; cron events:"; memlife_sql "SELECT name, type, epoch FROM comdb2_cron_events"; }
+memlife_setup() { memlife_sql "CREATE TABLE tp (a INT, s TEXT) PARTITIONED BY MANUAL RETENTION 2 START 1" >/dev/null; }
 memlife_iteration() {
-    $SQLM "INSERT INTO tp SELECT value, 'shard row' FROM generate_series(1, 500)" >/dev/null
-    $SQLM "PUT COUNTER tp INCREMENT" >/dev/null
+    memlife_sql "INSERT INTO tp SELECT value, 'shard row' FROM generate_series(1, 500)" >/dev/null
+    memlife_sql "PUT COUNTER tp INCREMENT" >/dev/null
     epoch=$((epoch + 1))
-    wait_rollout $epoch
-    echo -e "$1\t$epoch\t$($SQLM --tabs "SELECT count(*) FROM comdb2_timepartshards WHERE name='tp'")" >> $MEMLIFE_DIR/shards.tsv
+    memlife_wait_until 120 "rollout to epoch $epoch" rollout_applied rollout_diag ||
+        memlife_fail WORKLOAD_FAIL "rollout to epoch $epoch not applied"
+    echo -e "$1\t$epoch\t$(memlife_sql "SELECT count(*) FROM comdb2_timepartshards WHERE name='tp'" --tabs)" >> $MEMLIFE_DIR/shards.tsv
 }
 
 memlife_main

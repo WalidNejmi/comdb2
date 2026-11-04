@@ -7,10 +7,12 @@ bash -n "$0" || exit 1
 # Invariant: per-transaction memory is freed at commit.
 source ${TESTSROOTDIR}/memlife_common.sh
 MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
-memlife_setup() { $SQLM "CREATE TABLE t (i INT, s TEXT)" >/dev/null; }
+memlife_setup() { memlife_sql "CREATE TABLE t (i INT, s TEXT)" >/dev/null; }
+commits() { seq 1 5000 | sed "s/.*/INSERT INTO t VALUES (&, 'committed')/"; }
 memlife_iteration() {
-    seq 1 5000 | sed "s/.*/INSERT INTO t VALUES (&, 'committed')/" | $SQLM - >/dev/null
-    $SQLM "DELETE FROM t WHERE 1" >/dev/null
+    memlife_batch commits
+    memlife_require "5000 rows committed" test "$(memlife_sql "SELECT count(*) FROM t" --tabs)" = 5000
+    memlife_sql "DELETE FROM t WHERE 1" >/dev/null
 }
 memlife_reclaim() { memlife_force_log_deletion; }
 

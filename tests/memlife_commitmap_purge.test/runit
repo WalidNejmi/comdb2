@@ -4,20 +4,27 @@ bash -n "$0" || exit 1
 # Explicit reclamation test: commit_map grows by one entry per commit while log
 # deletion is off, and must shrink when the log files holding those commits
 # are deleted (bdb delete_log_files -> __txn_commit_map_delete_logfile_txns).
+# Three grow/reclaim cycles: the post-reclaim floor must not rise.
 source ${TESTSROOTDIR}/memlife_common.sh
 MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
-logfiles() { ls ${DBDIR:-$TESTDIR/$dbnm}/logs 2>/dev/null | grep -c '^log\.'; }
-memlife_setup() {
-    $SQLM "CREATE TABLE t (i INT, s TEXT)" >/dev/null
-    $SQLM "EXEC PROCEDURE sys.cmd.send('sync log-delete off')" >/dev/null
+: ${MEMLIFE_ITERS:=9} ${MEMLIFE_RECLAIM_EVERY:=3}
+log_delete() {   # log_delete on|off on every node
+    local n
+    for n in $memlife_nodes; do memlife_sql_node $n "EXEC PROCEDURE sys.cmd.send('sync log-delete $1')" >/dev/null; done
 }
+memlife_setup() {
+    memlife_sql "CREATE TABLE t (i INT, s TEXT)" >/dev/null
+    log_delete off
+}
+commits() { seq 1 3000 | sed "s/.*/INSERT INTO t VALUES (&, 'kept until log deletion')/"; }
 memlife_iteration() {
-    seq 1 3000 | sed "s/.*/INSERT INTO t VALUES (&, 'kept until log deletion')/" | $SQLM - >/dev/null
-    echo -e "$1\t$(logfiles)" >> $MEMLIFE_DIR/logfiles.tsv
+    memlife_batch commits
+    echo -e "$1\t$(memlife_logfiles $master)" >> $MEMLIFE_DIR/logfiles.tsv
 }
 memlife_reclaim() {
-    memlife_force_log_deletion
-    echo -e "RECLAIM\t$(logfiles)" >> $MEMLIFE_DIR/logfiles.tsv
+    memlife_force_log_deletion || return 1
+    echo -e "reclaim\t$(memlife_logfiles $master)" >> $MEMLIFE_DIR/logfiles.tsv
+    log_delete off
 }
 
 memlife_main

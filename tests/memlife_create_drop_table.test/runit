@@ -10,10 +10,10 @@ memlife_reclaim() { memlife_force_log_deletion; }
 memlife_iteration() {
     local k
     for k in $(seq 1 20); do
-        $SQLM "CREATE TABLE t (i INT, s TEXT)" >/dev/null
-        $SQLM "INSERT INTO t SELECT value, 'x' FROM generate_series(1, 100)" >/dev/null
-        $SQLM "SELECT count(*) FROM t" >/dev/null
-        $SQLM "DROP TABLE t" >/dev/null
+        memlife_sql "CREATE TABLE t (i INT, s TEXT)" >/dev/null
+        memlife_sql "INSERT INTO t SELECT value, 'x' FROM generate_series(1, 100)" >/dev/null
+        memlife_require "t has 100 rows" test "$(memlife_sql "SELECT count(*) FROM t" --tabs)" = 100
+        memlife_sql "DROP TABLE t" >/dev/null
     done
 }
 

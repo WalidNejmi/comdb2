@@ -6,17 +6,19 @@ bash -n "$0" || exit 1
 # Invariant: VDBE/sorter memory is freed at finalize; caches plateau.
 source ${TESTSROOTDIR}/memlife_common.sh
 memlife_setup() {
-    $SQLM "CREATE TABLE t (i INT, j INT, s TEXT)" >/dev/null
-    $SQLM "INSERT INTO t SELECT value, value % 97, hex(randomblob(16)) FROM generate_series(1, 20000)" >/dev/null
+    memlife_sql "CREATE TABLE t (i INT, j INT, s TEXT)" >/dev/null
+    memlife_sql "INSERT INTO t SELECT value, value % 97, hex(randomblob(16)) FROM generate_series(1, 20000)" >/dev/null
 }
-memlife_iteration() {
-    { for k in $(seq 1 10); do
+queries() {
+    local k
+    for k in $(seq 1 10); do
         echo "SELECT s FROM t ORDER BY s LIMIT 10"
         echo "SELECT j, count(*), max(s) FROM t GROUP BY j ORDER BY 2 DESC"
         echo "SELECT i, sum(j) OVER (PARTITION BY j ORDER BY i) FROM t WHERE i < 2000 ORDER BY i LIMIT 5"
         echo "WITH x AS (SELECT j, avg(i) a FROM t GROUP BY j) SELECT * FROM x WHERE a > (SELECT avg(i) FROM t) ORDER BY a"
         echo "SELECT i FROM t WHERE j = 5 UNION SELECT i FROM t WHERE j = 6 ORDER BY 1 LIMIT 5"
-      done; } | $SQLM - >/dev/null
+    done
 }
+memlife_iteration() { memlife_batch queries; }
 
 memlife_main

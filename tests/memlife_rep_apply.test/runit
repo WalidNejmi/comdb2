@@ -7,23 +7,40 @@ bash -n "$0" || exit 1
 # separately and compared with itself (physical node, role recorded).
 # Invariant: replication apply state does not grow with applied transactions
 # (historical leak: LC cache child_utxnids, fixed in 48cc34d81).
+# 24 iterations: on a master that is not the client host, the seqnum-ack
+# latency averagers (bdb/rep.c got_new_seqnum_from_node, 10 s / 60 s windows)
+# ramp for about 15 iterations before their plateau.
+# commit_map grows on every node with the 48,000 commits until the log files
+# holding them are deleted: the reclaim deletes them on every node.
 source ${TESTSROOTDIR}/memlife_common.sh
-[ -z "${CLUSTER}" ] && { echo "memlife_rep_apply needs a cluster; skipping"; exit 0; }
+MEMLIFE_NEEDS_CLUSTER=1
+: ${MEMLIFE_ITERS:=24}
+MEMLIFE_RETENTION="commit_map:until-log-file-deletion"
+memlife_reclaim() { memlife_force_log_deletion; }
 rows=0
-memlife_setup() { $SQLM "CREATE TABLE t (i INT)" >/dev/null; }
+memlife_setup() { memlife_sql "CREATE TABLE t (i INT)" >/dev/null; }
+inserts() { seq $((rows + 1)) $((rows + 2000)) | sed 's/.*/INSERT INTO t VALUES(&)/'; }
 memlife_iteration() {
-    seq $((rows + 1)) $((rows + 2000)) | sed 's/.*/INSERT INTO t VALUES(&)/' | $SQLM - >/dev/null
+    memlife_batch inserts
     rows=$((rows + 2000))
 }
-memlife_settle() {   # every node has the rows: replication caught up
-    local n i c
+caught_up() {
+    local n c
     for n in $memlife_nodes; do
-        for (( i = 0; i < 120; i++ )); do
-            c=$(cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $n "SELECT count(*) FROM t")
-            [[ "$c" == "$rows" ]] && break
-            sleep 1
-        done
+        c=$(cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $n "SELECT count(*) FROM t") || return 1
+        [[ $c == "$rows" ]] || return 1
     done
+}
+rep_diag() {
+    local n
+    echo "  expected $rows rows on every node"
+    for n in $memlife_nodes; do
+        echo "  $n: $(cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $n "SELECT count(*) FROM t" 2>&1) rows"
+    done
+    cdb2sql ${CDB2_OPTIONS} $dbnm default "SELECT host, is_master, coherent_state FROM comdb2_cluster" 2>&1 | sed 's/^/  /'
+}
+memlife_settle() {   # replication caught up on every node
+    memlife_wait_until 180 "every node has $rows rows" caught_up rep_diag || return 1
     sleep 2
 }
 

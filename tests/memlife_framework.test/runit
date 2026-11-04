@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Unit tests of the memory-lifecycle framework: classifier, retention and
+# snapshot validation (memlife_compare.py), and the fail-closed shell helpers
+# of memlife_common.sh with a fake cdb2sql. The database is not used.
+python3 ${TESTSROOTDIR}/tools/memlife_unittest.py || exit 1
+bash ${TESTSROOTDIR}/tools/memlife_shell_unittest.sh || exit 1
+echo "memlife framework unit tests passed"

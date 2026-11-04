@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# Lifecycle: time-series metric averagers (time_metric_add, util allocator)
+# with production defaults (30 s window, 10,000 points): every statement adds
+# points. Invariant: the averagers reach a bounded high-water mark.
+# The other memlife tests cap timeseries_metrics_maxpoints as a noise control
+# because this test covers the subsystem.
+source ${TESTSROOTDIR}/memlife_common.sh
+: ${MEMLIFE_ITERS:=16}
+selects() { seq 1 2000 | sed 's/.*/SELECT 1/'; }
+memlife_iteration() { memlife_batch selects; }
+
+memlife_main

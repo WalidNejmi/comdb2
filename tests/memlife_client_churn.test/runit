@@ -4,23 +4,50 @@ bash -n "$0" || exit 1
 # Lifecycle: per-connection state. 100 clean connect/query/disconnect plus 20
 # abrupt disconnects (client killed during a query) per iteration.
 # Invariant: client/session state does not grow with the number of clients.
+# MEMLIFE_CHURN_ABRUPT=0: clean disconnects only (control).
+# MEMLIFE_CHURN_POOL="linger 4 mint 0 maxt 1": SQL engine pool settings for the run.
+# MEMLIFE_CHURN_LINGER=1: after the last iteration wait for idle SQL engine
+#   threads to exit, then snapshot (R1).
+# MEMLIFE_CHURN_SETTLE_TIMEOUT (30 s): how long the server may take to drop
+#   the killed sessions (a small pool serves the killed queries one by one).
+# MEMLIFE_CHURN_KILL_AFTER (0.3 s): when each abrupt client is killed during
+#   its SELECT sleep(5) (raise it for slow servers, e.g. under Valgrind).
+# churn.tsv: iteration, connections, sqlenginepool threads after the settle.
 source ${TESTSROOTDIR}/memlife_common.sh
-base_conns=0
-nconns() { $SQLM --tabs "SELECT count(*) FROM comdb2_connections"; }
-memlife_setup() { $SQLM "CREATE TABLE t (i INT)" >/dev/null; $SQLM "INSERT INTO t SELECT value FROM generate_series(1, 100)" >/dev/null; }
+abrupt=${MEMLIFE_CHURN_ABRUPT:-20}
+base_conns=0 churn_it=warmup
+nconns() { cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $master "SELECT count(*) FROM comdb2_connections"; }
+pool() { cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host $master "SELECT $1 FROM comdb2_threadpools WHERE name='sqlenginepool'"; }
+conns_back() { local c; c=$(nconns) || return 1; (( c <= base_conns + 1 )); }
+churn_diag() { echo "  baseline connections $base_conns, now $(nconns); sqlenginepool threads $(pool num_thd), free $(pool free_thd)"; }
+pool_idle() { local n; n=$(pool "num_thd - max(min_thds, 1)") || return 1; (( n <= 0 )); }
+memlife_setup() {
+    if [[ -n ${MEMLIFE_CHURN_POOL:-} ]]; then
+        set -- $MEMLIFE_CHURN_POOL
+        while (( $# >= 2 )); do memlife_sql "EXEC PROCEDURE sys.cmd.send('sqlenginepool $1 $2')" >/dev/null; shift 2; done
+    fi
+    memlife_sql "CREATE TABLE t (i INT)" >/dev/null
+    memlife_sql "INSERT INTO t SELECT value FROM generate_series(1, 100)" >/dev/null
+}
 memlife_iteration() {
     local k p
-    for k in $(seq 1 100); do $SQLM "SELECT count(*) FROM t WHERE i > 10" >/dev/null; done
-    for k in $(seq 1 ${MEMLIFE_CHURN_ABRUPT:-20}); do   # 0: clean disconnects only
-        $SQLM "SELECT sleep(5)" >/dev/null 2>&1 & p=$!
-        sleep 0.3; kill -9 $p 2>/dev/null; wait $p 2>/dev/null
+    churn_it=$1
+    for k in $(seq 1 100); do memlife_sql "SELECT count(*) FROM t WHERE i > 10" >/dev/null; done
+    for k in $(seq 1 $abrupt); do
+        cdb2sql ${CDB2_OPTIONS} $dbnm --host $master "SELECT sleep(5)" >/dev/null 2>&1 & p=$!
+        sleep ${MEMLIFE_CHURN_KILL_AFTER:-0.3}
+        kill -9 $p 2>/dev/null || memlife_fail WORKLOAD_FAIL "abrupt client $k ended before it was killed"
+        wait $p 2>/dev/null || true   # killed on purpose
     done
 }
-memlife_settle() {   # wait until the server has torn down the killed sessions
-    local i
-    for (( i = 0; i < 30; i++ )); do (( $(nconns) <= base_conns + 1 )) && break; sleep 1; done
+memlife_settle() {   # the server has torn down the killed sessions
+    memlife_wait_until ${MEMLIFE_CHURN_SETTLE_TIMEOUT:-30} "connections back to baseline" conns_back churn_diag || return 1
     sleep 1
+    echo -e "$churn_it\t$(nconns)\t$(pool num_thd)" >> $MEMLIFE_DIR/churn.tsv
 }
-memlife_warmup() { memlife_iteration 0; sleep 6; base_conns=$(nconns); }
+memlife_warmup() { memlife_iteration 0; sleep 6; base_conns=$(nconns) || memlife_fail INFRA_FAIL "cannot count connections"; }
+if [[ ${MEMLIFE_CHURN_LINGER:-0} == 1 ]]; then
+    memlife_reclaim() { churn_it=linger; memlife_wait_until 300 "idle SQL engine threads exited" pool_idle churn_diag; }
+fi
 
 memlife_main
