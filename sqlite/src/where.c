@@ -50,6 +50,7 @@ int shard_check_parallelism(int iTable);
 int comdb2_shard_table_constraints(Parse *pParse, 
         const char *zName, const char *zDatabase, Expr **pWhere);
 int is_comdb2_index_unique(const char *tbl, char *idx);
+int comdb2_index_unique_ncols(const char *tbl, const char *idx, int *pUniqNulls);
 int comdb2_get_planner_effort();
 
 static char *comdb2IndexName(char *src, char *dest)
@@ -1688,6 +1689,7 @@ static int whereEqualScanEst(
   Parse *pParse,       /* Parsing & code generating context */
   WhereLoopBuilder *pBuilder,
   Expr *pExpr,         /* Expression for VALUE in the x=VALUE constraint */
+  u16 eOp,             /* Operator: WO_EQ, WO_IN, WO_IS or WO_ISNULL */
   tRowcnt *pnRow       /* Write the revised row estimate here */
 ){
   Index *p = pBuilder->pNew->u.btree.pIndex;
@@ -1715,6 +1717,27 @@ static int whereEqualScanEst(
     *pnRow = 1;
     return SQLITE_OK;
   }
+
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+  /* comdb2 declares every index to SQLite as non-unique (see
+  ** create_sqlmaster_record()), so the shortcut above never fires for
+  ** comdb2 keys.  If this is a unique comdb2 key and all of its key columns
+  ** are constrained by equality, at most one row can match whatever the
+  ** value is, so do not look at the value.  Looking at it would mark the
+  ** bound parameter in Vdbe.expmask and force a full re-prepare of the
+  ** statement every time a new value is bound.  If the key lets several
+  ** rows hold NULL, only "=" and "IN" (which never match NULL) qualify. */
+  if( p->pTable->iDb==0 ){
+    int bUniqNulls = 0;
+    int nUniq = comdb2_index_unique_ncols(p->pTable->zName, p->zName,
+                                          &bUniqNulls);
+    if( nUniq>0 && nEq>=nUniq
+     && (bUniqNulls==0 || (eOp & (WO_EQ|WO_IN))!=0) ){
+      *pnRow = 1;
+      return SQLITE_OK;
+    }
+  }
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
 
   rc = sqlite3Stat4ProbeSetValue(pParse, p, &pRec, pExpr, 1, nEq-1, &bOk);
   pBuilder->pRec = pRec;
@@ -1765,7 +1788,7 @@ static int whereInScanEst(
   assert( p->aSample!=0 );
   for(i=0; rc==SQLITE_OK && i<pList->nExpr; i++){
     nEst = nRow0;
-    rc = whereEqualScanEst(pParse, pBuilder, pList->a[i].pExpr, &nEst);
+    rc = whereEqualScanEst(pParse, pBuilder, pList->a[i].pExpr, WO_IN, &nEst);
     nRowEst += nEst;
     pBuilder->nRecValid = nRecValid;
   }
@@ -2276,6 +2299,39 @@ static int whereLoopInsert(WhereLoopBuilder *pBuilder, WhereLoop *pTemplate){
   return rc;
 }
 
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+/*
+** Return true if pWC constrains every column of some unique comdb2 key of
+** the table at pWC->pWInfo->pTabList->a[iTab] with "col = <constant>",
+** i.e. the table has a candidate loop that returns at most one row whatever
+** the bound parameter values are.  Such a lookup wins regardless of small
+** row-estimate tweaks on the other candidate loops, so there is no point in
+** peeking at bound values to refine those (which would force a re-prepare
+** each time the statement is executed with new values).
+*/
+static int comdb2WhereHasUniqueEq(WhereClause *pWC, int iTab){
+  struct SrcList_item *pSrc = &pWC->pWInfo->pTabList->a[iTab];
+  Table *pTab = pSrc->pTab;
+  Index *pIdx;
+  if( pTab==0 || pTab->iDb!=0 || IsVirtual(pTab) ) return 0;
+  for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+    int bUniqNulls, i;
+    int nUniq;
+    if( pIdx->pPartIdxWhere ) continue;
+    nUniq = comdb2_index_unique_ncols(pTab->zName, pIdx->zName, &bUniqNulls);
+    if( nUniq<=0 || nUniq>pIdx->nKeyCol ) continue;
+    for(i=0; i<nUniq; i++){
+      if( sqlite3WhereFindTerm(pWC, pSrc->iCursor, i, ~(Bitmask)0, WO_EQ,
+                               pIdx)==0 ){
+        break;
+      }
+    }
+    if( i==nUniq ) return 1;
+  }
+  return 0;
+}
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
+
 /*
 ** Adjust the WhereLoop.nOut value downward to account for terms of the
 ** WHERE clause that reference the loop but which are not used by an
@@ -2314,6 +2370,9 @@ static void whereLoopOutputAdjust(
   Bitmask notAllowed = ~(pLoop->prereq|pLoop->maskSelf);
   int i, j;
   LogEst iReduce = 0;    /* pLoop->nOut should not exceed nRow-iReduce */
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+  int bUniqueEq = -1;    /* comdb2WhereHasUniqueEq(), computed lazily */
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
 
   assert( (pLoop->wsFlags & WHERE_AUTO_INDEX)==0 );
   for(i=pWC->nTerm, pTerm=pWC->a; i>0; i--, pTerm++){
@@ -2340,6 +2399,14 @@ static void whereLoopOutputAdjust(
           Parse *pParse = pWC->pWInfo->pParse;
           int k = 0;
           testcase( pTerm->pExpr->op==TK_IS );
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+          if( pRight && pRight->op==TK_VARIABLE ){
+            if( bUniqueEq<0 ){
+              bUniqueEq = comdb2WhereHasUniqueEq(pWC, pLoop->iTab);
+            }
+            if( bUniqueEq ) pParse = 0; /* do not peek at the bound value */
+          }
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
           if( sqlite3ExprIsInteger(pRight, &k, pParse) && k>=(-1) && k<=1 ){
             k = 10;
           }else{
@@ -2711,7 +2778,7 @@ static int whereLoopAddBtreeIndex(
             testcase( eOp & WO_EQ );
             testcase( eOp & WO_IS );
             testcase( eOp & WO_ISNULL );
-            rc = whereEqualScanEst(pParse, pBuilder, pExpr->pRight, &nOut);
+            rc = whereEqualScanEst(pParse, pBuilder, pExpr->pRight, eOp, &nOut);
           }else{
             rc = whereInScanEst(pParse, pBuilder, pExpr->x.pList, &nOut);
           }

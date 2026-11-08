@@ -106,6 +106,7 @@ struct comdb2_metrics_store {
     int64_t minimum_truncation_offset;
     int64_t minimum_truncation_timestamp;
     int64_t reprepares;
+    int64_t sql_reprepares;
     int64_t nonsql;
     int64_t vreplays;
     int64_t nsslfullhandshakes;
@@ -323,6 +324,8 @@ comdb2_metric gbl_metrics[] = {
 #endif
     {"reprepares", "Number of times statements are reprepared by sqlitex", STATISTIC_INTEGER,
      STATISTIC_COLLECTION_TYPE_CUMULATIVE, &stats.reprepares, NULL},
+    {"sql_reprepares", "Number of times prepared SQL statements were recompiled before execution", STATISTIC_INTEGER,
+     STATISTIC_COLLECTION_TYPE_CUMULATIVE, &stats.sql_reprepares, NULL},
     {"verify_replays", "Number of replays on verify errors", STATISTIC_INTEGER, STATISTIC_COLLECTION_TYPE_CUMULATIVE,
      &stats.vreplays, NULL},
     {"nsslfullhandshakes", "Number of SSL full handshakes", STATISTIC_INTEGER, STATISTIC_COLLECTION_TYPE_CUMULATIVE,
@@ -465,6 +468,7 @@ const char *metric_collection_type_string(comdb2_collection_type t) {
 int gbl_metrics_count = sizeof(gbl_metrics) / sizeof(comdb2_metric);
 
 extern int n_commits;
+extern int64_t gbl_sql_reprepares;
 extern long n_fstrap;
 
 /* Legacy request metrics */
@@ -833,6 +837,8 @@ int refresh_metrics(void)
     stats.minimum_truncation_offset = min_offset;
     stats.minimum_truncation_timestamp = min_timestamp;
 #endif
+
+    stats.sql_reprepares = __atomic_load_n(&gbl_sql_reprepares, __ATOMIC_RELAXED);
 
     if (gbl_old_column_names && query_preparer_plugin &&
         query_preparer_plugin->sqlitex_get_metrics) {

@@ -12276,6 +12276,29 @@ int is_comdb2_index_unique(const char *dbname, char *idx)
     return 0;
 }
 
+/* If index idx of table tbl is a comdb2 unique (non-dup) key, return the
+ * number of key columns, otherwise 0.  An equality on all of those columns
+ * matches at most one row.  *pUniqNulls is set if NULL values are exempt from
+ * uniqueness, in which case only operators that never match NULL ("=", IN)
+ * are guaranteed to match at most one row. */
+int comdb2_index_unique_ncols(const char *tbl, const char *idx, int *pUniqNulls)
+{
+    struct dbtable *db = get_dbtable_by_name(tbl);
+    *pUniqNulls = 0;
+    if (db == NULL)
+        return 0;
+    for (int i = 0; i < db->nix; ++i) {
+        struct schema *s = db->ixschema[i];
+        if (s->sqlitetag && strcmp(s->sqlitetag, idx) == 0) {
+            if (s->flags & SCHEMA_DUP)
+                return 0;
+            *pUniqNulls = (s->flags & SCHEMA_UNIQNULLS) != 0;
+            return s->nmembers;
+        }
+    }
+    return 0;
+}
+
 int is_comdb2_index_expression(const char *dbname)
 {
     struct dbtable *db = get_dbtable_by_name(dbname);

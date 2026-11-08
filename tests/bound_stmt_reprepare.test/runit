@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+bash -n "$0" || exit 1
+
+# A cached statement executed again with new bound values must not be
+# recompiled by sqlite.
+#
+# With STAT4 statistics the planner used to read bound values while planning
+# (to refine row estimates).  Reading a value marks the parameter in
+# Vdbe.expmask, and every later bind then expires the statement, so each
+# execution of e.g. "select ... where id = ?" was fully re-parsed and
+# re-planned.  Equality on every column of a unique key matches at most one
+# row whatever the value, so the planner no longer reads bound values in that
+# case.  The sql_reprepares metric counts sqlite re-prepares.
+
+source ${TESTSROOTDIR}/tools/runit_common.sh
+
+dbnm=$1
+[[ -z "$dbnm" ]] && failexit "need a DB name"
+
+# Metrics are per node: pin every connection to one node.
+host=$(cdb2sql --tabs ${CDB2_OPTIONS} $dbnm default 'select comdb2_host()')
+run() { cdb2sql ${CDB2_OPTIONS} $dbnm --host "$host" "$@"; }
+runtabs() { cdb2sql --tabs ${CDB2_OPTIONS} $dbnm --host "$host" "$@"; }
+reprepares() { runtabs "select cast(value as integer) from comdb2_metrics where name = 'sql_reprepares'"; }
+
+N=200
+
+run "create table t(id int primary key, k int, v cstring(16))" || failexit "create table"
+run "create index t_k on t(k)" || failexit "create index"
+run "insert into t select value, value % 10, 'v' || value from generate_series(1, 5000)" || failexit "insert"
+run "analyze t" || failexit "analyze"
+nstat4=$(runtabs "select count(*) from sqlite_stat4 where tbl = 't'")
+[[ "$nstat4" -gt 0 ]] || failexit "no sqlite_stat4 samples for t"
+
+# Run each statement N times on one connection with a different bound value
+# each time, and return how many re-prepares the node did meanwhile.
+# $1: statement, $2: function printing the @bind lines for iteration $i.
+run_bound() {
+    local sql=$1 binds=$2 before after
+    before=$(reprepares)
+    for i in $(seq 1 $N); do
+        $binds $i
+        echo "$sql"
+    done | runtabs - > out.$$ 2>&1 || failexit "running '$sql'"
+    # drop the echo of each command ("[sql] rc 0") and keep the result rows
+    grep -v '^\[' out.$$ > rows.$$
+    after=$(reprepares)
+    echo $((after - before))
+}
+
+bind_id() { echo "@bind CDB2_INTEGER id $1"; }
+bind_id_v() { echo "@bind CDB2_INTEGER id $1"; echo "@bind CDB2_CSTRING v u$1"; }
+bind_ids() { echo "@bind CDB2_INTEGER a $1"; echo "@bind CDB2_INTEGER b $(($1 + 1000))"; }
+bind_k() { echo "@bind CDB2_INTEGER k $(($1 % 10))"; }
+
+# Sanity check that the metric works: equality on a non-unique index still
+# reads the bound value (the estimate depends on it), so it re-prepares.
+d=$(run_bound "select count(*) from t where k = @k" bind_k)
+echo "non-unique k = ?: $d re-prepares for $N executions"
+[[ "$d" -ge $((N / 2)) ]] || failexit "expected re-prepares for 'k = ?' (got $d); is sql_reprepares counted?"
+
+d=$(run_bound "select id, k, v from t where id = @id" bind_id)
+echo "pk id = ?: $d re-prepares for $N executions"
+[[ "$d" -lt 5 ]] || failexit "point select by primary key re-prepared $d times for $N executions"
+# results must be right
+expected=$(for i in $(seq 1 $N); do echo -e "$i\t$((i % 10))\tv$i"; done)
+assertres "$(cat rows.$$)" "$expected" "point select results"
+
+d=$(run_bound "update t set v = @v where id = @id" bind_id_v)
+echo "update by pk: $d re-prepares for $N executions"
+[[ "$d" -lt 5 ]] || failexit "update by primary key re-prepared $d times for $N executions"
+assertres "$(runtabs "select count(*) from t where id <= $N and v = 'u' || id")" "$N" "updated rows"
+
+d=$(run_bound "select id from t where id in (@a, @b) order by id" bind_ids)
+echo "pk id in (?, ?): $d re-prepares for $N executions"
+[[ "$d" -lt 5 ]] || failexit "IN lookup by primary key re-prepared $d times for $N executions"
+
+rm -f out.$$ rows.$$
+echo "Success"

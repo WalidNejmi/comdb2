@@ -922,6 +922,12 @@ static int sqlite3LockAndPrepare(
 ** locked the sqlite3_master table, return SQLITE_LOCKED. If any other error
 ** occurs, return SQLITE_SCHEMA.
 */
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+/* Number of statements re-prepared by sqlite3Reprepare() (exposed as the
+** sql_reprepares metric). */
+int64_t gbl_sql_reprepares = 0;
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
+
 int sqlite3Reprepare(Vdbe *p){
   int rc;
   sqlite3_stmt *pNew;
@@ -935,6 +941,9 @@ int sqlite3Reprepare(Vdbe *p){
   db = sqlite3VdbeDb(p);
   assert( sqlite3_mutex_held(db->mutex) );
   prepFlags = sqlite3VdbePrepareFlags(p);
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+  __atomic_add_fetch(&gbl_sql_reprepares, 1, __ATOMIC_RELAXED);
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
   rc = sqlite3LockAndPrepare(db, zSql, -1, prepFlags, p, &pNew, 0);
   if( rc ){
     if( rc==SQLITE_NOMEM ){
