@@ -8,13 +8,14 @@ import sys
 import tempfile
 import unittest
 
-EXECUTABLE, FAILURE = sys.argv[1:3]
-del sys.argv[1:3]
+EXECUTABLE, FAILURE, SOURCE = sys.argv[1:4]
+del sys.argv[1:4]
 SIZES = (1000, 100000, 1000000)
 OPERATIONS = ("Insert", "LookupHit", "LookupMiss", "Delete")
 NAMES = {"PlHash_{}/{}".format(op, size) for op in OPERATIONS for size in SIZES}
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from noise_study import process_medians
+from compare_revisions import validate_builds, summarize_pairs
 
 
 def run(executable, *args):
@@ -23,6 +24,30 @@ def run(executable, *args):
 
 
 class BenchmarkContract(unittest.TestCase):
+    def test_comparison_identity_and_pair_hierarchy(self):
+        info = json.loads((Path(EXECUTABLE).parent / "build-info.json").read_text())
+        clean = dict(info, source_dirty=False, harness_dirty=False)
+        validate_builds(clean, dict(clean, comdb2_sha="b" * 40))
+        for field in ("benchmark_definition_sha256", "c_flags",
+                      "google_benchmark_library_sha256", "c_compiler_sha256"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate_builds(clean, dict(clean, **{field: "different"}))
+        with self.assertRaises(ValueError):
+            validate_builds(clean, dict(clean, source_dirty=True))
+        pairs = [
+            {"base": {"x": {"cpu_time": 10, "real_time": 20}},
+             "candidate": {"x": {"cpu_time": 11, "real_time": 18}}},
+            {"base": {"x": {"cpu_time": 100, "real_time": 200}},
+             "candidate": {"x": {"cpu_time": 90, "real_time": 220}}},
+        ]
+        result = summarize_pairs(pairs)["x"]
+        self.assertAlmostEqual(result["cpu_time"]["median_delta_percent"], 0)
+        self.assertAlmostEqual(result["real_time"]["median_delta_percent"], 0)
+        self.assertEqual(result["cpu_time"]["base_process_medians"], [10, 100])
+        pairs[1]["candidate"] = {}
+        with self.assertRaises(ValueError):
+            summarize_pairs(pairs)
+
     def test_noise_uses_process_medians_not_pooled_repetitions(self):
         median = dict(run_name="PlHash_LookupHit/1000", aggregate_name="median",
                       time_unit="ns", real_time=20, cpu_time=10)
@@ -54,6 +79,13 @@ class BenchmarkContract(unittest.TestCase):
             data = json.loads(path.read_text())
         self.assertEqual(data["context"]["policy"], "REPORT_ONLY / NOT_QUALIFIED")
         self.assertEqual(len(data["context"]["comdb2_sha"]), 40)
+        expected = subprocess.check_output(["git", "-C", SOURCE, "rev-parse", "HEAD"],
+                                           universal_newlines=True).strip()
+        self.assertEqual(data["context"]["comdb2_sha"], expected)
+        info = json.loads((Path(EXECUTABLE).parent / "build-info.json").read_text())
+        self.assertEqual(Path(info["production_source_root"]).resolve(), Path(SOURCE).resolve())
+        self.assertEqual(data["context"]["benchmark_definition_sha256"],
+                         info["benchmark_definition_sha256"])
         rows = data["benchmarks"]
         self.assertFalse(any(row.get("error_occurred") for row in rows))
         raw = [row for row in rows if row["run_type"] == "iteration"]

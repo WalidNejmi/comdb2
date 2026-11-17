@@ -113,6 +113,39 @@ random seed, or file I/O in the measured operation.
 
 ## Noise and comparison
 
+### Frozen harness, different production revisions
+
+Configure the same clean harness checkout twice with
+`-DCOMDB2_SOURCE_ROOT=/absolute/clean/production/checkout` and separate build
+directories. The default remains the harness's parent checkout. Do not copy
+benchmark files into the baseline. Both source trees must be frozen at exact
+commits; `build-info.json` records production identity separately from harness
+identity. The definition hash covers benchmark C/C++/Python and build recipes,
+not the production implementation.
+
+```sh
+cmake -S /frozen/harness/benchmarks -B /build/base \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCOMDB2_SOURCE_ROOT=/source/base \
+  -DCMAKE_PREFIX_PATH=/dependency/install
+cmake -S /frozen/harness/benchmarks -B /build/candidate \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCOMDB2_SOURCE_ROOT=/source/candidate \
+  -DCMAKE_PREFIX_PATH=/dependency/install
+cmake --build /build/base
+cmake --build /build/candidate
+python3 /frozen/harness/benchmarks/compare_revisions.py \
+  /build/base/comdb2_microbenchmarks.tsk \
+  /build/candidate/comdb2_microbenchmarks.tsk /new/comparison
+```
+
+The comparison refuses dirty provenance or different definitions, compiler
+binaries/flags or dependency libraries. Four sequential pairs use AB/BA/AB/BA
+order, five repetitions/process and min_time 0.05. Each pair uses process
+medians; output retains every paired delta plus median/min/max. Timing delta is
+`(candidate-base)/base*100`, negative means faster, not a verdict.
+Raw repetitions, JSON context, command arrays and executable hashes are retained.
+Use one admitted host and the same environment for both sides. No affinity is
+imposed. This is report-only, not a replacement for workload qualification.
+
 ```sh
 python3 benchmarks/noise_study.py \
   ./benchmarks/build/comdb2_microbenchmarks.tsk /tmp/plhash-noise

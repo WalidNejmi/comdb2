@@ -37,7 +37,12 @@ int main(void) { return 0; }
 if(NOT MICROBENCH_OPTIMIZED_C)
   message(FATAL_ERROR "The configured C flags must enable optimization and NDEBUG.")
 endif()
-get_filename_component(COMDB2_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+get_filename_component(default_source "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+set(COMDB2_SOURCE_ROOT "${default_source}" CACHE PATH "Exact Comdb2 production checkout")
+get_filename_component(COMDB2_SOURCE "${COMDB2_SOURCE_ROOT}" REALPATH)
+if(NOT EXISTS "${COMDB2_SOURCE}/util/plhash.c")
+  message(FATAL_ERROR "COMDB2_SOURCE_ROOT must name a Comdb2 production checkout")
+endif()
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/include")
 configure_file("${COMDB2_SOURCE}/bbinc/plhash.in" include/plhash.h COPYONLY)
 
@@ -60,11 +65,13 @@ target_link_libraries(microbench_primitives PUBLIC Threads::Threads)
 
 add_custom_target(benchmark_build_info
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/build_info.py"
-    --source "${COMDB2_SOURCE}" --output "${CMAKE_CURRENT_BINARY_DIR}"
+    --source "${COMDB2_SOURCE}" --harness "${CMAKE_CURRENT_SOURCE_DIR}"
+    --output "${CMAKE_CURRENT_BINARY_DIR}"
     --c-compiler "${CMAKE_C_COMPILER}" --cxx-compiler "${CMAKE_CXX_COMPILER}"
     "--c-flags=${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${build_type}} -fPIC -std=gnu99 -fno-strict-aliasing -DBUILDING_TOOLS"
     "--cxx-flags=${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${build_type}} -fPIE -std=gnu++11 -fno-strict-aliasing"
     --benchmark-version "${benchmark_VERSION}" --benchmark-dir "${benchmark_DIR}"
+    --benchmark-library "$<TARGET_FILE:benchmark::benchmark>"
   BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/include/build_info.h"
     "${CMAKE_CURRENT_BINARY_DIR}/build-info.json"
   VERBATIM
@@ -84,4 +91,5 @@ set_target_properties(benchmark_failure_test PROPERTIES EXCLUDE_FROM_ALL ON)
 enable_testing()
 add_test(NAME microbenchmark_contract
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmarks.py"
-    "$<TARGET_FILE:comdb2_microbenchmarks>" "$<TARGET_FILE:benchmark_failure_test>")
+    "$<TARGET_FILE:comdb2_microbenchmarks>" "$<TARGET_FILE:benchmark_failure_test>"
+    "${COMDB2_SOURCE}")

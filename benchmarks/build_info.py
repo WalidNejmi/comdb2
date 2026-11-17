@@ -13,22 +13,26 @@ def capture(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("source", "output", "c-compiler", "cxx-compiler", "c-flags",
-                 "cxx-flags", "benchmark-version", "benchmark-dir"):
+    for name in ("source", "harness", "output", "c-compiler", "cxx-compiler", "c-flags",
+                 "cxx-flags", "benchmark-version", "benchmark-dir", "benchmark-library"):
         parser.add_argument("--" + name, required=True)
     args = parser.parse_args()
     root = Path(args.source)
-    definition_files = [
-        "benchmarks/CMakeLists.txt", "benchmarks/Makefile",
-        "benchmarks/benchmark_main.cpp", "benchmarks/plhash_bench.cpp",
-        "benchmarks/plhash_fixture.h", "benchmarks/build_info.py",
-    ]
+    harness = Path(args.harness)
+    definition_files = sorted(
+        p for p in harness.rglob("*")
+        if p.is_file() and "build" not in p.relative_to(harness).parts
+        and (p.suffix in (".cpp", ".h", ".py") or p.name in ("CMakeLists.txt", "Makefile"))
+        and "__pycache__" not in p.parts)
     digest = hashlib.sha256()
-    for name in definition_files:
-        digest.update(name.encode() + b"\0" + (root / name).read_bytes() + b"\0")
+    for path in definition_files:
+        digest.update(str(path.relative_to(harness)).encode() + b"\0" + path.read_bytes() + b"\0")
     info = {
         "comdb2_sha": capture(["git", "-C", str(root), "rev-parse", "HEAD"]),
         "source_dirty": bool(capture(["git", "-C", str(root), "status", "--porcelain"])),
+        "production_source_root": str(root.resolve()),
+        "harness_sha": capture(["git", "-C", str(harness), "rev-parse", "HEAD"]),
+        "harness_dirty": bool(capture(["git", "-C", str(harness), "status", "--porcelain"])),
         "benchmark_definition_sha256": digest.hexdigest(),
         "c_compiler": args.c_compiler,
         "c_compiler_version": capture([args.c_compiler, "--version"]).splitlines()[0],
@@ -38,6 +42,9 @@ def main():
         "cxx_flags": args.cxx_flags,
         "google_benchmark_version": args.benchmark_version,
         "google_benchmark_cmake_dir": args.benchmark_dir,
+        "google_benchmark_library_sha256": hashlib.sha256(Path(args.benchmark_library).read_bytes()).hexdigest(),
+        "c_compiler_sha256": hashlib.sha256(Path(args.c_compiler).read_bytes()).hexdigest(),
+        "cxx_compiler_sha256": hashlib.sha256(Path(args.cxx_compiler).read_bytes()).hexdigest(),
         "allocator": "BUILDING_TOOLS/system",
     }
     output = Path(args.output)

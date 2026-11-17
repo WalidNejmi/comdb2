@@ -27,6 +27,8 @@ int main(int argc, char** argv)
             return 1;
         benchmark::AddCustomContext("comdb2_sha", MICROBENCH_COMDB2_SHA);
         benchmark::AddCustomContext("source_dirty", MICROBENCH_SOURCE_DIRTY);
+        benchmark::AddCustomContext("harness_sha", MICROBENCH_HARNESS_SHA);
+        benchmark::AddCustomContext("harness_dirty", MICROBENCH_HARNESS_DIRTY);
         benchmark::AddCustomContext("benchmark_definition_sha256", MICROBENCH_BENCHMARK_DEFINITION_SHA256);
         benchmark::AddCustomContext("c_compiler", MICROBENCH_C_COMPILER_VERSION);
         benchmark::AddCustomContext("cxx_compiler", MICROBENCH_CXX_COMPILER_VERSION);
