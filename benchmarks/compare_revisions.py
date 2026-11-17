@@ -20,7 +20,7 @@ def validate_builds(base, candidate):
     for key in ("benchmark_definition_sha256", "harness_sha", "c_compiler",
                 "cxx_compiler", "c_compiler_version", "cxx_compiler_version",
                 "c_compiler_sha256", "cxx_compiler_sha256", "c_flags", "cxx_flags",
-                "google_benchmark_version", "google_benchmark_library_sha256", "allocator"):
+                "component_flags", "google_benchmark_version", "google_benchmark_library_sha256", "allocator"):
         if base[key] != candidate[key]:
             raise ValueError("incomparable build field: " + key)
 
@@ -53,7 +53,7 @@ def summarize_pairs(pairs):
 def observation(document, info):
     context = document["context"]
     for key in ("comdb2_sha", "harness_sha", "benchmark_definition_sha256",
-                "c_flags", "cxx_flags", "google_benchmark_version"):
+                "c_flags", "cxx_flags", "component_flags", "google_benchmark_version"):
         if context[key] != info[key]:
             raise ValueError("binary/build metadata mismatch: " + key)
     if context["source_dirty"] != "false" or context["harness_dirty"] != "false":

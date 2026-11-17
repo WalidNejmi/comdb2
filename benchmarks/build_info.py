@@ -14,7 +14,8 @@ def capture(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("source", "harness", "output", "c-compiler", "cxx-compiler", "c-flags",
-                 "cxx-flags", "benchmark-version", "benchmark-dir", "benchmark-library"):
+                 "cxx-flags", "benchmark-version", "benchmark-dir", "benchmark-library",
+                 "component-flags"):
         parser.add_argument("--" + name, required=True)
     args = parser.parse_args()
     root = Path(args.source)
@@ -22,7 +23,7 @@ def main():
     definition_files = sorted(
         p for p in harness.rglob("*")
         if p.is_file() and "build" not in p.relative_to(harness).parts
-        and (p.suffix in (".cpp", ".h", ".py") or p.name in ("CMakeLists.txt", "Makefile"))
+        and (p.suffix in (".c", ".cpp", ".h", ".py") or p.name in ("CMakeLists.txt", "Makefile"))
         and "__pycache__" not in p.parts)
     digest = hashlib.sha256()
     for path in definition_files:
@@ -40,6 +41,7 @@ def main():
         "cxx_compiler_version": capture([args.cxx_compiler, "--version"]).splitlines()[0],
         "c_flags": args.c_flags,
         "cxx_flags": args.cxx_flags,
+        "component_flags": args.component_flags,
         "google_benchmark_version": args.benchmark_version,
         "google_benchmark_cmake_dir": args.benchmark_dir,
         "google_benchmark_library_sha256": hashlib.sha256(Path(args.benchmark_library).read_bytes()).hexdigest(),

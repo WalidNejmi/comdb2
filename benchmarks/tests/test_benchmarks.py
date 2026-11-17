@@ -19,6 +19,11 @@ NAMES |= {"Pool_{}/{}".format(op, size) for op in ("Get", "GetZeroed", "Return",
           for size in (32, 128, 512)}
 NAMES |= {"Pool_Grow/entry:{}/step:{}".format(size, step)
           for size, step in ((32, 64), (128, 64), (512, 64), (128, 512))}
+NAMES |= {"CRC32C_{}/{}".format(op, size) for op in ("Comdb2", "Software")
+          for size in (64, 256, 4096, 65536)}
+NAMES |= {"RLE_{}/{}/{}".format(op, shape, size) for op in ("Compress", "Decompress")
+          for shape in ("Zeros", "Repeated8", "Mixed", "Incompressible")
+          for size in (256, 4096, 65536)}
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from noise_study import process_medians
 from compare_revisions import validate_builds, summarize_pairs

@@ -34,6 +34,7 @@ int main(int argc, char** argv)
         benchmark::AddCustomContext("cxx_compiler", MICROBENCH_CXX_COMPILER_VERSION);
         benchmark::AddCustomContext("c_flags", MICROBENCH_C_FLAGS);
         benchmark::AddCustomContext("cxx_flags", MICROBENCH_CXX_FLAGS);
+        benchmark::AddCustomContext("component_flags", MICROBENCH_COMPONENT_FLAGS);
         benchmark::AddCustomContext("google_benchmark_version", MICROBENCH_GOOGLE_BENCHMARK_VERSION);
         benchmark::AddCustomContext("allocator", MICROBENCH_ALLOCATOR);
         benchmark::AddCustomContext("policy", "REPORT_ONLY / NOT_QUALIFIED");

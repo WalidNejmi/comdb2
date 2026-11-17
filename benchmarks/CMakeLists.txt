@@ -52,6 +52,8 @@ add_library(microbench_primitives STATIC
   "${COMDB2_SOURCE}/util/pool.c"
   "${COMDB2_SOURCE}/util/logmsg.c"
   "${COMDB2_SOURCE}/util/segstring.c"
+  "${COMDB2_SOURCE}/crc32c/crc32c.c"
+  "${COMDB2_SOURCE}/comdb2rle/comdb2rle.c"
 )
 target_compile_definitions(microbench_primitives PRIVATE BUILDING_TOOLS)
 target_include_directories(microbench_primitives PUBLIC
@@ -59,7 +61,17 @@ target_include_directories(microbench_primitives PUBLIC
   "${COMDB2_SOURCE}/bbinc"
   "${COMDB2_SOURCE}/util"
   "${COMDB2_SOURCE}/berkdb"
+  "${COMDB2_SOURCE}/crc32c"
+  "${COMDB2_SOURCE}/comdb2rle"
 )
+set(component_flags "")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+  set_source_files_properties("${COMDB2_SOURCE}/crc32c/crc32c.c"
+    PROPERTIES COMPILE_OPTIONS "-msse4.2;-mpclmul")
+  set(component_flags "crc32c: -msse4.2 -mpclmul")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|armv7l|aarch64")
+  message(FATAL_ERROR "ARM CRC build flags require a separately reviewed production-equivalent recipe")
+endif()
 target_compile_options(microbench_primitives PRIVATE -fno-strict-aliasing)
 target_link_libraries(microbench_primitives PUBLIC Threads::Threads)
 
@@ -72,6 +84,7 @@ add_custom_target(benchmark_build_info
     "--cxx-flags=${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${build_type}} -fPIE -std=gnu++11 -fno-strict-aliasing"
     --benchmark-version "${benchmark_VERSION}" --benchmark-dir "${benchmark_DIR}"
     --benchmark-library "$<TARGET_FILE:benchmark::benchmark>"
+    "--component-flags=${component_flags}"
   BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/include/build_info.h"
     "${CMAKE_CURRENT_BINARY_DIR}/build-info.json"
   VERBATIM
@@ -88,6 +101,7 @@ endfunction()
 
 add_microbench(comdb2_microbenchmarks primitives/plhash_bench.cpp)
 target_sources(comdb2_microbenchmarks PRIVATE primitives/pool_bench.cpp)
+target_sources(comdb2_microbenchmarks PRIVATE primitives/crc32c_bench.cpp primitives/rle_bench.cpp)
 add_microbench(benchmark_failure_test tests/failure_bench.cpp)
 set_target_properties(benchmark_failure_test PROPERTIES EXCLUDE_FROM_ALL ON)
 enable_testing()
