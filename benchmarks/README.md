@@ -232,6 +232,11 @@ matching `benchmark_definition_sha256`, build recipe and environment. The
 future Walle adapter must enforce this and balanced AB/BA process ordering;
 this foundation does not yet publish normalized comparisons.
 
+The standalone comparison runner now enforces identical definitions/recipes and
+balanced process order; connecting it to Walle remains a separate milestone.
+See [main-versus-candidate results](MAIN_VS_CANDIDATE_REPORT.md) for the initial
+control, expanded same-binary noise study and the limits of this null comparison.
+
 ## Extending and testing
 
 Add one family in a separate C++ source, link the actual C component, and
