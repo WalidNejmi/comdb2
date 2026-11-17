@@ -87,6 +87,7 @@ function(add_microbench target source)
 endfunction()
 
 add_microbench(comdb2_microbenchmarks primitives/plhash_bench.cpp)
+target_sources(comdb2_microbenchmarks PRIVATE primitives/pool_bench.cpp)
 add_microbench(benchmark_failure_test tests/failure_bench.cpp)
 set_target_properties(benchmark_failure_test PROPERTIES EXCLUDE_FROM_ALL ON)
 enable_testing()

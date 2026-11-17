@@ -15,6 +15,10 @@ OPERATIONS = ("Insert", "LookupHit", "LookupMiss", "Delete", "LookupHitReadonly"
 NAMES = {"PlHash_{}/{}".format(op, size) for op in OPERATIONS for size in SIZES}
 NAMES |= {"PlHash_{}_Chain{}".format(op, depth) for op in ("LookupHit", "LookupReadonly")
           for depth in (1, 4, 16)}
+NAMES |= {"Pool_{}/{}".format(op, size) for op in ("Get", "GetZeroed", "Return", "GetReturn")
+          for size in (32, 128, 512)}
+NAMES |= {"Pool_Grow/entry:{}/step:{}".format(size, step)
+          for size, step in ((32, 64), (128, 64), (512, 64), (128, 512))}
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from noise_study import process_medians
 from compare_revisions import validate_builds, summarize_pairs
