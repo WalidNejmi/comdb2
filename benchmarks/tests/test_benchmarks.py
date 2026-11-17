@@ -41,7 +41,7 @@ class BenchmarkContract(unittest.TestCase):
         info = json.loads((Path(EXECUTABLE).parent / "build-info.json").read_text())
         clean = dict(info, source_dirty=False, harness_dirty=False)
         validate_builds(clean, dict(clean, comdb2_sha="b" * 40))
-        for field in ("benchmark_definition_sha256", "c_flags",
+        for field in ("benchmark_definition_sha256", "build_recipe_sha256", "c_flags",
                       "google_benchmark_library_sha256", "c_compiler_sha256"):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 validate_builds(clean, dict(clean, **{field: "different"}))
@@ -60,6 +60,26 @@ class BenchmarkContract(unittest.TestCase):
         pairs[1]["candidate"] = {}
         with self.assertRaises(ValueError):
             summarize_pairs(pairs)
+
+    def test_comparison_refuses_definition_change_before_execution(self):
+        info = json.loads((Path(EXECUTABLE).parent / "build-info.json").read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for side in ("base", "candidate"):
+                folder = root / side
+                folder.mkdir()
+                (folder / "executable").write_text("must not execute")
+                metadata = dict(info, source_dirty=False, harness_dirty=False)
+                if side == "candidate":
+                    metadata["benchmark_definition_sha256"] = "0" * 64
+                (folder / "build-info.json").write_text(json.dumps(metadata))
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve().parents[1] / "compare_revisions.py"),
+                 str(root / "base/executable"), str(root / "candidate/executable"), str(root / "output")],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("incomparable build field: benchmark_definition_sha256", result.stderr)
+            self.assertFalse((root / "output").exists())
 
     def test_noise_uses_process_medians_not_pooled_repetitions(self):
         median = dict(run_name="PlHash_LookupHit/1000", aggregate_name="median",

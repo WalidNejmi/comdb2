@@ -1,6 +1,7 @@
 """Characterize same-binary process variation without assigning qualification."""
 
 import argparse
+import datetime
 import hashlib
 import json
 import math
@@ -37,6 +38,7 @@ def main():
     parser.add_argument("executable", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--cpu", type=int)
+    parser.add_argument("--filter", default="^PlHash_")
     args = parser.parse_args()
     executable = args.executable.resolve(strict=True)
     if args.cpu is not None and (not hasattr(os, "sched_getaffinity") or
@@ -47,11 +49,13 @@ def main():
     modes = ["unpinned"] if args.cpu is None else ["unpinned", "pinned"]
     observations = {mode: [] for mode in modes}
     commands = []
+    started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    context = None
     for number in range(5):
         # Alternate mode order to avoid always placing one mode first.
         for mode in modes if number % 2 == 0 else reversed(modes):
             path = args.output / "{}-{}.json".format(mode, number + 1)
-            command = [str(executable), "--benchmark_filter=^PlHash_",
+            command = [str(executable), "--benchmark_filter=" + args.filter,
                        "--benchmark_min_time=0.05", "--benchmark_repetitions=5",
                        "--benchmark_display_aggregates_only=true",
                        "--benchmark_out=" + str(path.resolve()), "--benchmark_out_format=json"]
@@ -60,15 +64,27 @@ def main():
             commands.append(command)
             with path.with_suffix(".log").open("w") as log:
                 subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
-                               check=True, timeout=300)
-            observations[mode].append(process_medians(json.loads(path.read_text())))
+                               check=True, timeout=1800)
+            document = json.loads(path.read_text())
+            identity = {key: document["context"][key] for key in
+                        ("comdb2_sha", "harness_sha", "benchmark_definition_sha256",
+                         "source_dirty", "harness_dirty", "host_name", "num_cpus")}
+            if identity["source_dirty"] != "false" or identity["harness_dirty"] != "false":
+                raise ValueError("noise evidence requires clean source and harness")
+            if context is not None and identity != context:
+                raise ValueError("noise process identity changed")
+            context = identity
+            observations[mode].append(process_medians(document))
     if hashlib.sha256(executable.read_bytes()).hexdigest() != binary_hash:
         raise ValueError("executable changed during study")
     names = set(observations["unpinned"][0])
     summary = {"policy": "REPORT_ONLY / NOT_QUALIFIED",
                "executable_sha256": binary_hash, "cpu": args.cpu,
                "processes_per_mode": 5, "repetitions_per_process": 5,
-               "commands": commands, "modes": {}}
+               "commands": commands, "filter": args.filter, "context": context,
+               "started_at": started_at,
+               "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+               "modes": {}}
     for mode, processes in observations.items():
         if any(set(process) != names for process in processes):
             raise ValueError("benchmark set changed between processes")

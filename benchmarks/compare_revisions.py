@@ -17,7 +17,7 @@ def validate_builds(base, candidate):
     for info in (base, candidate):
         if info["source_dirty"] is not False or info["harness_dirty"] is not False:
             raise ValueError("comparison requires clean production and harness checkouts")
-    for key in ("benchmark_definition_sha256", "harness_sha", "c_compiler",
+    for key in ("benchmark_definition_sha256", "build_recipe_sha256", "harness_sha", "c_compiler",
                 "cxx_compiler", "c_compiler_version", "cxx_compiler_version",
                 "c_compiler_sha256", "cxx_compiler_sha256", "c_flags", "cxx_flags",
                 "component_flags", "google_benchmark_version", "google_benchmark_library_sha256", "allocator"):
@@ -33,6 +33,9 @@ def summarize_pairs(pairs):
     summary = {}
     for name in sorted(names):
         summary[name] = {}
+        keys = set(pairs[0]["base"][name])
+        if any(set(pair[side][name]) != keys for pair in pairs for side in ("base", "candidate")):
+            raise ValueError("metric set changed between paired processes: " + name)
         for metric in pairs[0]["base"][name]:
             base = [pair["base"][name][metric] for pair in pairs]
             candidate = [pair["candidate"][name][metric] for pair in pairs]

@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(Comdb2Microbenchmarks LANGUAGES C CXX)
+if(NOT CMAKE_GENERATOR STREQUAL "Unix Makefiles")
+  message(FATAL_ERROR "Microbenchmark recipe provenance currently requires the Unix Makefiles generator")
+endif()
 
 if(NOT CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo)$" OR CMAKE_CONFIGURATION_TYPES)
   message(FATAL_ERROR "Microbenchmarks require a single-config Release or RelWithDebInfo build.")

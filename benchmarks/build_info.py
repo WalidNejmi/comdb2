@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import shlex
 import subprocess
 
 
@@ -28,6 +29,19 @@ def main():
     digest = hashlib.sha256()
     for path in definition_files:
         digest.update(str(path.relative_to(harness)).encode() + b"\0" + path.read_bytes() + b"\0")
+    output = Path(args.output).resolve()
+    commands = json.loads((output / "compile_commands.json").read_text())
+    recipe = []
+    for command in commands:
+        normalized = command["command"]
+        for path, label in ((output, "<BUILD>"), (harness.resolve(), "<HARNESS>"),
+                            (root.resolve(), "<PRODUCTION>")):
+            normalized = normalized.replace(str(path), label)
+        recipe.append(shlex.split(normalized))
+    link = (output / "CMakeFiles/comdb2_microbenchmarks.dir/link.txt").read_text()
+    for path, label in ((output, "<BUILD>"), (harness.resolve(), "<HARNESS>"),
+                        (root.resolve(), "<PRODUCTION>")):
+        link = link.replace(str(path), label)
     info = {
         "comdb2_sha": capture(["git", "-C", str(root), "rev-parse", "HEAD"]),
         "source_dirty": bool(capture(["git", "-C", str(root), "status", "--porcelain"])),
@@ -35,6 +49,8 @@ def main():
         "harness_sha": capture(["git", "-C", str(harness), "rev-parse", "HEAD"]),
         "harness_dirty": bool(capture(["git", "-C", str(harness), "status", "--porcelain"])),
         "benchmark_definition_sha256": digest.hexdigest(),
+        "build_recipe_sha256": hashlib.sha256(
+            json.dumps([recipe, shlex.split(link)], sort_keys=True).encode()).hexdigest(),
         "c_compiler": args.c_compiler,
         "c_compiler_version": capture([args.c_compiler, "--version"]).splitlines()[0],
         "cxx_compiler": args.cxx_compiler,
@@ -49,7 +65,6 @@ def main():
         "cxx_compiler_sha256": hashlib.sha256(Path(args.cxx_compiler).read_bytes()).hexdigest(),
         "allocator": "BUILDING_TOOLS/system",
     }
-    output = Path(args.output)
     header = "#pragma once\n"
     for key, value in sorted(info.items()):
         text = str(value).lower() if isinstance(value, bool) else value
