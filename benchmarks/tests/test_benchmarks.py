@@ -24,6 +24,8 @@ NAMES |= {"CRC32C_{}/{}".format(op, size) for op in ("Comdb2", "Software")
 NAMES |= {"RLE_{}/{}/{}".format(op, shape, size) for op in ("Compress", "Decompress")
           for shape in ("Zeros", "Repeated8", "Mixed", "Incompressible")
           for size in (256, 4096, 65536)}
+NAMES |= {"Buffer_{}/{}".format(op, size) for op in ("Put", "Get") for size in (4, 8, 16, 64, 256)}
+NAMES |= {"Buffer_{}/{}".format(op, size) for op in ("NoNetPut", "NoNetGet") for size in (16, 64, 256)}
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from noise_study import process_medians
 from compare_revisions import validate_builds, summarize_pairs
@@ -79,6 +81,10 @@ class BenchmarkContract(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(set(result.stdout.splitlines()),
                          {"PlHash_LookupHit/{}".format(size) for size in SIZES})
+        for family in ("Pool_", "CRC32C_", "RLE_", "Buffer_"):
+            result = run(EXECUTABLE, "--benchmark_list_tests=true", "--benchmark_filter=^" + family)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(set(result.stdout.splitlines()), {n for n in NAMES if n.startswith(family)})
 
     def test_json_and_repetitions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -109,6 +115,11 @@ class BenchmarkContract(unittest.TestCase):
                 self.assertTrue(math.isfinite(row[key]) and row[key] > 0, row)
             if "_Chain" in row["name"]:
                 self.assertEqual(row["steps_per_op"], row["synthetic_chain_depth"] - 1)
+            if row["name"].startswith(("CRC32C_", "RLE_", "Buffer_")):
+                self.assertGreater(row["bytes_per_second"], 0)
+            if row["name"].startswith("RLE_"):
+                self.assertGreater(row["bytes_out"], 0)
+                self.assertGreater(row["compressed_over_original"], 0)
         medians = [row for row in rows if row.get("aggregate_name") == "median"]
         self.assertEqual(len(medians), len(NAMES))
 
