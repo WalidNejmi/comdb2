@@ -79,13 +79,14 @@ add_custom_target(benchmark_build_info
 
 function(add_microbench target source)
   add_executable(${target} ${source} benchmark_main.cpp)
+  target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
   set_target_properties(${target} PROPERTIES SUFFIX ".tsk")
   target_compile_options(${target} PRIVATE -fno-strict-aliasing)
   target_link_libraries(${target} PRIVATE microbench_primitives benchmark::benchmark)
   add_dependencies(${target} benchmark_build_info)
 endfunction()
 
-add_microbench(comdb2_microbenchmarks plhash_bench.cpp)
+add_microbench(comdb2_microbenchmarks primitives/plhash_bench.cpp)
 add_microbench(benchmark_failure_test tests/failure_bench.cpp)
 set_target_properties(benchmark_failure_test PROPERTIES EXCLUDE_FROM_ALL ON)
 enable_testing()

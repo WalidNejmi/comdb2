@@ -1,5 +1,5 @@
 #include <benchmark/benchmark.h>
-#include "../plhash_fixture.h"
+#include "plhash_fixture.h"
 
 static void InvalidFixture(benchmark::State& state)
 {

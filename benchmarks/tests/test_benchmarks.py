@@ -11,8 +11,10 @@ import unittest
 EXECUTABLE, FAILURE, SOURCE = sys.argv[1:4]
 del sys.argv[1:4]
 SIZES = (1000, 100000, 1000000)
-OPERATIONS = ("Insert", "LookupHit", "LookupMiss", "Delete")
+OPERATIONS = ("Insert", "LookupHit", "LookupMiss", "Delete", "LookupHitReadonly", "LookupMissReadonly")
 NAMES = {"PlHash_{}/{}".format(op, size) for op in OPERATIONS for size in SIZES}
+NAMES |= {"PlHash_{}_Chain{}".format(op, depth) for op in ("LookupHit", "LookupReadonly")
+          for depth in (1, 4, 16)}
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from noise_study import process_medians
 from compare_revisions import validate_builds, summarize_pairs
@@ -96,6 +98,8 @@ class BenchmarkContract(unittest.TestCase):
             self.assertGreater(row["iterations"], 0)
             for key in ("real_time", "cpu_time", "items_per_second"):
                 self.assertTrue(math.isfinite(row[key]) and row[key] > 0, row)
+            if "_Chain" in row["name"]:
+                self.assertEqual(row["steps_per_op"], row["synthetic_chain_depth"] - 1)
         medians = [row for row in rows if row.get("aggregate_name") == "median"]
         self.assertEqual(len(medians), len(NAMES))
 
