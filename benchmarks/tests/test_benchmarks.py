@@ -26,6 +26,11 @@ NAMES |= {"RLE_{}/{}/{}".format(op, shape, size) for op in ("Compress", "Decompr
           for size in (256, 4096, 65536)}
 NAMES |= {"Buffer_{}/{}".format(op, size) for op in ("Put", "Get") for size in (4, 8, 16, 64, 256)}
 NAMES |= {"Buffer_{}/{}".format(op, size) for op in ("NoNetPut", "NoNetGet") for size in (16, 64, 256)}
+COMMIT_MAP = "commit_map:" in json.loads((Path(EXECUTABLE).parent / "build-info.json").read_text())["component_flags"]
+COMMIT_NAMES = {"CommitMap_LookupHit/1024", "CommitMap_LookupMiss/1024", "CommitMap_InsertBatch",
+                "CommitMap_InsertGrow", "CommitMap_PurgeLogfile", "CommitMap_PurgeShrink"}
+if COMMIT_MAP:
+    NAMES |= COMMIT_NAMES
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from noise_study import process_medians
 from compare_revisions import validate_builds, summarize_pairs, observation
@@ -37,6 +42,34 @@ def run(executable, *args):
 
 
 class BenchmarkContract(unittest.TestCase):
+    @unittest.skipUnless(COMMIT_MAP, "optional commit-map target disabled")
+    def test_commit_map_production_paths_and_invariants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "commit-map.json"
+            result = run(EXECUTABLE, "--benchmark_filter=^CommitMap_", "--benchmark_min_time=0.001",
+                         "--benchmark_repetitions=2", "--benchmark_out=" + str(path), "--benchmark_out_format=json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(path.read_text())
+        rows = [row for row in data["benchmarks"] if row["run_type"] == "iteration"]
+        self.assertEqual({row["run_name"] for row in rows}, COMMIT_NAMES)
+        self.assertEqual(len(rows), 12)
+        self.assertIn("commit_map: comdb2ma/dlmalloc/MT_SAFE", data["context"]["allocator"])
+        for row in rows:
+            self.assertFalse(row.get("error_occurred"))
+            self.assertGreater(row["items_per_second"], 0)
+            name = row["run_name"]
+            if "Lookup" in name:
+                self.assertEqual((row["entries"], row["buckets"]), (1024, 1024))
+            elif name == "CommitMap_InsertBatch":
+                self.assertEqual(row["inserts_per_iteration"], 128)
+            elif name == "CommitMap_InsertGrow":
+                self.assertEqual((row["entries_rehashed"], row["resizes_per_op"]), (1025, 1))
+            else:
+                shrink = name == "CommitMap_PurgeShrink"
+                self.assertEqual(row["entries_purged_per_iteration"], 1024)
+                self.assertEqual(row["survivors"], 1 if shrink else 1024)
+                self.assertEqual(row["resizes_per_op"], 1 if shrink else 0)
+
     def test_comparison_recomputes_median_from_raw_repetitions(self):
         info = json.loads((Path(EXECUTABLE).parent / "build-info.json").read_text())
         context = dict(info, source_dirty="false", harness_dirty="false")

@@ -83,14 +83,86 @@ It uses the established `BUILDING_TOOLS` system-allocator boundary, like
 This is the repository's plhash implementation, not an external sysutil
 substitution used by some internal production builds.
 
-Commit-map was considered first. Its entry points share `berkdb/txn/txn_util.c`
-with recovery/prepared-transaction code and depend on `DB_ENV`, Berkeley DB
-allocators, LSN state and mutex wrappers. Rather than fabricate server globals
-or extract a second implementation, this first layer uses plhash.
+The default primitive suite does not measure the commit map. Its optional
+dedicated coverage is described below; PlHash results are not a proxy for the
+custom transaction-ID lookup.
 
 The existing generated `plhash.h` interface is C++ safe (`extern "C"`).
-C sources remain compiled as C99; only the harness/fixture use C++11. No new C
-adapter or production API change is necessary.
+C sources remain compiled as C99; only the harness/fixture use C++11. PlHash
+requires no C adapter or production API change.
+
+## Optional real commit-map benchmarks
+
+```sh
+make -C benchmarks check CMAKE_ARGS='-DCMAKE_PREFIX_PATH=/path/to/benchmark/install -DCOMDB2_BENCHMARK_COMMIT_MAP=ON'
+./benchmarks/build/comdb2_microbenchmarks.tsk \
+  --benchmark_filter='^CommitMap_' --benchmark_min_time=0.05 \
+  --benchmark_repetitions=5 --benchmark_display_aggregates_only=true \
+  --benchmark_out=/tmp/commit-map.json --benchmark_out_format=json
+```
+
+Default OFF preserves the original 88-case suite and its dependencies.
+Enabling this adds six cases (94 total), OpenSSL development headers required
+by the real Berkeley DB headers, and libunwind required by the real allocator's
+stack helper. `OPENSSL_ROOT_DIR` can select an existing installation. These
+benchmarks require a production checkout with the slab-backed commit-map API
+and counters; older plhash-based transaction maps are not silently substituted.
+
+The harness compiles **unmodified production** `berkdb/txn/txn_util.c`,
+Berkeley DB allocation/error/global support, `mem/mem.c`, `dlmalloc/dlmalloc.c`,
+and list/stack helpers. Berkeley DB's normal generators produce headers and
+templates **in the build directory**, never in the production checkout.
+Function/data sections plus linker garbage collection discard unrelated
+transaction/recovery/server code; no dummy server symbols or copied map
+algorithm are supplied. The C adapter uses the same zero-initialized private
+`DB_ENV` / `use_sys_malloc` setup as `__txn_commit_map_selftest`, initializes
+the real allocator, and calls the real map init/destroy APIs. No database or
+WAL service is opened. `use_sys_malloc` applies to the enclosing map allocation;
+slabs, buckets and logfile directory callbacks use the real named thread-safe
+`commit_map` allocator, including its accounting and dlmalloc behavior.
+
+The map uses a custom intrusive chained hash for transaction IDs and
+per-logfile slabs; its smaller logfile directory still uses plhash.
+Actual map entry points retain their mutex locking. This is single-threaded,
+uncontended in-memory component coverage—not a transaction commit, WAL flush,
+replication, schema-change or contention benchmark.
+
+| Case | Timed unit | Setup and validation outside timing |
+|---|---|---|
+| `CommitMap_LookupHit/1024` | One production lookup with mutex; cyclic existing key | 1,024 entries; returned LSN checked |
+| `CommitMap_LookupMiss/1024` | One production lookup with mutex; cyclic absent key | Same map; DB_NOTFOUND required |
+| `CommitMap_InsertBatch` | 128 inserts into an existing logfile/slab | One seed entry; assert no resize or extra slab |
+| `CommitMap_InsertGrow` | Insert entry 1,025, including rehash | 1,024 entries/buckets; assert growth to 2,048 buckets and exactly one resize |
+| `CommitMap_PurgeLogfile` | Purge one logfile holding 1,024 entries | Another logfile holds 1,024 survivors; assert no shrink |
+| `CommitMap_PurgeShrink` | Purge 1,024 entries, free slabs and shrink | One survivor; assert 2,048 -> 1,024 buckets and one resize |
+
+Lookup return-value checks and the thin C adapter are included in timed lookup
+cost. Fixture creation, mutation-reset teardown, snapshot counters and full
+post-purge absence/survivor checks are outside timing. Purges delete the lowest
+logfile while another remains, exercising normal logfile-bound maintenance
+without warning-log noise. IDs and LSNs are deterministic and nonzero.
+
+**Units matter:** reported `cpu_time`/`real_time` are per benchmark iteration.
+For InsertBatch that is **128 inserts**, and for each purge it is **one
+1,024-entry logfile purge**, not one transaction. `items_per_second` uses
+inserted/purged entries; InsertGrow counts one growth-triggering insertion.
+Counters expose these batch sizes, bucket counts, survivor counts and resizes.
+These cases verify invariants in optimized builds, not only via `assert`.
+
+Keep execution budgeted: routine comparisons target five minutes excluding
+builds, and an initial reliability pilot must stop within its ten-minute
+measurement budget. Paused fixture setup still costs wall time, so first
+measure the complete process runtime rather than multiplying min_time alone.
+Do not silently expand all cases across duration/placement matrices. A budget
+expiry preserves partial evidence and is not a successful comparison.
+Results remain report-only and unqualified without independent confirmation.
+
+Provenance includes the optional `.cmake` recipe in the definition hash,
+component flags/allocator distinction, actual compile/link commands, and
+the libunwind path/content hash in `support_libraries`. Build comparisons
+reject differing support-library identities.
+
+### Default PlHash fixture details
 
 - Entries use deterministic consecutive 64-bit keys and preallocated payloads.
   Construction, population, full lookup validation and destruction are outside

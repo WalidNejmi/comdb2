@@ -14,6 +14,8 @@ from noise_study import process_medians
 
 
 def validate_builds(base, candidate):
+    if base.get("support_libraries", {}) != candidate.get("support_libraries", {}):
+        raise ValueError("incomparable build field: support_libraries")
     for info in (base, candidate):
         if info["source_dirty"] is not False or info["harness_dirty"] is not False:
             raise ValueError("comparison requires clean production and harness checkouts")

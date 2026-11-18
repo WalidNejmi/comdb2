@@ -83,6 +83,16 @@ string(APPEND component_flags "; buffer_adapter: -D_LINUX_SOURCE")
 target_compile_options(microbench_primitives PRIVATE -fno-strict-aliasing)
 target_link_libraries(microbench_primitives PUBLIC Threads::Threads)
 
+option(COMDB2_BENCHMARK_COMMIT_MAP "Include real slab-backed commit-map benchmarks" OFF)
+set(support_args "")
+set(allocator "BUILDING_TOOLS/system")
+if(COMDB2_BENCHMARK_COMMIT_MAP)
+  include(commit_map.cmake)
+  string(APPEND component_flags "; commit_map: -D_LINUX_SOURCE -D_GNU_SOURCE -DPER_THREAD_MALLOC -ffunction-sections -fdata-sections; link: --gc-sections")
+  set(allocator "primitives: BUILDING_TOOLS/system; commit_map: comdb2ma/dlmalloc/MT_SAFE")
+  list(APPEND support_args --support-library "${COMMIT_MAP_UNWIND_LIBRARY}")
+endif()
+
 add_custom_target(benchmark_build_info
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/build_info.py"
     --source "${COMDB2_SOURCE}" --harness "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -93,6 +103,7 @@ add_custom_target(benchmark_build_info
     --benchmark-version "${benchmark_VERSION}" --benchmark-dir "${benchmark_DIR}"
     --benchmark-library "$<TARGET_FILE:benchmark::benchmark>"
     "--component-flags=${component_flags}"
+    "--allocator=${allocator}" ${support_args}
   BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/include/build_info.h"
     "${CMAKE_CURRENT_BINARY_DIR}/build-info.json"
   VERBATIM
@@ -111,6 +122,10 @@ add_microbench(comdb2_microbenchmarks primitives/plhash_bench.cpp)
 target_sources(comdb2_microbenchmarks PRIVATE primitives/pool_bench.cpp)
 target_sources(comdb2_microbenchmarks PRIVATE primitives/crc32c_bench.cpp primitives/rle_bench.cpp)
 target_sources(comdb2_microbenchmarks PRIVATE primitives/endian_bench.cpp fixtures/buffer_adapter.c)
+if(COMDB2_BENCHMARK_COMMIT_MAP)
+  target_sources(comdb2_microbenchmarks PRIVATE primitives/commit_map_bench.cpp)
+  target_link_libraries(comdb2_microbenchmarks PRIVATE microbench_commit_map)
+endif()
 add_microbench(benchmark_failure_test tests/failure_bench.cpp)
 set_target_properties(benchmark_failure_test PROPERTIES EXCLUDE_FROM_ALL ON)
 enable_testing()

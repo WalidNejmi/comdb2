@@ -18,13 +18,15 @@ def main():
                  "cxx-flags", "benchmark-version", "benchmark-dir", "benchmark-library",
                  "component-flags"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--allocator", default="BUILDING_TOOLS/system")
+    parser.add_argument("--support-library", action="append", default=[])
     args = parser.parse_args()
     root = Path(args.source)
     harness = Path(args.harness)
     definition_files = sorted(
         p for p in harness.rglob("*")
         if p.is_file() and "build" not in p.relative_to(harness).parts
-        and (p.suffix in (".c", ".cpp", ".h", ".py") or p.name in ("CMakeLists.txt", "Makefile"))
+        and (p.suffix in (".c", ".cpp", ".h", ".py", ".cmake") or p.name in ("CMakeLists.txt", "Makefile"))
         and "__pycache__" not in p.parts)
     digest = hashlib.sha256()
     for path in definition_files:
@@ -63,10 +65,14 @@ def main():
         "google_benchmark_library_sha256": hashlib.sha256(Path(args.benchmark_library).read_bytes()).hexdigest(),
         "c_compiler_sha256": hashlib.sha256(Path(args.c_compiler).read_bytes()).hexdigest(),
         "cxx_compiler_sha256": hashlib.sha256(Path(args.cxx_compiler).read_bytes()).hexdigest(),
-        "allocator": "BUILDING_TOOLS/system",
+        "allocator": args.allocator,
+        "support_libraries": {str(Path(path).resolve()): hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                              for path in args.support_library},
     }
     header = "#pragma once\n"
     for key, value in sorted(info.items()):
+        if key == "support_libraries":
+            continue
         text = str(value).lower() if isinstance(value, bool) else value
         header += "#define MICROBENCH_{} {}\n".format(key.upper(), json.dumps(text))
     for path, text in ((output / "include/build_info.h", header),
