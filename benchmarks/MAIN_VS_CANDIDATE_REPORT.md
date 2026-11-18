@@ -1,5 +1,10 @@
 # Main versus candidate: primitive microbenchmarks
 
+Follow-up: [same-executable reliability investigation](RELIABILITY_INVESTIGATION.md).
+The historical measurements below are unchanged; later diagnostics reproduce
+large null deltas without a different executable and do not establish a
+universal affinity or qualification policy.
+
 ## Provenance
 
 | Field | Measured value |

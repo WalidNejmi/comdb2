@@ -200,6 +200,15 @@ medians; output retains every paired delta plus median/min/max. Timing delta is
 Raw repetitions, JSON context, command arrays and executable hashes are retained.
 Use one admitted host and the same environment for both sides. No affinity is
 imposed. This is report-only, not a replacement for workload qualification.
+The runner checks both executables and their metadata before and after each
+process, refusing further execution on an integrity change. `campaign.json`
+is an atomically replaced progress journal with process timestamps, launch
+affinity, system load and result-file fingerprints. On a handled failure it
+retains the error; an externally interrupted process may leave RUNNING, which
+is not evidence of completion. Only a completed campaign writes `summary.json`.
+Raw repetition counts, units, finite positive timings and recomputed medians
+are checked before aggregation. These integrity checks do not qualify noisy
+timings or reconstruct past CPU/NUMA placement from load averages.
 The Unix Makefiles generator is required: normalized compile commands and the
 actual link recipe are hashed, including per-source flags, with only build,
 harness and production root paths replaced. Ninja/multi-config generators are
@@ -236,6 +245,9 @@ The standalone comparison runner now enforces identical definitions/recipes and
 balanced process order; connecting it to Walle remains a separate milestone.
 See [main-versus-candidate results](MAIN_VS_CANDIDATE_REPORT.md) for the initial
 control, expanded same-binary noise study and the limits of this null comparison.
+The [reliability investigation](RELIABILITY_INVESTIGATION.md) reproduces large
+label deltas with one identical executable and explains why pinning is not
+adopted globally. Its diagnostic telemetry is not a qualification threshold.
 
 ## Extending and testing
 

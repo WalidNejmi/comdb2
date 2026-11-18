@@ -28,7 +28,7 @@ NAMES |= {"Buffer_{}/{}".format(op, size) for op in ("Put", "Get") for size in (
 NAMES |= {"Buffer_{}/{}".format(op, size) for op in ("NoNetPut", "NoNetGet") for size in (16, 64, 256)}
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from noise_study import process_medians
-from compare_revisions import validate_builds, summarize_pairs
+from compare_revisions import validate_builds, summarize_pairs, observation
 
 
 def run(executable, *args):
@@ -37,6 +37,88 @@ def run(executable, *args):
 
 
 class BenchmarkContract(unittest.TestCase):
+    def test_comparison_recomputes_median_from_raw_repetitions(self):
+        info = json.loads((Path(EXECUTABLE).parent / "build-info.json").read_text())
+        context = dict(info, source_dirty="false", harness_dirty="false")
+        rows = [dict(run_name="case", run_type="iteration", repetition_index=i,
+                     repetitions=5, cpu_time=i + 1, real_time=2 * (i + 1), time_unit="ns")
+                for i in range(5)]
+        aggregate = dict(run_name="case", run_type="aggregate", aggregate_name="median",
+                         time_unit="ns", cpu_time=3, real_time=6)
+        document = {"context": context, "benchmarks": rows + [aggregate]}
+        self.assertEqual(observation(document, info)["case"], {"cpu_time": 3, "real_time": 6})
+        for field, value in (("cpu_time", 99), ("cpu_time", float("nan")),
+                             ("time_unit", "ms"), ("repetition_index", 4)):
+            corrupt = json.loads(json.dumps(document))
+            corrupt["benchmarks"][2][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                observation(corrupt, info)
+
+    def test_comparison_stops_and_journals_artifact_mutation(self):
+        info = json.loads((Path(EXECUTABLE).parent / "build-info.json").read_text())
+        script = Path(__file__).resolve().parents[1] / "compare_revisions.py"
+        for target in ("executable", "build-info.json"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for side in ("base", "candidate"):
+                    folder = root / side
+                    folder.mkdir()
+                    executable = folder / "executable"
+                    executable.write_text(
+                        "#!" + sys.executable + "\n"
+                        "from pathlib import Path\n"
+                        "Path(__file__).with_name(" + repr(target) + ").write_text('mutated')\n")
+                    executable.chmod(0o700)
+                    (folder / "build-info.json").write_text(json.dumps(
+                        dict(info, source_dirty=False, harness_dirty=False)))
+                result = subprocess.run(
+                    [sys.executable, str(script), str(root / "base/executable"),
+                     str(root / "candidate/executable"), str(root / "output")],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+                self.assertNotEqual(result.returncode, 0)
+                message = "executable changed" if target == "executable" else "build metadata changed"
+                self.assertIn(message, result.stderr)
+                journal = json.loads((root / "output/campaign.json").read_text())
+                self.assertEqual(journal["status"], "FAILED")
+                self.assertEqual(len(journal["processes"]), 1)
+                self.assertEqual(journal["processes"][0]["status"], "FAILED")
+                self.assertFalse((root / "output/summary.json").exists())
+
+    def test_comparison_journals_complete_balanced_campaign(self):
+        info = json.loads((Path(EXECUTABLE).parent / "build-info.json").read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "executable"
+            executable.write_text(
+                "#!" + sys.executable + "\n"
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "context = json.loads(Path(__file__).with_name('build-info.json').read_text())\n"
+                "context.update(source_dirty='false', harness_dirty='false')\n"
+                "rows = [dict(run_name='case', run_type='iteration', repetition_index=i,\n"
+                "             repetitions=5, cpu_time=10, real_time=20, time_unit='ns') for i in range(5)]\n"
+                "rows.append(dict(run_name='case', run_type='aggregate', aggregate_name='median',\n"
+                "                 cpu_time=10, real_time=20, time_unit='ns'))\n"
+                "context.update(host_name='fixture', num_cpus=1, caches=[])\n"
+                "output = next(a.split('=',1)[1] for a in sys.argv if a.startswith('--benchmark_out='))\n"
+                "Path(output).write_text(json.dumps(dict(context=context, benchmarks=rows)))\n")
+            executable.chmod(0o700)
+            (root / "build-info.json").write_text(json.dumps(
+                dict(info, source_dirty=False, harness_dirty=False)))
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve().parents[1] / "compare_revisions.py"),
+                 str(executable), str(executable), str(root / "output")],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = json.loads((root / "output/summary.json").read_text())
+            self.assertEqual(summary, json.loads((root / "output/campaign.json").read_text()))
+            self.assertEqual(summary["status"], "COMPLETE")
+            self.assertEqual([p["side"] for p in summary["processes"]],
+                             ["base", "candidate", "candidate", "base"] * 2)
+            self.assertTrue(all(p["status"] == "COMPLETE" and len(p["result_sha256"]) == 64
+                                for p in summary["processes"]))
+            self.assertEqual(summary["benchmarks"]["case"]["cpu_time"]["paired_delta_percent"], [0] * 4)
+
     def test_comparison_identity_and_pair_hierarchy(self):
         info = json.loads((Path(EXECUTABLE).parent / "build-info.json").read_text())
         clean = dict(info, source_dirty=False, harness_dirty=False)

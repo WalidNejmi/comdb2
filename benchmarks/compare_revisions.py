@@ -70,14 +70,36 @@ def observation(document, info):
         raise ValueError("raw/median benchmark sets differ")
     for name, rows in raw.items():
         if (len(rows) != 5 or {r["repetition_index"] for r in rows} != set(range(5))
-                or any(r["repetitions"] != 5 for r in rows)):
+                or any(r["repetitions"] != 5 or r["time_unit"] != "ns" for r in rows)):
             raise ValueError("expected five raw repetitions: " + name)
+        for key in ("cpu_time", "real_time"):
+            values = [row[key] for row in rows]
+            if not all(math.isfinite(value) and value > 0 for value in values):
+                raise ValueError("invalid raw repetition: " + name)
+            if not math.isclose(statistics.median(values), medians[name][key], rel_tol=1e-9):
+                raise ValueError("reported median differs from raw repetitions: " + name)
     for row in document["benchmarks"]:
         if row.get("aggregate_name") == "median":
             for key in ("items_per_second", "bytes_per_second"):
                 if key in row:
                     medians[row["run_name"]][key] = row[key]
     return medians
+
+
+def fingerprint(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def verify_artifacts(executables, metadata, fingerprints, metadata_hashes):
+    for side in executables:
+        if fingerprint(executables[side]) != fingerprints[side]:
+            raise ValueError("executable changed during comparison: " + side)
+        if fingerprint(metadata[side]) != metadata_hashes[side]:
+            raise ValueError("build metadata changed during comparison: " + side)
+
+
+def utc():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def main():
@@ -89,18 +111,27 @@ def main():
     args = parser.parse_args()
     executables = {side: getattr(args, side).resolve(strict=True)
                    for side in ("base", "candidate")}
-    infos = {side: json.loads((exe.parent / "build-info.json").read_text())
-             for side, exe in executables.items()}
+    metadata = {side: exe.parent / "build-info.json" for side, exe in executables.items()}
+    infos = {side: json.loads(path.read_text()) for side, path in metadata.items()}
     validate_builds(infos["base"], infos["candidate"])
-    fingerprints = {side: hashlib.sha256(exe.read_bytes()).hexdigest()
-                    for side, exe in executables.items()}
+    fingerprints = {side: fingerprint(exe) for side, exe in executables.items()}
+    metadata_hashes = {side: fingerprint(path) for side, path in metadata.items()}
     args.output.mkdir(parents=True, exist_ok=False)
     summary = {"policy": "REPORT_ONLY / NOT_QUALIFIED", "builds": infos,
                "binary_sha256": fingerprints, "pairs": 4, "repetitions": 5,
+               "build_info_sha256": metadata_hashes,
                "filter": args.filter, "time_unit": "ns",
                "affinity": sorted(os.sched_getaffinity(0)),
-               "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-               "commands": []}
+               "started_at": utc(), "status": "RUNNING",
+               "commands": [], "processes": []}
+    journal = args.output / "campaign.json"
+
+    def save_journal():
+        temporary = journal.with_suffix(".tmp")
+        temporary.write_text(json.dumps(summary, indent=2) + "\n")
+        temporary.replace(journal)
+
+    save_journal()
     pairs = []
     host = None
     for number in range(4):
@@ -112,22 +143,48 @@ def main():
                        "--benchmark_display_aggregates_only=true",
                        "--benchmark_out=" + str(path), "--benchmark_out_format=json"]
             summary["commands"].append(command)
-            with path.with_suffix(".log").open("w") as log:
-                subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
-                               check=True, timeout=1800)
-            document = json.loads(path.read_text())
-            machine = {k: document["context"][k] for k in ("host_name", "num_cpus", "caches")}
-            if host is not None and host != machine:
-                raise ValueError("host/CPU context changed")
-            host = machine
-            pair[side] = observation(document, infos[side])
+            record = {"pair": number + 1, "side": side, "started_at": utc(),
+                      "status": "RUNNING", "load_before": os.getloadavg(),
+                      "affinity": sorted(os.sched_getaffinity(0))}
+            summary["processes"].append(record)
+            save_journal()
+            try:
+                verify_artifacts(executables, metadata, fingerprints, metadata_hashes)
+                if record["affinity"] != summary["affinity"]:
+                    raise ValueError("process launch affinity changed")
+                with path.with_suffix(".log").open("w") as log:
+                    subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
+                                   check=True, timeout=1800)
+                verify_artifacts(executables, metadata, fingerprints, metadata_hashes)
+                document = json.loads(path.read_text())
+                machine = {k: document["context"][k] for k in ("host_name", "num_cpus", "caches")}
+                if host is not None and host != machine:
+                    raise ValueError("host/CPU context changed")
+                host = machine
+                pair[side] = observation(document, infos[side])
+                record["result_sha256"] = fingerprint(path)
+                record["status"] = "COMPLETE"
+            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+                record["status"] = summary["status"] = "FAILED"
+                record["error"] = str(error)
+                raise
+            finally:
+                record["finished_at"] = utc()
+                record["load_after"] = os.getloadavg()
+                save_journal()
         pairs.append(pair)
-    for side, exe in executables.items():
-        if hashlib.sha256(exe.read_bytes()).hexdigest() != fingerprints[side]:
-            raise ValueError("executable changed during comparison")
-    summary["host"] = host
-    summary["benchmarks"] = summarize_pairs(pairs)
-    summary["finished_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        summary["host"] = host
+        summary["benchmarks"] = summarize_pairs(pairs)
+        verify_artifacts(executables, metadata, fingerprints, metadata_hashes)
+        summary["status"] = "COMPLETE"
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        summary["status"] = "FAILED"
+        summary["error"] = str(error)
+        raise
+    finally:
+        summary["finished_at"] = utc()
+        save_journal()
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(args.output / "summary.json")
 
