@@ -96,7 +96,7 @@ requires no C adapter or production API change.
 ```sh
 make -C benchmarks check CMAKE_ARGS='-DCMAKE_PREFIX_PATH=/path/to/benchmark/install -DCOMDB2_BENCHMARK_COMMIT_MAP=ON'
 ./benchmarks/build/comdb2_microbenchmarks.tsk \
-  --benchmark_filter='^CommitMap_' --benchmark_min_time=0.05 \
+  --benchmark_filter='^CommitMap_' --benchmark_min_time=0.01 \
   --benchmark_repetitions=5 --benchmark_display_aggregates_only=true \
   --benchmark_out=/tmp/commit-map.json --benchmark_out_format=json
 ```
@@ -153,6 +153,9 @@ Keep execution budgeted: routine comparisons target five minutes excluding
 builds, and an initial reliability pilot must stop within its ten-minute
 measurement budget. Paused fixture setup still costs wall time, so first
 measure the complete process runtime rather than multiplying min_time alone.
+The short example uses 10 ms per repetition to keep setup-heavy paired pilots
+practical. This sacrifices precision; retain the raw repetitions and paired
+noise, and do not treat low median noise as protection from large outliers.
 Do not silently expand all cases across duration/placement matrices. A budget
 expiry preserves partial evidence and is not a successful comparison.
 Results remain report-only and unqualified without independent confirmation.
