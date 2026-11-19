@@ -1712,6 +1712,7 @@ extern int gbl_uses_simpleauth;
 extern int gbl_uses_externalauth_connect;
 extern int gbl_externalauth_warn;
 extern int gbl_consumer_auth_warnonly;
+extern int gbl_comdb2sc_auth_warnonly;
 extern int gbl_admin_bypass_externalauth;
 extern int gbl_passwords_with_externalauth;
 extern int gbl_identity_cache_max;

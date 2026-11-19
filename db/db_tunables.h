@@ -2751,6 +2751,11 @@ REGISTER_TUNABLE("consumer_auth_warnonly",
                  "Warn instead of denying access for consumer stored procedures (Default: on)", TUNABLE_BOOLEAN,
                  &gbl_consumer_auth_warnonly, NOARG, NULL, NULL, NULL, NULL);
 
+REGISTER_TUNABLE("comdb2sc_auth_warnonly",
+                 "Warn instead of denying access to the comdb2sc bpkg, identified by its authenticated principal "
+                 "(Default: on)",
+                 TUNABLE_BOOLEAN, &gbl_comdb2sc_auth_warnonly, NOARG, NULL, NULL, NULL, NULL);
+
 REGISTER_TUNABLE("admin_bypass_externalauth", "Allow admin connections to bypass external auth checks (Default: OFF)",
                  TUNABLE_BOOLEAN, &gbl_admin_bypass_externalauth, NOARG | READEARLY, NULL, NULL, NULL, NULL);
 

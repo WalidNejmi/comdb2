@@ -251,6 +251,7 @@ int gbl_uses_simpleauth = 0;
 int gbl_uses_externalauth_connect = 0;
 int gbl_externalauth_warn = 0;
 int gbl_consumer_auth_warnonly = 1;
+int gbl_comdb2sc_auth_warnonly = 1;
 int gbl_admin_bypass_externalauth = 0;
 int gbl_passwords_with_externalauth = 0;
 int gbl_identity_cache_max = 1000;
